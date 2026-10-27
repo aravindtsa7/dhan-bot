@@ -1,46 +1,56 @@
-"""Exercise live Streamlit widgets and a real, bounded custom backtest."""
+"""Exercise dark-terminal navigation and real bounded option / MCX simulations."""
+from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import pandas as pd
 from streamlit.testing.v1 import AppTest
-from quant_backtester import run_backtest, OUT, HIGH_STRATEGIES
+from quant_backtester import run_backtest
+from quant_terminal import PAGES, load_registry
 
 
 def main():
     saved=[]
-    def execute(config):
-        assert config.capital==500000 and config.capital_usage_pct==50
-        assert config.futures_margin_pct==20 and config.daily_profit_target==1500
-        assert config.start=='2026-10-01' and config.end=='2026-10-23'
-        result=run_backtest(config,output=OUT/'ui_step5_smoke')
-        saved.append(result)
-        return result
-    with patch('quant_backtester.run_backtest',side_effect=execute), patch('quant_backtester.refresh_leaderboard',return_value=pd.DataFrame()):
-        app=AppTest.from_file('quant_ui.py',default_timeout=120).run()
-        def clean():
-            assert not app.exception,[e.message for e in app.exception]
-        def widget(kind,label): return next(w for w in getattr(app,kind) if w.label==label)
-        clean(); assert len(app.tabs)==4
-        for instrument in ('NIFTY','SENSEX','CRUDEOIL','NATURALGAS','GOLDM'):
-            widget('selectbox','Instrument').select(instrument).run(); clean()
-            widget('selectbox','Strategy mode').select('High-Risk Explosive Growth').run(); clean()
-            expected=HIGH_STRATEGIES[3] if instrument=='GOLDM' else HIGH_STRATEGIES[5] if instrument in ('CRUDEOIL','NATURALGAS') else HIGH_STRATEGIES[4]
-            assert widget('selectbox','Test strategy').value==expected
-        widget('selectbox','Instrument').select('CRUDEOIL').run()
-        widget('selectbox','Strategy mode').select('Steady Income').run()
-        widget('selectbox','Test strategy').select(HIGH_STRATEGIES[3]).run()
-        widget('date_input','From Date').set_value('2026-10-01')
-        widget('number_input','Total trading capital (₹)').set_value(500000)
-        widget('slider','Capital usage / maximum concurrent exposure (%)').set_value(50)
-        widget('slider','Futures margin assumption (% of notional)').set_value(20)
-        widget('button','Run & save backtest').click().run(timeout=120)
-        clean()
-        assert not app.error,[e.value for e in app.error]
-        assert saved and saved[0]['metrics']['unresolved_trades']==0
-        trades=pd.read_parquet(Path(saved[0]['path'])/'trades.parquet')
-        assert len(trades)>0,'Smoke window must exercise actual fills'
-        assert (trades.capital_used_pct<=50).all()
-        print(f'PASS: all instruments/modes/four tabs; real custom run {saved[0]["run_id"]}, {len(trades)} trades, zero unresolved.')
+    with TemporaryDirectory() as directory:
+        output=Path(directory)
+        def execute(config, output):
+            assert config.capital==2000000 and config.capital_usage_pct==75
+            assert config.start=='2026-10-01' and config.end=='2026-10-23'
+            assert config.minimum_premium==100 and config.risk_basis=='percentage'
+            result=run_backtest(config,output=output)
+            saved.append(result)
+            return result
+        with patch('quant_backtester.OUT',output), patch('quant_backtester.run_backtest',side_effect=execute):
+            app=AppTest.from_file('quant_ui.py',default_timeout=180).run()
+            def clean():
+                assert not app.exception,[e.message for e in app.exception]
+                assert not app.error,[e.value for e in app.error]
+            clean(); assert not app.tabs
+            for page in PAGES:
+                app.radio(key='page').set_value(page).run(); clean()
+            app.radio(key='page').set_value('Backtests').run()
+            for instrument,strategy in [('NIFTY 50','Buy CE / Buy PE'),('CRUDEOIL','MCX Breakout')]:
+                app.selectbox(key='bt_instrument').select(instrument)
+                app.selectbox(key='bt_strategy').select(strategy)
+                app.date_input(key='bt_period').set_value((date(2026,10,1),date(2026,10,22)))
+                app.number_input(key='bt_capital').set_value(2000000)
+                app.selectbox(key='bt_allocation').select('75%')
+                app.button(key='run_backtest').click().run(timeout=180); clean()
+                result=saved[-1]
+                assert result['metrics']['unresolved_trades']==0
+                trades=pd.read_parquet(Path(result['path'])/'trades.parquet')
+                assert len(trades)>0, 'Real smoke window must exercise actual fills'
+                assert trades.capital_used_pct.le(75).all()
+                if instrument=='NIFTY 50': assert trades.raw_entry_price.ge(100).all()
+                assert app.get('plotly_chart')
+                app.button(key='save_strategy').click().run(); clean()
+                print(f"PASS: {instrument}, {len(trades)} trades, zero unresolved, saved configuration and chart.")
+            registry=load_registry(output)
+            assert len(registry['runs'])==2 and len(registry['strategies'])==2
+            assert [r['display_id'] for r in registry['runs']]==['BT-001','BT-002']
+            app.radio(key='page').set_value('Reports').run(); clean()
+            assert len(app.get('plotly_chart'))==2
+            print('PASS: seven sidebar pages, real option and MCX backtests, premium filter, allocation, persistence and Reports replay.')
 
 
 if __name__=='__main__': main()

@@ -156,12 +156,13 @@ class PaperRoomTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual({m.label:m.value for m in app.metric}['Closed win rate'], 'N/A')
 
-    def test_full_quant_ui_loads_all_six_tabs(self):
+    def test_full_quant_ui_has_sidebar_and_paper_page(self):
         app = AppTest.from_file(str(Path(__file__).with_name('quant_ui.py')), default_timeout=60).run()
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.tabs), 6)
-        self.assertEqual(app.tabs[4].label, '📊 Live Paper Trading Room')
-        self.assertEqual(app.tabs[-1].label, '📊 Option Chain & Strike Replay')
+        self.assertEqual(len(app.tabs), 0)
+        self.assertEqual(app.radio(key='page').value, 'Backtests')
+        app.radio(key='page').set_value('Live Paper Trading').run()
+        self.assertFalse(app.exception)
         self.assertIn('Paper trades executed', [m.label for m in app.metric])
 
 

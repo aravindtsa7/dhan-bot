@@ -1,4 +1,4 @@
-"""Verify completed sweep artifacts and exercise all Streamlit tabs offline."""
+"""Verify current-engine sweep artifacts and the seven terminal pages offline."""
 import json
 from pathlib import Path
 import pandas as pd
@@ -81,15 +81,14 @@ def verify():
     from streamlit.testing.v1 import AppTest
     app=AppTest.from_file('quant_ui.py',default_timeout=90).run()
     assert not app.exception, [e.message for e in app.exception]
-    assert len(app.tabs)==4 and len(app.get('plotly_chart'))==4
-    for name in ('NIFTY','SENSEX','CRUDEOIL','NATURALGAS','GOLDM'):
-        next(w for w in app.sidebar.selectbox if w.label=='Instrument').select(name).run()
+    from quant_terminal import PAGES
+    assert not app.tabs
+    for page in PAGES:
+        app.radio(key='page').set_value(page).run()
         assert not app.exception, [e.message for e in app.exception]
-    next(w for w in app.sidebar.selectbox if w.label=='Instrument').select('All').run()
-    next(w for w in app.sidebar.selectbox if w.label=='Price evidence').select('Observed contract prices + accounting checked').run()
-    assert not app.exception, [e.message for e in app.exception]
-    print('Streamlit: all 4 tabs, 5 instrument filters, charts and replay passed')
-    (OUT/'verification.json').write_text(json.dumps(dict(**totals,ui_tabs=4,instrument_filters=5,status='passed'),indent=2))
+    print('Streamlit: all seven sidebar pages passed')
+    (OUT/'verification.json').write_text(json.dumps(dict(**totals,ui_pages=7,status='passed'),indent=2))
+
 
 
 if __name__=='__main__': verify()

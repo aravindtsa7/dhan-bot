@@ -57,7 +57,12 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
                 except StopIteration as done:
                     trade,trace=done.value; active.remove(p)
                     if trade is None:
-                        skipped.append(dict(date=date,minute=at,side=event[1],budget=budget,reason='unavailable_entry_or_insufficient_capital'))
+                        reason='unavailable_entry_or_insufficient_capital'
+                        first=data.price(data.days[date],at,event[1],event[2])
+                        if not data.mcx:
+                            if c.option_side not in ('both',event[1]): reason='option_side_filter'
+                            elif first and max(first[0],event[3] or first[0])<c.minimum_premium: reason='below_minimum_premium'
+                        skipped.append(dict(date=date,minute=at,side=event[1],budget=budget,reason=reason))
                     else:
                         entered.append(event[1]); records.append(trade); paths.extend(trace); day_closed.append(trade)
                         equity+=trade['net_pnl']; last_exit=at

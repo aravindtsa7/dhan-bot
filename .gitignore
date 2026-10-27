@@ -5,10 +5,34 @@
 .streamlit/secrets.toml
 *.pem
 *.key
+credentials/
+secrets/
+tokens/
+credentials.json
+credentials.*.json
+credentials.yaml
+credentials.yml
+credentials.toml
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+token.json
+tokens.json
+token.txt
+access_token*
+refresh_token*
+*.p12
+*.pfx
 
 # Python environments and generated caches
 .venv/
 venv/
+env/
+ENV/
+.virtualenv/
+.tox/
+.nox/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -16,8 +40,17 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+.cache/
+*.log
+logs/
 
 # Local market data and generated research artifacts
 data/
 data_lake/
 *.parquet
+datasets/
+downloads/
+backtests/
+paper_trading/
+paper_trades/
+paper_runs/

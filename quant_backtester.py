@@ -22,7 +22,7 @@ from quant_calendar import CALENDAR_HASH, expiries, next_expiry, is_expiry_day, 
 from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
 
-ENGINE_VERSION = '5.1.0'
+ENGINE_VERSION = '5.2.0'
 OUT = ROOT / 'backtests'
 STRATEGIES = ['EMA_Supertrend_VWAP_Directional', 'ORB_Option_Momentum_Breakout',
               'Dual_CE_PE_Straddle_Breakout', 'VWAP_Trend_Pullback_Buyer',
@@ -96,17 +96,23 @@ class Config:
     compression_ratio: float = 0.8
     breakeven_trigger_pct: float = 15
     tick_size: float = 0  # 0 selects option 0.05 / commodity contract tick
+    minimum_premium: float = 0  # observed entry premium, before slippage; options only
+    option_side: str = 'both'  # both / CE / PE
+    exit_mode: str = 'legacy'  # legacy / end_of_day / trailing_sl / target_eod
+    risk_basis: str = 'legacy'  # legacy ATR futures stops, or percentage of entry
 
     def validate(self):
+        if self.instrument == 'BANKNIFTY':
+            raise ValueError('BANKNIFTY spot is available, but option history and a dated contract schedule are not configured. Choose NIFTY 50 or SENSEX for option backtests.')
         if self.instrument not in INSTRUMENTS or self.strategy not in STRATEGIES:
             raise ValueError('Unknown instrument or strategy')
-        if self.timeframe not in ('3m', '5m', '15m') or self.strike not in ('ATM', 'ATM-1', 'ATM+1'):
+        if self.timeframe not in ('1m', '3m', '5m', '15m') or self.strike not in ('ATM', 'ATM-1', 'ATM+1'):
             raise ValueError('Unsupported timeframe / moneyness')
         if (self.instrument in POINT_VALUE) != (self.strategy in (STRATEGIES[4],HIGH_STRATEGIES[3],HIGH_STRATEGIES[5])):
             raise ValueError('S5/H4/H6 support MCX; other strategies support index options')
         if self.strategy==HIGH_STRATEGIES[5] and self.instrument not in ('CRUDEOIL','NATURALGAS'):
             raise ValueError('H6 supports only Crude Oil and Natural Gas')
-        if self.strategy==HIGH_STRATEGIES[4] and self.trail_pct<=0:
+        if self.strategy==HIGH_STRATEGIES[4] and self.exit_mode=='legacy' and self.trail_pct<=0:
             raise ValueError('H5 requires an active trailing stop')
         if any(isinstance(v,(int,float)) and not math.isfinite(v) for v in asdict(self).values()):
             raise ValueError('Numeric settings must be finite')
@@ -137,6 +143,14 @@ class Config:
         if self.volume_multiple<1.5 or self.option_lookback<1 or self.oi_min_change_pct<=0 or self.atr_expansion<=0 or self.compression_ratio<=0:
             raise ValueError('Invalid volume/OI/ATR filters')
         if self.tick_size<0: raise ValueError('Tick size cannot be negative')
+        if self.minimum_premium < 0 or self.option_side not in ('both', 'CE', 'PE'):
+            raise ValueError('Invalid minimum premium or option side')
+        if self.exit_mode not in ('legacy', 'end_of_day', 'trailing_sl', 'target_eod') or self.risk_basis not in ('legacy', 'percentage'):
+            raise ValueError('Invalid exit mode or risk basis')
+        if self.exit_mode == 'trailing_sl' and self.trail_pct <= 0:
+            raise ValueError('Trailing SL requires a positive trailing distance')
+        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy in (STRATEGIES[2], HIGH_STRATEGIES[1])):
+            raise ValueError('Futures and dual-leg strategies require both sides')
         for value in (self.entry_start, self.entry_end, self.anchor):
             minute(value)
         if minute(self.entry_start)>=minute(self.entry_end):
@@ -434,14 +448,17 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     first = data.price(day,at,side,strike)
     if first is None or first[0]<=0: return None, []
     raw_entry = max(first[0],trigger) if trigger else first[0]
+    if not data.mcx and (raw_entry < c.minimum_premium or c.option_side not in ('both', side)):
+        return None, []
     entry = adverse_tick(raw_entry+direction*c.slippage,c,direction==1)
     entry_equity=c.capital if entry_equity is None else entry_equity
     budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
     qty,allocated,reserve=order_allocation(c,date,entry,budget,direction)
     if not qty: return None, []
-    stop_distance = atr*c.atr_sl if data.mcx else entry*c.sl_pct/100
+    atr_risk = data.mcx and c.risk_basis == 'legacy'
+    stop_distance = atr*c.atr_sl if atr_risk else entry*c.sl_pct/100
     if stop_distance<=0: return None, []
-    target_distance = stop_distance*c.reward_risk if data.mcx else entry*c.target_pct/100
+    target_distance = stop_distance*c.reward_risk if atr_risk else entry*c.target_pct/100
     stop, target = entry-direction*stop_distance, entry+direction*target_distance
     initial_stop = stop
     best = entry
@@ -471,7 +488,7 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
         if force_exit:
             exit_price,exit_at,reason=op-direction*c.slippage,current,force_exit; break
         hit_stop = lo<=stop if direction==1 else hi>=stop
-        hit_target = hi>=target if direction==1 else lo<=target
+        hit_target = c.exit_mode != 'end_of_day' and (hi>=target if direction==1 else lo<=target)
         # Stop wins ambiguous OHLC collisions. Gaps use the adverse open.
         if hit_stop:
             exit_price=(min(op,stop) if direction==1 else max(op,stop))-direction*c.slippage
@@ -481,11 +498,11 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
             exit_at,reason=current,'target'; break
         favorable = hi if direction==1 else lo
         best = max(best,favorable) if direction==1 else min(best,favorable)
-        if c.strategy==HIGH_STRATEGIES[2] and best>=entry*(1+c.breakeven_trigger_pct/100):
+        if c.exit_mode=='legacy' and c.strategy==HIGH_STRATEGIES[2] and best>=entry*(1+c.breakeven_trigger_pct/100):
             stop=max(stop,entry)  # premium breakeven, not net-of-cost breakeven; next minute
-        jump = stop_distance*c.atr_trail_jump if data.mcx else entry*c.trail_jump_pct/100
-        if c.trail_pct>0 and direction*(best-entry)>=jump:
-            distance = stop_distance if data.mcx else entry*c.trail_pct/100
+        jump = stop_distance*c.atr_trail_jump if atr_risk else entry*c.trail_jump_pct/100
+        if c.exit_mode in ('legacy', 'trailing_sl') and c.trail_pct>0 and direction*(best-entry)>=jump:
+            distance = stop_distance if atr_risk else entry*c.trail_pct/100
             steps=math.floor((direction*(best-entry)+1e-10)/jump)
             # Price can leap through several jumps in one minute; only complete
             # increments advance the trail. Overshoot is retained for next time.
