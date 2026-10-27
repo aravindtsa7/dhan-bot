@@ -11,6 +11,8 @@ import streamlit as st
 from quant_backtester import OUT, run_backtest
 from quant_lake import ROOT, IST, QuantDataLake
 from quant_paper_ui import render_live_paper_room
+from quant_data_ui import render_data_lake, render_data_quality, checked_label
+from quant_data_quality import read_document, fingerprint, file_fingerprint
 from quant_terminal import (PAGES, INSTRUMENT_LABELS, STRATEGY_LABELS, STRATEGY_NOTES,
                             INTERVALS, EXITS, build_config, lake_snapshot, load_registry,
                             register_run, save_strategy, form_values, read_json)
@@ -20,7 +22,7 @@ st.markdown('<style>'+Path(__file__).with_name('quant_terminal.css').read_text(e
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def snapshot(root):
+def snapshot(root, evidence_token=None):
     return lake_snapshot(root)
 
 
@@ -71,7 +73,7 @@ def coverage_card(data):
         card_title('📊 Dataset Coverage', 'COMMITTED PARTITIONS')
         rows = ''
         for row in data['coverage']:
-            state = 'positive' if row['status'] == 'Ready' else 'amber'
+            state = 'positive' if row['status'] == 'Checks passed' else 'amber'
             rows += (f'<tr><td class="strong">{escape(row["dataset"])}</td><td>{row["interval"]}</td>'
                      f'<td>{row["coverage"]}</td><td><span class="{state} dot">{row["status"]}</span></td></tr>')
         html('<div class="table-scroll"><table class="terminal-table"><thead><tr><th>Dataset</th><th>Interval</th>'
@@ -80,17 +82,13 @@ def coverage_card(data):
 
 
 def quality_card(data):
-    report = data['quality']
-    checked = pd.Timestamp(report['checked_at']).tz_convert(IST).strftime('%d %b %Y, %H:%M IST') if report.get('checked_at') else 'Not audited'
-    counts = report.get('quality_counts', {})
+    state = data['quality_state']
     with st.container(border=True, key='quality'):
-        card_title('🛡️ Data Quality', f'Last checked: {checked}')
-        missing = f'{counts["missing_internal_minutes"]:,}' if 'missing_internal_minutes' in counts else '—'
-        duplicates = f'{counts["exact_duplicates"]:,}' if 'exact_duplicates' in counts else '—'
-        html(f'<div class="quality-grid"><div><label>Missing candles</label><strong>{missing}</strong></div>'
-             f'<div><label>Duplicates</label><strong>{duplicates}</strong></div>'
-             f'<div><label>Expiry mapping</label><strong class="amber quality-text">{data["expiry_mapping"]}</strong></div></div>')
-        st.caption(f'Exact duplicates removed · {counts.get("conflicting_duplicate_rows", 0):,} conflicting rows quarantined. Rolling option expiry identities are unverified.')
+        card_title('🛡️ Data Quality', checked_label(state))
+        st.write(state['status'])
+        st.caption(state['explanation'])
+        st.caption('File integrity, candle validity, historical session coverage and options identity are separate checks.')
+        st.caption('Options expiry identity: '+data['expiry_mapping'])
 
 
 def run_picker(runs, key, default=False):
@@ -263,27 +261,6 @@ def render_result(run_id, full=False):
         st.download_button('Download run configuration', json.dumps(result['config'], indent=2), f'{run_id}_config.json', 'application/json')
 
 
-def render_catalog(data, search):
-    coverage_card(data)
-    with st.container(border=True, key='catalog'):
-        card_title('Dataset catalog', 'LOCAL PARQUET')
-        frame = pd.DataFrame(data['catalog'])
-        if frame.empty:
-            st.info('No committed datasets. Build the data lake to begin.'); return
-        mask = frame.instrument.str.contains(search, case=False, regex=False) | frame.dataset.str.contains(search, case=False, regex=False)
-        st.dataframe(frame[mask].rename(columns=lambda c: c.replace('_', ' ').title()), hide_index=True, width='stretch')
-        st.download_button('Download catalog', frame[mask].to_csv(index=False), 'lake_catalog.csv', 'text/csv')
-    with st.container(border=True, key='explorer'):
-        card_title('Explore candles')
-        with QuantDataLake(ROOT) as lake: catalog = lake.instruments()
-        a, b = st.columns([2, 1])
-        selected = a.selectbox('Dataset', catalog, format_func=lambda v: f'{v[1]} / {v[0]}')
-        day = b.date_input('Session', date(2026, 10, 22))
-        if selected:
-            with QuantDataLake(ROOT) as lake:
-                rows = lake.query(selected[1], str(day), str(day+pd.Timedelta(days=1)), dataset=selected[0], timeframe='1d' if selected[0] == 'daily' else '1m')
-            if rows.empty: st.info('No candles for this dataset and session.')
-            else: st.dataframe(rows, hide_index=True, width='stretch', height=320)
 
 
 def load_saved(record):
@@ -305,7 +282,11 @@ def render_saved(records, search):
 
 
 try:
-    data = snapshot(str(ROOT))
+    manifest, _ = read_document(ROOT / 'ingestion_manifest.json')
+    evidence_token = (fingerprint(manifest), file_fingerprint(ROOT, manifest or {}),
+        tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None for p in
+              (ROOT / 'quality_report.json', ROOT / 'session_calendar.json')))
+    data = snapshot(str(ROOT), evidence_token)
     registry = history(str(OUT))
 except (ValueError, OSError) as exc:
     st.error(str(exc)); st.stop()
@@ -324,8 +305,9 @@ with st.sidebar:
 with st.container(key='topbar'):
     a, b, c = st.columns([6, 1.35, 1.55], vertical_alignment='center')
     with a: search = st.text_input('Search', placeholder='Search datasets, strategies, or runs...', label_visibility='collapsed', key='search')
-    with b: html(f'<div class="lake-badge">● &nbsp; {"LIVE LAKE" if data["available"] else "DEMO DATA"}</div>')
-    with c: html('<div class="profile"><span>AR</span><div>Researcher<small>Local workspace</small></div></div>')
+    if st.session_state.page not in ('Data Lake', 'Data Quality'):
+        with b: html(f'<div class="lake-badge">● &nbsp; {"LIVE LAKE" if data["available"] else "DEMO DATA"}</div>')
+        with c: html('<div class="profile"><span>AR</span><div>Researcher<small>Local workspace</small></div></div>')
 
 page = st.session_state.page
 titles = {'Overview': ('Workspace Overview', 'Indian markets • Research at a glance'),
@@ -350,7 +332,8 @@ for code, label in [('NIFTY', 'NIFTY 50 • NSE'), ('BANKNIFTY', 'BANKNIFTY • 
     else:
         cards += f'<div class="market-card"><label>{label}</label><strong>—</strong><div class="muted">Not ingested</div><small>No sample prices substituted</small></div>'
 cards += '<div class="market-card metadata"><label>RESEARCH INFRASTRUCTURE</label><div class="meta-grid"><div>Source<strong>DhanHQ</strong></div><div>Storage<strong>Parquet</strong></div><div>Timezone<strong>Asia/Kolkata</strong></div></div><small>Local historical lake · No live quote feed</small></div>'
-html('<div class="market-strip">'+cards+'</div>')
+if page not in ('Data Lake', 'Data Quality'):
+    html('<div class="market-strip">'+cards+'</div>')
 
 notice = st.session_state.pop('notice', None)
 if notice: st.success(notice)
@@ -385,19 +368,8 @@ elif page == 'Overview':
     with b:
         quality_card(data)
         st.button('Configure a backtest →', type='primary', on_click=go_page, args=('Backtests',))
-elif page == 'Data Lake': render_catalog(data, search)
-elif page == 'Data Quality':
-    quality_card(data); coverage_card(data)
-    with st.container(border=True, key='audit'):
-        card_title('Audit findings')
-        report = data['quality']
-        if not report: st.info('No audit report yet. Run audit_quant_lake.py to check the local lake.')
-        else:
-            for issue in report.get('issues', []): st.error(str(issue))
-            if not report.get('issues'): st.success('Partition integrity checks passed. Historical coverage still requires the reviews below.')
-            st.dataframe(pd.DataFrame([{'Check': k.replace('_', ' ').title(), 'Count': v} for k, v in report.get('quality_counts', {}).items()]), hide_index=True, width='stretch')
-            st.caption(f'{report.get("short_sessions_for_review", 0)} short sessions need calendar review.')
-            for note in report.get('notes', []): st.write('• '+note)
+elif page == 'Data Lake': render_data_lake(ROOT)
+elif page == 'Data Quality': render_data_quality(ROOT)
 elif page == 'Strategy Builder':
     a, b = st.columns([1.15, 1], gap='large')
     with a: configure_card()

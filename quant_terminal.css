@@ -1,4 +1,21 @@
 :root {color-scheme:dark; --navy:#0b121e; --card:#111a2b; --border:#1e2d45; --cyan:#22d3ee; --muted:#7c8da8;}
+/* Data workspaces: owned classes and stable Streamlit container keys only. */
+.data-summary-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px;}
+.data-summary-card {background:var(--card);border:1px solid var(--border);border-radius:9px;padding:18px;}
+.data-summary-card label {display:block;color:#94a3b8;font-size:12px;}
+.data-summary-card strong {display:block;color:#dff6ff;font-size:24px;font-weight:600;line-height:1.35;margin:9px 0;overflow-wrap:anywhere;}
+.data-summary-card small {display:block;font-size:11px;color:#91a3bc;line-height:1.5;}
+.data-panel-title {display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px;}
+.data-panel-title h3 {font-size:17px;font-weight:600;margin:0;padding:0;}
+.data-panel-title span {color:#67c8de;font-size:11px;}
+.data-facts {margin:12px 0;}
+.data-facts>div {display:grid;grid-template-columns:minmax(100px,.7fr) minmax(0,1.3fr);gap:16px;border-bottom:1px solid var(--border);padding:9px 0;}
+.data-facts dt {color:#91a3bc;font-size:12px;}
+.data-facts dd {margin:0;color:#d5e0ed;font-size:12px;line-height:1.5;overflow-wrap:anywhere;}
+.st-key-lake_table,.st-key-lake_details,.st-key-lake_preview,.st-key-quality_overview,.st-key-quality_results,.st-key-quality_findings {background:var(--card);border:1px solid var(--border);border-radius:9px;padding:18px;}
+:is(.st-key-lake_browser,.st-key-lake_preview,.st-key-quality_overview,.st-key-quality_results,.st-key-quality_findings) [data-testid="stCaptionContainer"] p {font-size:12px;color:#98abc4;line-height:1.6;}
+@media(max-width:1100px) {.data-summary-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:760px) {.data-summary-grid {gap:10px;}.data-summary-card {padding:13px;}.data-summary-card strong {font-size:20px;}.data-facts>div {grid-template-columns:1fr;gap:4px;}}
 html,body,[class*="css"],.stApp {font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
 .stApp,[data-testid="stAppViewContainer"] {background:var(--navy);color:#e2e8f0;}
 [data-testid="stHeader"] {background:transparent;height:2.7rem;}

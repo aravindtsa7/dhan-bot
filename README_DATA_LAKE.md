@@ -28,8 +28,10 @@ use a separate `--root`.
 - `quarantine/`: out-of-hours or invalid OHLCV rows with rejection reasons.
 - `ingestion_manifest.json`: exact request payload, time window, status, checksum,
   file location, row count, actual coverage, and validation counts per partition.
-- `summary.csv`, `quality_report.json`, `session_coverage.parquet`,
-  `query_benchmark.json`: produced by the audit command.
+- `quality_report.json`: current versioned, manifest-bound local audit.
+- `audit_history/`: preserved previous audit report bytes.
+- `summary.csv`, `session_coverage.parquet`, `query_benchmark.json`: legacy
+  artifacts; the current UI does not treat these as current audit evidence.
 
 Parquet is Zstandard-compressed with timezone-aware IST timestamps. Stable
 28-day storage partitions can grow at the tail without creating overlapping
@@ -68,6 +70,53 @@ first/max/min/last, volume sums, and OI/IV/spot/strike use the last observation.
 A `QuantDataLake` instance owns a DuckDB connection; create one per UI worker.
 
 ## Research limitations that must remain visible in the UI
+
+The current seven-page terminal uses **Data Lake** and **Data Quality** for
+catalog inspection and local audits. See [README_DARK_TERMINAL.md](README_DARK_TERMINAL.md)
+for workflow, export bounds and status definitions. The option-chain module
+described below remains a separate API/module; it is no longer a navigation tab.
+
+## Session evidence for quality audits
+
+`session_calendar.json` is optional local evidence, not a downloader. No schedule
+is inferred from the expiry calendar, weekdays, candle count, or the first observed
+commodity candle. Unsupported dates remain **Coverage not verified**. A sourced
+date-specific schedule can represent closures (`windows: []`), special sessions,
+breaks, and MCX seasonal closing changes. Each window is opening-inclusive and
+closing-exclusive, at one-minute frequency. Windows must be ordered, disjoint,
+and within the dated session. Daily data expects one candle on an evidenced open
+session; it never receives a 375-minute expectation.
+
+Schema illustration only — these are **not real exchange schedule facts**:
+
+```json
+{
+  "sessions": [
+    {"exchange": "NSE", "date": "2026-01-05", "windows": [["09:15", "15:30"]], "source": "Replace with reviewed exchange notice"},
+    {"exchange": "NSE", "date": "2026-01-06", "windows": [], "source": "Replace with reviewed closure notice"}
+  ],
+  "contracts": {
+    "EXACT_COMMODITY_STREAM_NAME": {
+      "start": "2026-01-05", "end_exclusive": "2026-02-01",
+      "source": "Replace with reviewed contract listing/applicability evidence"
+    }
+  }
+}
+```
+
+Only the union of a stream's requested manifest periods is evaluated. Commodity
+futures additionally require exact-stream applicability bounds and provenance;
+dates outside those bounds are not counted as missing sessions. The source field
+records the local evidence supplied by the operator; the audit does not fetch or
+authenticate external notices. Review the evidence before treating counts as
+exchange-complete. Options identity remains a separate unverified field.
+
+Run `.venv\Scripts\python.exe audit_quant_lake.py --root data_lake` to check local
+files only. The command exits nonzero for findings requiring review; a successful
+audit execution can correctly produce **Review needed**. It serializes with
+ingestion, hashes committed files, checks candles/duplicates and preserves prior
+reports. It never rewrites historical partitions, session-coverage artifacts,
+strategy settings or credentials.
 
 ### Step 9: weekly option chain and strike replay
 

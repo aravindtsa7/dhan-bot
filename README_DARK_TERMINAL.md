@@ -86,7 +86,82 @@ simulation returns a clear availability error. No other index is substituted.
 Rolling-option expiry identity remains unverified, and actual missing-candle
 and duplicate counts are shown. Research results retain modeled-price caveats.
 
-## Verification
+## Data Lake and Data Quality workspaces
+
+Data Lake groups the local catalog by **exchange, underlying/product, segment,
+and stored interval**. Options streams and futures contracts remain individually
+selectable. Daily and minute candles are separate datasets. The four summary
+cards count readable committed Parquet rows, distinct physical file bytes, and
+available logical datasets. Quarantine, orphan files and generated results are
+excluded. Counts represent stored stream observations, not unique tradable
+contracts or a continuous futures series.
+
+Filter by exchange, instrument or segment, search a stream name, then use
+**Selected dataset** and **Stream / contract**. Details show exact stored dates,
+session availability, recorded endpoints, interval derivations, storage and
+options-identity limitations. The preview defaults to the selected stream's
+latest actual session. Preview CSV contains exactly the displayed 100, 500 or
+1,000 rows for that single session; it is not an entire-lake export.
+**Open Data Quality** carries the dataset selection across pages.
+
+The expandable ingestion panel shows manifest records and exclusive request-end
+dates, including failed, empty and unavailable responses. These are not download
+jobs, and no pause/resume, import, or download actions are implied.
+
+Data Quality separates file integrity, stored candle validity, historical session
+coverage, and options identity. **Run quality check** reads local partitions and
+writes an atomic `quality_report.json`; it makes no broker requests, repairs,
+fills or downloads. Prior report bytes, including malformed reports, are retained
+under `data_lake/audit_history/`. Filter and export findings as CSV or download
+the original report JSON. Legacy report evidence remains visible in the technical
+expander but cannot establish a current verification.
+
+| Status | Meaning |
+| --- | --- |
+| No data | No manifest datasets, or no stored candles for the selected group. |
+| Not checked | No supported audit bound to this lake; legacy/unversioned reports are unverified. |
+| Audit outdated | Manifest, committed-file state or session evidence changed, or ingestion changed the snapshot during the audit. |
+| Review needed | Failed/empty/unavailable requests, integrity/validity findings, insufficient coverage evidence, or unverified options identity require review. |
+| Checks passed | The documented checks passed within their evidenced scope; a checksum alone never grants this status. |
+
+Reports carry an audit version, canonical manifest fingerprint, file-state
+fingerprint and session-calendar fingerprint. Checksums are read during audits;
+file size/mtime changes also invalidate the displayed report. An unchanged
+size/mtime is not a fresh cryptographic check. Audits share the ingestion writer
+lock and recheck the snapshot before publishing. The existing backtest integrity
+`issues` field is retained. Legacy `session_coverage.parquet` and benchmark files
+are not rewritten or used to claim current UI coverage.
+
+Exact removed input duplicates, rejected/quarantined conflicting rows, and
+unresolved conflicts in stored candles are separate findings. Missing measurements
+remain unknown. A one-candle minute session never passes coverage. Without a
+verified session schedule, observed minute-spacing holes are described only as
+spacing measurements, not exact counts of missing exchange candles.
+
+Expected opening/closing gaps and entirely absent sessions require an optional
+local `data_lake/session_calendar.json`. Its schema is documented in
+[README_DATA_LAKE.md](README_DATA_LAKE.md#session-evidence-for-quality-audits).
+The existing expiry calendar does **not** establish a complete exchange-session
+calendar. The current lake has no such session evidence, so historical coverage
+remains unverified. Rolling ATM-relative options retain unverified contract/expiry
+identity even when their file and candle checks pass.
+
+### Offline checks
+
+```powershell
+# Self-contained fixtures; no local market data required
+.venv\Scripts\python.exe verify_offline_tests.py test_quant_data_pages
+# Full regression suite; includes tests requiring the existing local lake
+.venv\Scripts\python.exe verify_offline_tests.py
+```
+
+The runner blocks external socket connections while allowing Windows asyncio's
+loopback sockets. The existing `test_quant_lake.LakeTests.test_live_lake_query_intraday_bound`
+and `test_quant_option_chain.LocalLakeOptionTests` require actual local NIFTY/SENSEX
+data; they are not replaced with fixtures or skipped. The full paper-page smoke
+test also reads existing local paper artifacts without starting a trader.
+
+### Backtest checks
 
 ```powershell
 .venv\Scripts\python -m unittest discover -p "test_*.py"

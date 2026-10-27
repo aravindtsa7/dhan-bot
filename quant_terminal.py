@@ -83,59 +83,52 @@ def read_json(path):
 
 
 def lake_snapshot(root):
-    """Use the lake catalog and committed chunks, never decorative example figures."""
+    """Shared cards use the same evidence-bound statuses as the data pages."""
+    from quant_data_quality import inventory, report_state, group_status
     root = Path(root)
-    with QuantDataLake(root) as lake:
-        catalog = lake.catalog()
-        chunks = list(lake.manifest['chunks'].values())
-        complete = [c for c in chunks if c['status'] == 'complete' and c.get('rows', 0)]
-        markets = {}
-        for name in ('NIFTY', 'BANKNIFTY', 'SENSEX'):
-            records = [c for c in complete if c['dataset'] == 'spot_1m' and c['instrument'] == name]
-            if not records:
-                markets[name] = None
-                continue
-            last = max(pd.Timestamp(c.get('last', c['end'])) for c in records)
-            frame = lake.query(name, str((last - pd.Timedelta(days=12)).date()),
-                               str((last + pd.Timedelta(days=1)).date()))
-            if frame.empty:
-                markets[name] = None
-                continue
+    inv = inventory(root)
+    state = report_state(root, inv)
+    markets = dict.fromkeys(('NIFTY', 'BANKNIFTY', 'SENSEX'))
+    for name in markets:
+        stream = inv['streams'].get('spot_1m|'+name)
+        if not stream or not stream['last']:
+            continue
+        try:
+            last = pd.Timestamp(stream['last'])
+            with QuantDataLake(root) as lake:
+                frame = lake.query(name, str((last-pd.Timedelta(days=12)).date()),
+                                   str((last+pd.Timedelta(days=1)).date()))
+            if frame.empty: continue
             closes = frame.groupby(frame.timestamp.dt.date).close.last()
             latest = float(closes.iloc[-1])
-            prior = float(closes.iloc[-2]) if len(closes) > 1 else None
+            prior = float(closes.iloc[-2]) if len(closes)>1 else None
             markets[name] = dict(price=latest, change=latest-prior if prior else None,
-                                 change_pct=100*(latest/prior-1) if prior else None,
-                                 asof=frame.timestamp.iloc[-1].isoformat())
-    quality_path = root / 'quality_report.json'
-    quality = read_json(quality_path) if quality_path.exists() else {}
-    coverage = []
-    groups = {
-        'Index spot': lambda c: c['dataset'] == 'spot_1m' and c['instrument'] in ('NIFTY', 'BANKNIFTY', 'SENSEX'),
-        'Expired options': lambda c: c['dataset'].startswith('options_'),
-        'MCX commodities': lambda c: c['dataset'] == 'spot_1m' and any(c['instrument'].startswith(i+'_') for i in POINT_VALUE),
-    }
-    for label, predicate in groups.items():
-        records = [c for c in complete if predicate(c)]
-        requested = [c for c in chunks if predicate(c)]
-        first = min((c.get('first', c['start'])[:10] for c in records), default=None)
-        last = max((c.get('last', c['end'])[:10] for c in records), default=None)
-        gaps = sum(c.get('quality', {}).get('missing_internal_minutes', 0) for c in records)
-        rejected = any(c.get('quality', {}).get('conflicting_duplicate_rows', 0) or
-                       c.get('quality', {}).get('invalid_ohlcv', 0) for c in records)
-        partial = any(c['status'] in ('failed', 'unavailable') for c in requested)
-        span = 'Not ingested'
-        if first:
-            span = f'{first[:4]} – {last[:4]}' if first[:4] != last[:4] else f'{pd.Timestamp(first):%b} – {pd.Timestamp(last):%b %Y}'
-        coverage.append(dict(dataset=label, interval='1 minute', first=first, last=last,
-                             coverage=span,
-                             status='Not available' if not records else 'Review gaps' if gaps or rejected or partial else 'Ready',
-                             rows=sum(c['rows'] for c in records), gaps=gaps))
-    rolling = any(c['dataset'] == 'options_rolling_1m' for c in complete)
-    return dict(markets=markets, coverage=coverage, quality=quality, catalog=catalog,
-                rows=sum(c['rows'] for c in complete), partitions=len(complete),
-                expiry_mapping='Unverified' if rolling else 'Not audited',
-                available=bool(complete))
+                change_pct=100*(latest/prior-1) if prior else None, asof=frame.timestamp.iloc[-1].isoformat())
+        except Exception:
+            # Data pages expose the exact file/manifest findings; a quote card must not crash navigation.
+            continue
+    coverage=[]
+    for label, segment in [('Index spot','Index spot'), ('Expired options','Rolling options'), ('MCX commodities','Commodity futures')]:
+        groups=[g for g in inv['groups'] if g['segment']==segment and g['interval']=='1 minute']
+        starts=[g['first'] for g in groups if g['first']]
+        ends=[g['last'] for g in groups if g['last']]
+        first=min(starts,key=pd.Timestamp)[:10] if starts else None
+        last=max(ends,key=pd.Timestamp)[:10] if ends else None
+        statuses=[group_status(g,inv,state) for g in groups]
+        status=next((s for s in ('Review needed','Audit outdated','Not checked','No data') if s in statuses), 'Checks passed' if statuses else 'No data')
+        coverage.append(dict(dataset=label,interval='1 minute',first=first,last=last,
+            coverage=(first+' / '+last) if first else 'Not ingested',status=status,
+            rows=sum(g['rows'] for g in groups),gaps=None))
+    catalog=[]
+    for stream in inv['streams'].values():
+        row=dict(dataset=stream['dataset'],instrument=stream['instrument'],rows=stream['rows'])
+        row.update({s+'_chunks':sum(r['status']==s for r in stream['records']) for s in ('complete','empty','failed','unavailable')})
+        catalog.append(row)
+    return dict(markets=markets,coverage=coverage,quality=state['report'] or {},quality_state=state,
+                catalog=catalog,rows=sum(g['rows'] for g in inv['groups']),
+                partitions=sum(g['partitions'] for g in inv['groups']),
+                expiry_mapping='Unverified' if any(s['dataset'].startswith('options_') for s in inv['streams'].values()) else 'Not applicable',
+                available=any(g['rows'] for g in inv['groups']))
 
 
 def _entry(result, display_id, created_at):

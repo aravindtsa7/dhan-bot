@@ -21,8 +21,9 @@ from quant_lake import QuantDataLake, ROOT, IST
 from quant_calendar import CALENDAR_HASH, expiries, next_expiry, is_expiry_day, regular_session
 from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
+from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
 
-ENGINE_VERSION = '5.2.0'
+ENGINE_VERSION = '5.3.0'
 OUT = ROOT / 'backtests'
 STRATEGIES = ['EMA_Supertrend_VWAP_Directional', 'ORB_Option_Momentum_Breakout',
               'Dual_CE_PE_Straddle_Breakout', 'VWAP_Trend_Pullback_Buyer',
@@ -252,6 +253,7 @@ class ResearchData:
     def __init__(self, instrument, start='2025-01-01', end='2026-10-23', root=ROOT):
         self.instrument, self.start, self.end, self.root = instrument, start, end, Path(root)
         self.days, self.exclusions, self._features, self._events = {}, [], {}, {}
+        self.eligibility = []
         report_path = self.root/'quality_report.json'
         if not report_path.exists():
             raise ValueError('Run audit_quant_lake.py first: quality report is required')
@@ -267,7 +269,17 @@ class ResearchData:
             self.fingerprint = hashlib.sha256(self.fingerprint.encode()+calendar.read_bytes()).hexdigest()[:16]
         self.has_calendar = bool(self.expiry_calendar)
         self.mcx = instrument in POINT_VALUE
+        self.required_windows = required_windows(self.mcx)
+        selections = {}
         with QuantDataLake(self.root) as lake:
+            names = {name for ds, name in lake.instruments() if
+                     (ds == 'spot_1m' and (name.startswith(instrument+'_') if self.mcx else name == instrument)) or
+                     (not self.mcx and ds == 'options_rolling_1m' and
+                      name in {f'{instrument}_{side}_{strike}_WEEK1' for side in ('CE','PE') for strike in ('ATM','ATM-1','ATM+1')})}
+            records = [r for r in lake.manifest['chunks'].values() if r['status'] == 'complete'
+                       and r['dataset'] in ('spot_1m', 'options_rolling_1m') and r['instrument'] in names
+                       and r['start'] < end and (self.mcx or r['end'] > start)]
+            verify_files(self.root, records)
             if self.mcx:
                 frames = [lake.query(name, start, end) for ds, name in lake.instruments()
                           if ds == 'spot_1m' and name.startswith(instrument+'_')]
@@ -276,10 +288,10 @@ class ResearchData:
                     raise ValueError(f'No data for {instrument}')
                 allspot = pd.concat(frames, ignore_index=True)
                 allspot['date'] = allspot.timestamp.dt.strftime('%Y-%m-%d')
-                vols = allspot.groupby(['date', 'instrument']).volume.sum().unstack()
-                # Only yesterday's observed contracts can be selected today.
-                chosen = vols.shift(1).apply(lambda row: row.idxmax() if row.notna().any() else None, axis=1)
-                spot = allspot[allspot.instrument.eq(allspot.date.map(chosen))].copy()
+                selections = select_contracts(prior_volume(lake, records, end), sorted(allspot.date.unique()))
+                # Keep observed execution dates, even those without a selectable
+                # contract, so every exclusion can be inspected.
+                spot = allspot
                 opts = pd.DataFrame()
             else:
                 spot = lake.query(instrument, start, end)
@@ -300,44 +312,57 @@ class ResearchData:
             flagged = set(zip(coverage.loc[coverage.short_session_review, 'instrument'],
                               coverage.loc[coverage.short_session_review, 'session'].astype(str)))
         for date, s in spot.groupby('date', sort=True):
+            contract, prior, selection_error = selections.get(date, (instrument, None, None))
+            audit = dict(date=date, instrument=instrument, selected_contract=contract if self.mcx else None,
+                         selection_session=prior, required_windows=self.required_windows,
+                         status='excluded', reasons=[], evidence=[])
+            self.eligibility.append(audit)
+            if self.mcx:
+                s = s[s.instrument.eq(contract)]
+                if selection_error or s.empty:
+                    reason = selection_error or 'Prior-session selected contract has no execution candles'
+                    audit['reasons'].append(dict(problem=reason, stream=contract))
+                    self.exclusions.append(dict(date=date, instrument=instrument, contract=contract, reason=reason))
+                    continue
             s = s.sort_values('timestamp').copy()
             s['minute'] = s.timestamp.dt.hour*60+s.timestamp.dt.minute
-            begin, finish = (1020, 1395) if self.mcx else (555, 920)
-            relevant = s[s.minute.between(begin, finish)]
-            reason = 'calendar: no regular index session' if not self.mcx and not regular_session(date) else None
-            if (s.instrument.iloc[0], date) in flagged:
-                reason = 'quality report: short underlying session'
-            elif set(relevant.minute) != set(range(begin, finish+1)):
-                reason = 'missing underlying minute in trading window'
-            if reason:
-                self.exclusions.append(dict(date=date, reason=reason)); continue
+            if not self.mcx and not regular_session(date):
+                audit['reasons'].append(dict(problem='calendar: no regular index session', stream=instrument))
+            stream = s.instrument.iloc[0]
+            reasons, notes = stream_check(s, date, stream, self.required_windows['underlying'], (stream,date) in flagged)
+            rejected, evidence = rejected_evidence(self.root, records, date, stream, self.required_windows['underlying'])
+            audit['reasons'].extend(reasons+rejected); audit['evidence'].extend(notes+evidence)
             option_map, rolling, option_meta = {}, {}, {}
             if not self.mcx:
-                od = option_days.get(date)
-                if od is None:
-                    self.exclusions.append(dict(date=date, reason='no options')); continue
-                bad = False
-                for (side, strike), g in od.groupby(['option_type', 'moneyness']):
-                    g = g.copy()
+                od = option_days.get(date, pd.DataFrame())
+                for side, strike in ((side, strike) for side in ('CE','PE') for strike in ('ATM','ATM-1','ATM+1')):
+                    stream = f'{instrument}_{side}_{strike}_WEEK1'
+                    g = od[od.instrument.eq(stream)].copy() if len(od) else od.copy()
+                    reasons, notes = stream_check(g, date, stream, self.required_windows['options'], (stream,date) in flagged)
+                    rejected, evidence = rejected_evidence(self.root, records, date, stream, self.required_windows['options'])
+                    audit['reasons'].extend(reasons+rejected); audit['evidence'].extend(notes+evidence)
+                    if g.empty: continue
                     g['minute'] = g.timestamp.dt.hour*60+g.timestamp.dt.minute
-                    if ((g.instrument.iloc[0], date) in flagged or
-                        set(g.loc[g.minute.between(begin, finish), 'minute']) != set(range(begin, finish+1))):
-                        bad = True; break
                     rolling[side, strike] = {int(row.minute): float(row.strike) for row in g.itertuples()}
                     for row in g.itertuples():
                         key = (int(row.minute), side, float(row.strike))
                         value = (row.open, row.high, row.low, row.close, row.volume)
                         if key in option_map and option_map[key] != value:
-                            bad = True; break
+                            audit['reasons'].append(dict(problem='Conflicting same-strike candles', stream=stream,
+                                                         timestamps=[row.timestamp.isoformat()]))
                         option_map[key] = value
                         option_meta[key] = (float(row.oi),float(row.iv),float(row.spot))
-                if bad or len(rolling) != 6:
-                    self.exclusions.append(dict(date=date, reason='option gap, short session, or conflicting same-strike candles')); continue
+            if audit['reasons']:
+                self.exclusions.append(dict(date=date, instrument=instrument, contract=contract if self.mcx else None,
+                                            reason='; '.join(sorted({r['problem'] for r in audit['reasons']}))))
+                continue
+            audit['status'] = 'eligible'
             self.days[date] = dict(spot=s, prices={int(r.minute): (r.open,r.high,r.low,r.close,r.volume) for r in s.itertuples()},
                                   options=option_map, option_meta=option_meta, rolling=rolling, contract=s.instrument.iloc[0],
                                   timestamp=s.timestamp.iloc[0].normalize())
-        if not self.days:
-            raise ValueError(f'No complete, quality-eligible sessions for {instrument}')
+        # An all-excluded request still has a useful eligibility report and zero
+        # executions; do not erase the evidence with a generic loader exception.
+        self.fingerprint = hashlib.sha256(self.fingerprint.encode()+json.dumps(self.eligibility, sort_keys=True).encode()).hexdigest()[:16]
 
     def features(self, timeframe):
         if timeframe not in self._features:
@@ -595,7 +620,7 @@ def run_backtest(c, data=None, output=OUT, persist=True):
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'
-    if persist and marker.exists() and all((path/f'{name}.parquet').exists() for name in ('trades','equity','monthly','stop_paths','excluded_sessions','skipped_entries','daily_risk')):
+    if persist and marker.exists() and (path/'eligibility.json').exists() and all((path/f'{name}.parquet').exists() for name in ('trades','equity','monthly','stop_paths','excluded_sessions','skipped_entries','daily_risk')):
         return json.loads(marker.read_text())
     began=time.perf_counter()
     from quant_portfolio import execute_portfolio
@@ -616,6 +641,8 @@ def run_backtest(c, data=None, output=OUT, persist=True):
             splits[col]=closed.groupby(col).agg(trades=('net_pnl','size'),net_pnl=('net_pnl','sum')).reset_index().to_dict('records')
     result=dict(run_id=run_id,config=asdict(c),metrics=metrics,splits=splits,engine_version=ENGINE_VERSION,
                 data_fingerprint=data.fingerprint,eligible_sessions=len(data.days),excluded_sessions=len(data.exclusions),
+                eligibility=getattr(data,'eligibility',[]),
+                eligibility_scope='Run dependency windows, not whole-session historical health or verified options identity',
                 first_session=min(data.days,default=None),last_session=max(data.days,default=None),runtime_seconds=round(time.perf_counter()-began,3),
                 status='observed_candles_accounting_checked' if data.mcx else 'model_dependent' if metrics['modeled_trades'] else 'observed_strike_expiry_unverified',
                 verified_price_eligible=bool(data.mcx and metrics['unresolved_trades']==0 and len(trades)>0),
@@ -623,6 +650,7 @@ def run_backtest(c, data=None, output=OUT, persist=True):
                 equity_basis='all entered trades closed; realized daily equity; modeled prices explicitly tagged',path=str(path.resolve()))
     if persist:
         path.mkdir(parents=True,exist_ok=True)
+        atomic_json(path/'eligibility.json', result['eligibility'])
         for name,frame in [('trades',trades),('equity',equity),('monthly',monthly),('stop_paths',pd.DataFrame(paths)),('skipped_entries',pd.DataFrame(skipped)),('excluded_sessions',pd.DataFrame(data.exclusions)),('daily_risk',pd.DataFrame(daily_risk))]:
             temp=path/f'{name}.parquet.tmp'
             frame.to_parquet(temp,index=False); os.replace(temp,path/f'{name}.parquet')

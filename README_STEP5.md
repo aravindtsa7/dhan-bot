@@ -39,6 +39,65 @@ Equity and underwater charts use realized daily P&L. Sharpe uses returns on the 
 
 ## Reproducible verification
 
+### Run data selection and eligibility (engine 5.3.0)
+
+MCX contract selection uses the immediately preceding **observed** session's
+stored total volume, including context before the requested start. Weekends
+and missing calendar dates are not assumed to be sessions. Equal volumes keep
+the lexical contract-name tie break. No execution-day final volume selects
+that day's contract; an unavailable selected contract is excluded rather than
+replaced using today's volume. Only requested execution dates enter results.
+The earliest observed date without prior volume is explicitly excluded.
+
+Run prerequisites are inclusive IST windows: index underlying and all six
+rolling option streams **09:15–15:20**; selected MCX underlying **09:00–23:15**.
+These are dependency windows, not entry hours. Indicators reset each day but
+consume the morning history (EMA/ATR/ADX and cumulative VWAP); MCX evening
+entries also use that history. Opening ranges, option confirmations, position
+management and mandatory square-off remain unchanged. The shared loader keeps
+its six-stream prerequisite because fixed-strike signals and the continuity
+model use both sides and neighboring offsets; it does not optimize eligibility
+to the candles a particular trade happened to consume.
+
+Required opening/closing candles, internal gaps, invalid records and conflicting
+same-strike quotes are checked. Legacy whole-session short flags are re-measured
+against stored timestamps instead of automatically excluding the date. A gap
+after 15:20 alone cannot exclude an index session. Historical flags and audit
+reports are retained. Rejected invalid/conflicting aggregates require readable,
+accounted-for quarantine timestamps; unavailable evidence fails closed.
+Recorded checksums are rechecked for execution and selection-context files;
+missing/changed files and the existing audit integrity gate still block loading.
+
+Each new run saves `eligibility.json` beside `result.json` under its run directory.
+The result JSON also embeds these records: date, instrument, selected contract,
+selection-evidence session, required windows, eligible/excluded status, reasons,
+streams and known timestamps. All-excluded observed requests save zero-execution
+results with their exclusions. `ResearchData.eligibility` exposes the same checks
+without running or persisting a backtest.
+
+Eligibility is distinct from whole-session health and verified option history.
+The existing regular-index calendar policy remains; no new special sessions or
+MCX calendar completeness claims are added. Entirely unobserved MCX dates are
+not invented as expected sessions. Prior volume describes the stored sample,
+not verified full-session volume; unchanged partial prior sessions remain the
+existing selection evidence. Rolling expiry identity and modeled fixed-strike
+continuity limitations remain. Request-boundary invariance concerns selected
+contracts and execution inputs, not portfolio P&L across different trade histories.
+
+Version 5.3.0 changes the hashed run identity; existing 5.2.0 directories remain
+inspectable and are not reused or included in the current-engine leaderboard.
+Eligibility evidence is part of the data fingerprint. A cached completion also
+requires the eligibility artifact.
+
+Self-contained loader checks, with external sockets blocked:
+
+```powershell
+.venv\Scripts\python.exe verify_offline_tests.py test_quant_run_data
+```
+
+The full offline suite includes these fixtures (do not add the focused count
+again). Existing local-lake tests still require the installed historical lake.
+
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -v
 .venv\Scripts\python.exe -X utf8 verify_step5.py
