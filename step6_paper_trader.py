@@ -143,7 +143,15 @@ async def live(args,c,emit,transport):
             now=time.time(); mono=time.monotonic(); local=datetime.fromtimestamp(now,IST)
             if (args.output/'STOP').exists(): stop()
             if args.duration and mono-started>=args.duration: stop()
-            if local.hour*60+local.minute>=(1396 if c.instrument in POINT_VALUE else 921): stop()
+            clock_minute=local.hour*60+local.minute
+            expiry_strategy=c.strategy=='expiry_day'
+            market_open=not expiry_strategy or 555<=clock_minute<930
+            if expiry_strategy:
+                from quant_calendar import is_expiry_day
+                from quant_backtester import minute
+                if is_expiry_day(c.instrument,local.date().isoformat()) and clock_minute>=minute(c.expiry_exit_cutoff)+1: stop()
+                if ws and not market_open: await drop()
+            elif clock_minute>=(1396 if c.instrument in POINT_VALUE else 921): stop()
             if stopping:
                 account.request_exit(stop_reason)
                 p=account.position
@@ -156,7 +164,7 @@ async def live(args,c,emit,transport):
             if p and p['pending_exit']:
                 q=latest.get(Asset(**p['asset']).key)
                 if ws and q and q.fresh(now): account.close(q,now,p['pending_exit'])
-            if ws is None and mono>=retry_at:
+            if ws is None and mono>=retry_at and market_open:
                 try:
                     uri='wss://api-feed.dhan.co?'+urlencode(dict(version=2,token=token,clientId=client_id,authType=2))
                     ws=await connect(uri,open_timeout=10,close_timeout=2,ping_interval=10,ping_timeout=20,max_queue=32,logger=transport)
@@ -169,7 +177,7 @@ async def live(args,c,emit,transport):
                 except Exception:
                     emit('FEED connection failed; credentials and upstream exception text suppressed')
                     await drop()
-            if ws and seed_task is None and mono-last_seed>=60 and not stopping:
+            if ws and seed_task is None and mono-last_seed>=60 and not stopping and market_open:
                 last_seed=mono; snapshot=now
                 seed_task=asyncio.create_task(asyncio.to_thread(warmup,client_id,token,chosen,snapshot,5 if c.strategy in STRATEGIES else 0))
                 seed_task.snapshot=snapshot
@@ -228,6 +236,19 @@ async def live(args,c,emit,transport):
                         if event and not args.monitor_only and not stopping and not account.position:
                             if c.instrument in POINT_VALUE:
                                 account.enter(event,tick,received)
+                            elif c.strategy=='expiry_day':
+                                from quant_expiry import paper_candidates, paper_selection
+                                candidates=paper_candidates(option_master,c.instrument,tick.price,received)
+                                histories={}
+                                for _,asset in candidates:
+                                    histories[asset.key]=await asyncio.to_thread(warmup,client_id,token,asset,received)
+                                resolved=paper_selection(c,candidates,histories,event,received)
+                                if len(resolved)==2:
+                                    for _,asset in resolved:
+                                        if asset.key not in by_key:
+                                            assets.append(asset);by_key[asset.key]=asset
+                                            await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
+                                    pending=(event,resolved,int(received)//60*60+15)
                             elif c.strategy in BOOK_STRATEGIES[:3]:
                                 resolved=option_structure_assets(option_master,c.instrument,event[1],tick.price,received)
                                 confirmed=True

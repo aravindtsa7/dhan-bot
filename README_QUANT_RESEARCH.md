@@ -1,6 +1,6 @@
 # Options and commodities research
 
-**Current engine: 5.4.0.** See [README_DARK_TERMINAL.md](README_DARK_TERMINAL.md) for the eight terminal strategies, eligibility and repair workflow, and [README_BOOK_STRATEGIES.md](README_BOOK_STRATEGIES.md) for atomic option baskets and large-move fixed-strike pricing. [README_STEP4.md](README_STEP4.md) retains the H1–H4 research reference. The remainder of this file documents the retained Step 3 baseline and original cost assumptions, including its historical censoring behavior; current runs require all positions to close or fail explicitly.
+**Current engine: 5.4.0.** See [README_DARK_TERMINAL.md](README_DARK_TERMINAL.md) for the nine terminal strategies, eligibility and repair workflow, [README_EXPIRY_DAY.md](README_EXPIRY_DAY.md) for overnight combined-straddle/strangle research, and [README_BOOK_STRATEGIES.md](README_BOOK_STRATEGIES.md) for atomic option baskets and large-move fixed-strike pricing. [README_STEP4.md](README_STEP4.md) retains the H1–H4 research reference. The remainder of this file documents the retained Step 3 baseline and original cost assumptions, including its historical censoring behavior; current runs require all positions to close or fail explicitly.
 
 Run from `C:\Dhan\dhan-bot`:
 

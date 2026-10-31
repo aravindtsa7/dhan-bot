@@ -51,8 +51,9 @@ Basket exits trigger on synchronized minute closes and fill all legs at the
 next open. A daily account lock overrides a pending strategy exit. Portfolio
 trailing levels become active on the next minute. Combined chart candles show
 only synchronized open/close envelopes; individual option OHLC extrema cannot
-establish simultaneous executable basket prices. Gaps, fees and slippage may
-exceed theoretical expiry payoff bounds. Iron butterfly profit targets remain
+establish simultaneous executable basket prices. Fallback spread marks are
+bounded before execution costs; fees and adverse slippage may exceed theoretical
+payoff bounds. Iron butterfly profit targets remain
 active in every exit mode; all other baskets follow the selected exit mode.
 
 Saved strategies deploy to a virtual-only paper runner. It resolves a common
@@ -75,6 +76,28 @@ prices or broker order endpoints are used in live paper execution.
 3. Other missing-candle cases retain the existing lagged-IV continuity model.
    Missing required spot/neighbor evidence still fails explicitly.
 
+For a vertical or iron butterfly, any current wing fallback additionally invokes
+joint basket pricing at both the minute open and close. Two modeled paired
+strikes share the smaller bounded extrinsic value as a common anchor. With one
+observed leg, that exact quote stays fixed and its modeled partner is projected
+relative to it. A vertical's pre-slippage debit lies in
+`[min(κ − 0.05, max(intrinsic spread, 0.05)), κ − 0.05]`.
+The intrinsic floor must saturate at the ceiling: once intrinsic equals κ,
+the literal floor κ and ceiling κ−0.05 cannot both hold. This is the requested
+conservative tick cap, not a claim that every individual modeled premium meets
+an independent intrinsic floor while an inconsistent observed quote is retained.
+
+The butterfly's call and put vertical liabilities each lie in `[0, κ]` and
+share a single total κ budget, so its signed value stays in `[-κ, 0]`.
+Any excess is removed proportionally from the adjustable liabilities above
+their feasible floors. Exact observed quotes are never silently rewritten;
+incompatible fixed observations that leave no feasible model fail explicitly.
+These bounds feed risk decisions, liquidation marks, next-open fills, per-leg
+fees and P&L. The ledger and minute paths expose `spread_bounds_applied`.
+Slippage and tick rounding follow the projection and remain fully charged.
+Observed-only bars, single options, strap/strip, futures and Expiry Day retain
+their existing valuation paths. Entries still require every observed leg.
+
 Trade and per-leg `modeled_wing_fallback` flags, modeled-bar counts, price sources,
 KPI disclosure, ledger column, and result limitations expose the estimates.
 `strict_observed` still rejects all modeled execution. Synthetic repaired wings
@@ -92,8 +115,12 @@ proof of a verified contract or a profitable strategy.
 
 External sockets are blocked during these checks. The matrix retains current
 Engine 5.4.0 quality/eligibility/repair gates and writes only to ignored
-`data/book_verification/`. It verifies per-leg reconciliation, total costs,
-slippage accounting, entry caps, and zero unresolved trades. It never registers
+`data/book_verification/` (this corrected checkpoint used
+`--output data/book_bounds_verification` for NIFTY and
+`--instruments SENSEX NATURALGAS --output data/book_bounds_remaining` for the
+remaining instruments). It verifies per-leg reconciliation,
+total costs, slippage accounting, entry caps, zero unresolved trades, and every
+fallback-bounded open/close/envelope mark and raw exit against its strike width. It never registers
 verification runs in Reports or changes source partitions.
 
 The 24-row matrix uses ₹1,000,000 capital, one dated lot, 100% capital budget,
@@ -111,32 +138,42 @@ research, conditioned on stored coverage and including disclosed modeled prices.
 | NATURALGAS | 64 | 37 | 2026-07-09 / 2026-10-29 |
 
 The request window was 2025-01-01 through 2026-10-30 inclusive. Unavailable
-dates are not fabricated. All 20 supported runs closed every entered position;
-four MCX option-only combinations are explicitly unsupported. No external
-network was available. NIFTY runs include disclosed repaired inputs; SENSEX
-runs with trades depend on modeled pricing. NATURALGAS uses observed futures
-candles under strict-observed policy. Across runs, 3,866 trades used a wing
-fallback. Several strategies depleted the capital budget and therefore stopped
-entering trades; counts are not identical samples. Losses may exceed starting
-capital on the final gapped/costed close. Positive vertical-spread results also
-depend heavily on modeled fills and unverified rolling expiry identity.
+dates are not fabricated. All four requested index vertical runs passed every
+fallback-bound and accounting assertion and had zero unresolved trades.
+Across the wider 24-row matrix, 18 runs completed, four MCX option-only
+combinations are unsupported, and both SENSEX butterfly runs are incomplete.
+At **2025-08-11 10:59 IST**, fixed **80100 CE** had no usable neighboring
+quote with valid lagged IV for the existing continuity model. The engine still
+rejects that position; no partial aggregate or zero-unresolved claim is reported.
+The bounded strategy follows a different capital/exit path from the previous
+unbounded run, so the previous butterfly totals cannot be carried forward.
+The verification runner records the failure, continues other combinations, and
+returns a nonzero CLI exit status when any supported run is incomplete.
+
+No external network was available. NIFTY runs include disclosed repaired inputs;
+SENSEX runs with trades depend on modeled pricing. NATURALGAS uses observed
+futures candles under strict-observed policy. Several strategies depleted the
+capital budget and therefore stopped entering trades; counts are not identical
+samples. Losses may exceed starting capital on the final gapped/costed close.
+Positive vertical-spread results still depend heavily on modeled fills and
+unverified rolling expiry identity; the bound is not validation of those prices.
 
 | Instrument | TF | Strategy | Net ₹ | Win % | Trades | Profit factor |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
-| NIFTY | 5m | Vertical | 630,628.60 | 46.49 | 869 | 1.737 |
-| NIFTY | 5m | Iron butterfly | -999,690.54 | 3.85 | 338 | 0.021 |
+| NIFTY | 5m | Vertical | 463,876.90 | 59.15 | 869 | 4.279 |
+| NIFTY | 5m | Iron butterfly | 73,627.37 | 28.65 | 562 | 1.242 |
 | NIFTY | 5m | Strap / strip | -996,541.79 | 15.91 | 176 | 0.054 |
 | NIFTY | 5m | Vol/OI momentum | -114,118.40 | 24.60 | 126 | 0.238 |
-| NIFTY | 15m | Vertical | 742,868.09 | 44.68 | 799 | 2.187 |
-| NIFTY | 15m | Iron butterfly | -1,000,195.80 | 2.82 | 319 | 0.012 |
+| NIFTY | 15m | Vertical | 380,155.33 | 54.82 | 799 | 3.709 |
+| NIFTY | 15m | Iron butterfly | 44,568.32 | 28.14 | 398 | 1.197 |
 | NIFTY | 15m | Strap / strip | -328,524.32 | 22.71 | 207 | 0.188 |
 | NIFTY | 15m | Vol/OI momentum | -382.45 | 0.00 | 2 | 0.000 |
-| SENSEX | 5m | Vertical | 667,740.70 | 46.98 | 860 | 1.573 |
-| SENSEX | 5m | Iron butterfly | -1,002,211.56 | 2.87 | 279 | 0.046 |
+| SENSEX | 5m | Vertical | 401,914.39 | 67.91 | 860 | 7.284 |
+| SENSEX | 5m | Iron butterfly | Incomplete: missing price | — | — | — |
 | SENSEX | 5m | Strap / strip | -997,615.58 | 16.42 | 134 | 0.041 |
 | SENSEX | 5m | Vol/OI momentum | -164,371.90 | 25.29 | 87 | 0.096 |
-| SENSEX | 15m | Vertical | 1,096,368.00 | 50.19 | 799 | 2.503 |
-| SENSEX | 15m | Iron butterfly | -1,000,755.24 | 2.84 | 282 | 0.034 |
+| SENSEX | 15m | Vertical | 357,230.84 | 66.21 | 799 | 6.837 |
+| SENSEX | 15m | Iron butterfly | Incomplete: missing price | — | — | — |
 | SENSEX | 15m | Strap / strip | -203,644.43 | 27.94 | 68 | 0.102 |
 | SENSEX | 15m | Vol/OI momentum | 0.00 | 0.00 | 0 | — |
 | NATURALGAS | 5m | Vertical futures equivalent | -169,124.71 | 13.28 | 128 | 0.151 |
@@ -148,13 +185,18 @@ depend heavily on modeled fills and unverified rolling expiry identity.
 | NATURALGAS | 15m | Strap / strip | N/A | N/A | N/A | N/A |
 | NATURALGAS | 15m | Vol/OI momentum | -36,793.72 | 25.00 | 48 | 0.532 |
 
-The original 267 regression tests remain, with the catalog assertion updated to
-eight keys. New tests cover causal positive/negative book signals, per-leg tax
+The original regression tests remain, with the catalog assertion updated to
+nine keys including Expiry Day. Tests cover causal positive/negative book signals, per-leg tax
 and slippage arithmetic, theoretical expiry payoff bounds, atomic allocation,
 credit/debit exits, portfolio trail/daily locks, large-move fallback, exact-quote
 priority, strict pricing, every result/name save path, all four book UI charts,
 and fresh-quote paper basket recovery.
 
-The final full offline suite passed **292 tests** (267 existing + 25 new), with
-**zero external network attempts**. The real-lake UI smoke check also passed
-NIFTY and CRUDEOIL backtests, all six pages, explicit saves and Reports replay.
+The corrected checkpoint's full offline suite passed **320 tests** (all 312
+existing tests plus eight spread-bound regressions), with **zero external
+network attempts**. Regressions include 24650/24700 bull calls, 24550/24500 bear
+puts, 500-point jumps, one or both missing legs, butterfly shared-width bounds,
+pre-slippage per-leg reconciliation, exact quote priority, strict-observed
+rejection and unchanged non-spread pricing. All nine strategies retain their
+simulation, UI, result-save and named paper-strategy coverage. Streamlit was
+restarted on port 8501; both the page and health endpoint returned HTTP 200.

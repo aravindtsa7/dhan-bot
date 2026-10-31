@@ -90,6 +90,13 @@ class MinuteBook:
         self.cumulative=volume; self.last_epoch=tick.exchange_time; self.last_received=tick.received_time
     def signal(self,c,now):
         local=datetime.fromtimestamp(now,IST); at=local.hour*60+local.minute
+        if c.strategy=='expiry_day':
+            from quant_expiry import live_event
+            event=live_event(c,now)
+            minute_epoch=int(now)//60*60
+            if event is None or self.last_signal_minute==minute_epoch or minute_epoch-60 not in self.rows: return None
+            self.last_signal_minute=minute_epoch
+            return event
         n=int(c.timeframe[:-1]); minute_epoch=int(now)//60*60
         if at%n or self.last_signal_minute==minute_epoch: return None
         self.last_signal_minute=minute_epoch
@@ -128,6 +135,9 @@ class PaperAccount:
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
         self.c=c; c.validate(); self.asset=asset; self.emit=emit
         policy=asdict(c); policy.pop('start'); policy.pop('end')
+        if c.strategy!='expiry_day':
+            for key in list(policy):
+                if key.startswith('expiry_'): policy.pop(key)
         # These fields do not affect existing strategies. Preserve their
         # durable policy hashes when loading an account created before books.
         if c.strategy not in BOOK_STRATEGIES:

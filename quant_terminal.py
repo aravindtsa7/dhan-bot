@@ -23,9 +23,11 @@ STRATEGY_LABELS = {
     'Iron Butterfly Income Spread (Sec 2.44)': (BOOK_STRATEGIES[1], 'both'),
     'Strap / Strip Volatility Breakout (Sec 2.34 & 2.35)': (BOOK_STRATEGIES[2], 'both'),
     'Vol-Scaled Momentum + Volume/OI Activity Filter (Sec 10.3.1 & 10.4)': (BOOK_STRATEGIES[3], 'both'),
+    'Expiry Day': ('expiry_day','both'),
 }
 INTERVALS = {'1 minute': '1m', '3 minutes': '3m', '5 minutes': '5m', '15 minutes': '15m'}
 EXITS = {'End of day': 'end_of_day', 'Trailing SL': 'trailing_sl', 'Target / EOD': 'target_eod'}
+EXPIRY_EXITS = {'Target + SL':'target_eod','Trailing SL':'trailing_sl','EOD':'end_of_day'}
 STRATEGY_NOTES = {
     list(STRATEGY_LABELS)[0]: 'EMA9 pullback, EMA9/21 alignment, session VWAP and ADX ≥18; next-open execution. Zero-volume spot uses a disclosed TWAP proxy.',
     list(STRATEGY_LABELS)[1]: 'Index 09:15–09:30 / MCX 17:00–17:30 range, RSI and >1.3× prior 10-bar volume. Zero-volume indices require complete observed fixed-strike option volume. Maximum two entries per session.',
@@ -35,6 +37,7 @@ STRATEGY_NOTES = {
     list(STRATEGY_LABELS)[5]: 'Index options only: sell ATM CE/PE, buy equidistant wings after 09:45, ADX <22 and within 0.25% of VWAP. Credit decay/expansion exits and 15:15 EOD; reserve max loss plus fees.',
     list(STRATEGY_LABELS)[6]: 'Index options only: 2CE:1PE strap or 1CE:2PE strip on ORB/Donchian break with fixed-contract volume expansion. Combined portfolio exits.',
     list(STRATEGY_LABELS)[7]: 'Mean tanh(return / lagged volatility), 10-bar lookback, threshold 0.25; log volume expansion and positive log OI activity where available. Missing OI is disclosed.',
+    'Expiry Day': 'NIFTY / SENSEX only. Balanced fixed CE+PE basket, pre-expiry 15:25 signal / 15:26 fill, held overnight. Only combined TP/SL/trailing exits on expiry; no individual leg stops. WEEK1 expiry identity remains unverified.',
 }
 
 SAVED_STRATEGIES = Path(__file__).resolve().parent/'data'/'saved_strategies.json'
@@ -52,7 +55,7 @@ def instrument_defaults(instrument):
 
 
 def build_config(instrument, strategy, period, capital, allocation, interval,
-                 take_profit, stop_loss, minimum_premium, exit_label):
+                 take_profit, stop_loss, minimum_premium, exit_label, **expiry_settings):
     """Every visible form setting is preserved in the engine's hashed config."""
     if len(period) != 2:
         raise ValueError('Choose both the start and end of the Period.')
@@ -68,11 +71,12 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
         start=begin.isoformat(), end=(end + timedelta(days=1)).isoformat(),
         capital=float(capital), capital_usage_pct=float(str(allocation).rstrip('%')),
         timeframe=INTERVALS[interval], sl_pct=sl, target_pct=tp,
-        minimum_premium=float(minimum_premium), exit_mode=EXITS[exit_label],
+        minimum_premium=float(minimum_premium), exit_mode={**EXITS,**EXPIRY_EXITS}[exit_label],
         trail_pct=sl if exit_label == 'Trailing SL' else 0, risk_basis='legacy' if mcx and engine_strategy in BOOK_STRATEGIES else 'percentage',
         sizing_mode='allocation', slippage=.5 if code=='NATURALGAS' or not mcx else 1.0,
         entry_start='17:00' if mcx and engine_strategy!='vwap_ema_pullback' else '09:25', volume_multiple=1.3,
         entry_end='22:45' if mcx and engine_strategy!='vwap_ema_pullback' else '14:30', price_policy='strict_observed' if mcx else 'model_continuity',
+        **expiry_settings,
     )
     config.validate()
     return config
@@ -222,7 +226,7 @@ def load_saved_strategies(path=None):
             raise ValueError('Invalid parameters in saved_strategies.json') from exc
         config.validate()
         if config.strategy not in STRATEGIES:
-            raise ValueError('Saved strategies must use one of the eight terminal strategies')
+            raise ValueError('Saved strategies must use a supported terminal strategy')
     return data
 
 
@@ -232,7 +236,7 @@ def save_strategy(output, config, label):
         raise ValueError('Enter a custom Strategy Name before saving.')
     config.validate()
     if config.strategy not in STRATEGIES:
-        raise ValueError('Save one of the eight terminal strategies')
+        raise ValueError('Save a supported terminal strategy')
     path = saved_strategy_path(output)
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -261,4 +265,5 @@ def form_values(config, label):
                 interval=next(k for k, v in INTERVALS.items() if v == config['timeframe']),
                 take_profit=f"{config['target_pct']:g}%", stop_loss=f"{config['sl_pct']:g}%",
                 minimum_premium=float(config['minimum_premium']),
-                exit_label=next(k for k, v in EXITS.items() if v == config['exit_mode']))
+                exit_label=next(k for k, v in (EXPIRY_EXITS if config['strategy']=='expiry_day' else EXITS).items() if v == config['exit_mode']),
+                **{k:v for k,v in config.items() if k.startswith('expiry_')})

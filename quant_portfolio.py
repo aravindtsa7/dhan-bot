@@ -3,6 +3,9 @@ from collections import defaultdict
 
 
 def execute_portfolio(data,c,run_id,daily_audit=None):
+    if c.strategy=='expiry_day':
+        from quant_expiry import execute_expiry_portfolio
+        return execute_expiry_portfolio(data,c,run_id,daily_audit)
     from quant_backtester import _trade_steps, HIGH_STRATEGIES, LEGACY_STRATEGIES as STRATEGIES, RESEARCH_STRATEGIES, BOOK_STRATEGIES
     records,paths,skipped=[],[],[]
     equity=c.capital

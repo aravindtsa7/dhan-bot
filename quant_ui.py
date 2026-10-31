@@ -17,6 +17,7 @@ from quant_terminal import (PAGES, INSTRUMENT_LABELS, STRATEGY_LABELS, STRATEGY_
                             INTERVALS, EXITS, build_config, lake_snapshot, load_registry,
                             save_result, save_strategy, form_values, read_json, load_saved_strategies, saved_strategy_path, instrument_defaults)
 from quant_results import trade_ledger, ledger_html, trade_chart
+from quant_terminal import EXPIRY_EXITS
 from quant_deployment import render_strategy_deployment
 
 st.set_page_config(page_title='Indian Market Research Lake', page_icon='📊', layout='wide', initial_sidebar_state='expanded')
@@ -138,6 +139,8 @@ def configure_card():
         st.session_state.defaults_instrument = defaults['instrument']
         for key in defaults:
             st.session_state.pop('bt_'+key, None)
+        for key in ('bt_expiry_tp','bt_expiry_sl','bt_expiry_exit_label'):
+            st.session_state.pop(key,None)
     with st.container(border=True, key='configure'):
         card_title('⚙️ Configure backtest', 'SIMULATION')
         a, b = st.columns(2)
@@ -160,19 +163,42 @@ def configure_card():
         with a: allocation = st.selectbox('Capital allocation', ['100%', '75%', '50%', '25%'], index=['100%', '75%', '50%', '25%'].index(defaults['allocation']), key='bt_allocation')
         with b: interval = st.selectbox('Candle interval', list(INTERVALS), index=list(INTERVALS).index(defaults['interval']), key='bt_interval')
         a, b = st.columns(2)
-        with a: take_profit = st.selectbox('Take profit', ['5%', '10%', '15%', '25%', '50%', '100%'], index=['5%', '10%', '15%', '25%', '50%', '100%'].index(defaults['take_profit']), key='bt_take_profit')
-        with b: stop_loss = st.selectbox('Stop loss', ['25%', '15%', '10%', '5%'], index=['25%', '15%', '10%', '5%'].index(defaults['stop_loss']), key='bt_stop_loss')
+        if strategy=='Expiry Day':
+            with a: take_profit = f"{st.number_input('Take Profit %',min_value=0.1,value=float(defaults['take_profit'].rstrip('%')),step=5.,key='bt_expiry_tp'):g}%"
+            with b: stop_loss = f"{st.number_input('Stop Loss %',min_value=0.1,max_value=99.9,value=float(defaults['stop_loss'].rstrip('%')),step=5.,key='bt_expiry_sl'):g}%"
+        else:
+            targets=list(dict.fromkeys(['5%', '10%', '15%', '25%', '50%', '100%',defaults['take_profit']]))
+            stops=list(dict.fromkeys(['50%', '30%', '25%', '20%', '15%', '10%', '5%',defaults['stop_loss']]))
+            with a: take_profit = st.selectbox('Take profit', targets, index=targets.index(defaults['take_profit']), key='bt_take_profit')
+            with b: stop_loss = st.selectbox('Stop loss', stops, index=stops.index(defaults['stop_loss']), key='bt_stop_loss')
         a, b = st.columns(2)
         with a:
             premium = st.number_input('Minimum premium', min_value=0., value=defaults['minimum_premium'], step=10., format='%.0f', key='bt_minimum_premium',
                                        disabled=instrument in ('CRUDEOIL', 'NATURALGAS', 'GOLDM'),
                                        help='₹ per option unit. Observed entry prices below this value are skipped before slippage. Options only.')
         with b:
-            exit_label = st.selectbox('Exit', list(EXITS), index=list(EXITS).index(defaults['exit_label']), key='bt_exit_label',
+            choices=EXPIRY_EXITS if strategy=='Expiry Day' else EXITS
+            prior_mode={**EXITS,**EXPIRY_EXITS}.get(defaults['exit_label'],'target_eod')
+            default_exit=next(k for k,v in choices.items() if v==prior_mode)
+            exit_label = st.selectbox('Exit', list(choices), index=list(choices).index(default_exit), key='bt_expiry_exit_label' if strategy=='Expiry Day' else 'bt_exit_label',
                 help='End of day: protective stop, no target. Trailing SL: target plus a trail at the selected stop percentage. Target / EOD: fixed stop and target. Every mode closes by session end.')
+        expiry_settings={}
+        if strategy=='Expiry Day':
+            with st.expander('Expiry Day timing and date window',expanded=True):
+                modes={'Pre-expiry close → expiry day (BTST)':'btst','Expiry-day intraday (09:15 signal / 09:16 fill)':'expiry_intraday'}
+                selected=st.selectbox('Entry mode',list(modes),index=list(modes.values()).index(defaults.get('expiry_entry_mode','btst')),key='bt_expiry_entry_mode')
+                a,b=st.columns(2)
+                with a: signal=st.selectbox('Pre-expiry signal (IST)',['15:25','15:26','15:27','15:28'],index=['15:25','15:26','15:27','15:28'].index(defaults.get('expiry_entry_signal','15:25')),key='bt_expiry_entry_signal')
+                with b: cutoff=st.selectbox('Expiry EOD cutoff (IST)',['15:20','15:15'],index=['15:20','15:15'].index(defaults.get('expiry_exit_cutoff','15:20')),key='bt_expiry_exit_cutoff')
+                include=st.checkbox('Include prior entry session when Period starts on expiry day',value=defaults.get('expiry_include_prior_session',True),key='bt_expiry_include_prior_session')
+                basis=st.selectbox('Expiry session evidence',['calendar','observed_reset'],index=['calendar','observed_reset'].index(defaults.get('expiry_calendar_mode','calendar')),key='bt_expiry_calendar_mode',
+                    format_func=lambda v:'Dated exchange calendar + holiday shifts' if v=='calendar' else 'Recorded expiry / weekly-reset evidence only')
+                expiry_settings=dict(expiry_entry_mode=modes[selected],expiry_entry_signal=signal,expiry_exit_cutoff=cutoff,expiry_include_prior_session=include,expiry_calendar_mode=basis)
+                st.caption('Period selects expiry exit dates. BTST fills one minute after the signal and holds both legs overnight. Candle interval changes chart aggregation; basket risk is checked every minute. EOD keeps the combined protective stop active.')
+                if basis=='observed_reset': st.caption('ATM strike changes alone are insufficient. The current WEEK1 schema has no dated expiry/reset evidence; this mode may produce no eligible pairs.')
         st.session_state.form_defaults = dict(instrument=instrument, strategy=strategy, period=period, capital=capital,
             allocation=allocation, interval=interval, take_profit=take_profit, stop_loss=stop_loss,
-            minimum_premium=premium, exit_label=exit_label)
+            minimum_premium=premium, exit_label=exit_label,**expiry_settings)
         html('<div class="cost-bar">ⓘ &nbsp; Costs: Brokerage + taxes + slippage</div>')
         st.caption('Allocation caps committed capital, not maximum loss. Default allocation is 25%; entries require whole lots plus fees.')
         a, b = st.columns(2)
@@ -187,7 +213,7 @@ def configure_card():
             st.info('Spot data is available. BANKNIFTY option history and contract schedules must be added before simulation.')
         if submitted or saved:
             try:
-                config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label)
+                config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label,**expiry_settings)
                 if submitted:
                     with st.spinner('Simulating eligible historical candles…'):
                         result = run_backtest(config, output=OUT, persist=False)
@@ -242,6 +268,9 @@ def render_result(run_id=None, full=True, result=None):
             ('Avg Win / Avg Loss', money(wins.net_pnl.mean() if len(wins) else 0)+' / '+money(losses.net_pnl.mean() if len(losses) else 0), 'After fees and slippage', ''),
             ('Total Costs', money(metrics['total_cost']+slippage), f'Fees {money(metrics["total_cost"])} + slippage {money(slippage)}', ''),
         ]
+        if config['strategy']=='expiry_day':
+            items[4]=('CE + PE baskets',str(len(trades)),'Every exit closes both legs','')
+            items[5]=('Average combined return',f'{trades.combined_return_pct.mean() if len(trades) else 0:+.2f}%','Before fees; after fill slippage','')
         html('<div class="result-kpis">'+''.join(f'<div class="result-kpi"><label>{escape(label)}</label><strong class="{color}">{value}</strong><small>{escape(detail)}</small></div>' for label,value,detail,color in items)+'</div>')
         if len(trades) and 'structure_label' in trades:
             for label, group in trades.groupby('structure_label'):
@@ -260,6 +289,10 @@ def render_result(run_id=None, full=True, result=None):
                 format_func=lambda v: f'{v.rsplit("_",1)[-1]} · {trades.loc[trades.trade_id.eq(v),"side"].iloc[0]} · {money(trades.loc[trades.trade_id.eq(v),"net_pnl"].iloc[0], True)}')
             trade = trades[trades.trade_id.eq(selected)].iloc[0]
             st.plotly_chart(theme(trade_chart(trade,table('underlying'),table('stop_paths'),config),650), width='stretch', key='inspection_'+run_id)
+            if config['strategy']=='expiry_day':
+                st.caption(f"Signal {trade.signal_time:%Y-%m-%d %H:%M} · Entry {trade.entry_time:%Y-%m-%d %H:%M} · Exit {trade.exit_time:%Y-%m-%d %H:%M} IST. "
+                    f"CE ₹{trade.ce_entry_price:.2f} → ₹{trade.ce_exit_price:.2f} · PE ₹{trade.pe_entry_price:.2f} → ₹{trade.pe_exit_price:.2f}. "
+                    f"Combined {money(trade.combined_entry_value)} → {money(trade.combined_exit_value)} ({trade.combined_return_pct:+.2f}% before fees).")
             st.caption('IST · Entry and exit markers use exact execution timestamps and fills. Dashed levels span the holding period; the active stop applies on the next candle. Amber diamonds identify modeled prices.')
         equity = table('equity')
         if not equity.empty:

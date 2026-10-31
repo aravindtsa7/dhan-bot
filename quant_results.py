@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 SIDE_LABELS = {'CE':'BUY CE', 'PE':'BUY PE', 'LONG':'LONG FUT', 'SHORT':'SHORT FUT'}
 from quant_book import SIDE_LABELS as BOOK_SIDE_LABELS
 SIDE_LABELS.update(BOOK_SIDE_LABELS)
+SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
 REASONS = {'target':'Target', 'stop_loss':'Stop Loss', 'trailing_stop':'Trailing SL', 'square_off':'EOD',
            'daily_loss_limit':'Daily loss limit', 'daily_profit_target':'Daily profit target'}
 
@@ -18,7 +19,7 @@ def trade_ledger(trades, config):
     f = trades.sort_values(['exit_time','entry_time','trade_id']).reset_index(drop=True)
     labels = f.side.map(SIDE_LABELS).fillna(f.side)
     fees = f.total_cost + f.get('slippage_cost', pd.Series(0.,index=f.index))
-    return pd.DataFrame({
+    ledger = pd.DataFrame({
         'Trade #':range(1,len(f)+1), 'Date':f.date, 'Side':labels,
         'Contract / Strike':f.contract,
         'Entry basis':f.get('entry_value_type',pd.Series('premium / futures',index=f.index)).fillna('premium / futures'),
@@ -31,6 +32,15 @@ def trade_ledger(trades, config):
         'Balance (₹)':c.capital+f.net_pnl.cumsum(),
         'Modeled wing fallback':f.get('modeled_wing_fallback',pd.Series(False,index=f.index)).fillna(False),
     })
+    if c.strategy=='expiry_day':
+        ledger['Signal Date & Time']=pd.to_datetime(f.signal_time).dt.strftime('%Y-%m-%d %H:%M:%S')
+        ledger['Entry Date & Time']=pd.to_datetime(f.entry_time).dt.strftime('%Y-%m-%d %H:%M:%S')
+        ledger['Exit Date & Time']=pd.to_datetime(f.exit_time).dt.strftime('%Y-%m-%d %H:%M:%S')
+        ledger['CE Entry → Exit ₹']=[f'{r.ce_entry_price:,.2f} → {r.ce_exit_price:,.2f}' for r in f.itertuples()]
+        ledger['PE Entry → Exit ₹']=[f'{r.pe_entry_price:,.2f} → {r.pe_exit_price:,.2f}' for r in f.itertuples()]
+        ledger['Combined Entry ₹ → Combined Exit ₹']=[f'{r.combined_entry_value:,.2f} → {r.combined_exit_value:,.2f}' for r in f.itertuples()]
+        ledger['Combined Return %']=f.combined_return_pct
+    return ledger
 
 
 def ledger_html(ledger):
@@ -58,7 +68,10 @@ def trade_chart(trade, underlying, paths, config):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.09,
                         row_heights=[.55,.45], subplot_titles=('Underlying session · IST', 'Traded contract · IST'))
     if not underlying.empty:
-        f = underlying[underlying.date.eq(trade['date'])] if 'date' in underlying else underlying
+        if config['strategy']=='expiry_day' and 'date' in underlying:
+            f=underlying[underlying.date.between(str(pd.Timestamp(trade['entry_time']).date()),str(pd.Timestamp(trade['exit_time']).date()))]
+        else:
+            f = underlying[underlying.date.eq(trade['date'])] if 'date' in underlying else underlying
         fig.add_trace(go.Candlestick(x=f.timestamp,open=f.open,high=f.high,low=f.low,close=f.close,name='Underlying'),row=1,col=1)
         for key,label,color in [('vwap','VWAP / TWAP proxy','#fbbf24'),('ema9','EMA 9','#22d3ee'),('ema21','EMA 21','#a78bfa'),('supertrend','Supertrend','#34d399')]:
             if key in f: fig.add_trace(go.Scatter(x=f.timestamp,y=f[key],name=label,line=dict(color=color,width=1)),row=1,col=1)
@@ -96,5 +109,11 @@ def trade_chart(trade, underlying, paths, config):
         fig.add_trace(go.Scatter(x=[entry_at,exit_at],y=[trade[key]]*2,name=label,mode='lines',line=dict(color=color,dash='dash',width=1)),row=2,col=1)
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(title=side+' · '+str(trade.get('entry_value_type','premium / futures'))+' · '+contract)
+    if config['strategy']=='expiry_day':
+        summary=(f"Signal {pd.Timestamp(trade['signal_time']):%Y-%m-%d %H:%M} | Fill {entry_at:%Y-%m-%d %H:%M} → Exit {exit_at:%Y-%m-%d %H:%M} IST<br>"
+                 f"CE ₹{trade['ce_entry_price']:.2f} → ₹{trade['ce_exit_price']:.2f} | "
+                 f"PE ₹{trade['pe_entry_price']:.2f} → ₹{trade['pe_exit_price']:.2f} | "
+                 f"Combined ₹{trade['combined_entry_value']:,.2f} → ₹{trade['combined_exit_value']:,.2f} ({trade['combined_return_pct']:+.2f}%)")
+        fig.add_annotation(x=0,y=1.08,xref='paper',yref='paper',text=summary,showarrow=False,xanchor='left',font=dict(size=10))
     fig.update_yaxes(tickprefix='₹')
     return fig

@@ -36,12 +36,12 @@ RESEARCH_STRATEGIES = ['vwap_ema_pullback', 'orb_volume_breakout',
                        'supertrend_adx_trend', 'mcx_evening_breakout']
 BOOK_STRATEGIES = ['book_vertical_spread', 'book_iron_butterfly',
                    'book_strap_strip', 'book_vol_oi_momentum']
-STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES
+STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day']
 INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
     'Out-of-band fixed strikes may use intrinsic plus bounded, distance-decayed wing time value; modeled_wing_fallback flags every affected trade. Strict-observed policy still rejects modeled fills.',
-    'Book structures use atomic per-leg fills. Basket exits trigger on synchronized minute closes and fill next open; gaps, costs and slippage can exceed theoretical expiry payoff bounds. Combined candles show open/close envelopes, not executable intrabar extrema.',
+    'Book structures use atomic per-leg fills. Wing-modeled vertical marks are bounded to [min(intrinsic spread, width-0.05), width-0.05], with a 0.05 floor; iron butterfly liability is bounded to one wing width. Exact observed quotes are retained. Costs and slippage are applied after bounds and may exceed payoff limits. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
     'PROVISIONAL: rolling WEEK1 options have no expiry/contract ID. Matching strike is necessary but cannot prove contract identity.',
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
     'H1 uses stored fixed-strike option VWAP; zero-volume spot has a separate TWAP proxy. Repaired stored inputs may affect signals; all affected sessions are disclosed.',
@@ -114,6 +114,11 @@ class Config:
     risk_basis: str = 'legacy'  # legacy ATR futures stops, or percentage of entry
     momentum_lookback: int = 10
     momentum_threshold: float = 0.25
+    expiry_entry_mode: str = 'btst'  # btst / expiry_intraday
+    expiry_entry_signal: str = '15:25'
+    expiry_exit_cutoff: str = '15:20'
+    expiry_include_prior_session: bool = True  # Period selects expiry/exit dates
+    expiry_calendar_mode: str = 'calendar'  # calendar / observed_reset (recorded evidence only)
 
     def validate(self):
         if self.instrument == 'BANKNIFTY':
@@ -128,6 +133,12 @@ class Config:
             raise ValueError('MCX Evening Momentum supports NATURALGAS and CRUDEOIL only')
         if self.strategy in BOOK_STRATEGIES[1:3] and self.instrument in POINT_VALUE:
             raise ValueError('Iron butterfly and strap/strip require index option streams; MCX futures cannot reproduce these payoffs')
+        if self.strategy=='expiry_day' and self.instrument not in ('NIFTY','SENSEX'):
+            raise ValueError('Expiry Day supports NIFTY and SENSEX weekly index options only; MCX is unsupported')
+        if self.expiry_entry_mode not in ('btst','expiry_intraday') or self.expiry_calendar_mode not in ('calendar','observed_reset'):
+            raise ValueError('Invalid Expiry Day entry or calendar mode')
+        if not 925<=minute(self.expiry_entry_signal)<=928 or self.expiry_exit_cutoff not in ('15:15','15:20') or not isinstance(self.expiry_include_prior_session,bool):
+            raise ValueError('Expiry Day signal must be 15:25–15:28; cutoff must be 15:15 or 15:20')
         if self.strategy not in STRATEGIES and (self.instrument in POINT_VALUE) != (self.strategy in (LEGACY_STRATEGIES[4],HIGH_STRATEGIES[3],HIGH_STRATEGIES[5])):
             raise ValueError('S5/H4/H6 support MCX; other strategies support index options')
         if self.strategy==HIGH_STRATEGIES[5] and self.instrument not in ('CRUDEOIL','NATURALGAS'):
@@ -171,7 +182,7 @@ class Config:
             raise ValueError('Invalid exit mode or risk basis')
         if self.exit_mode == 'trailing_sl' and self.trail_pct <= 0:
             raise ValueError('Trailing SL requires a positive trailing distance')
-        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy in BOOK_STRATEGIES[:3] or self.strategy in (LEGACY_STRATEGIES[2], HIGH_STRATEGIES[1])):
+        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy=='expiry_day' or self.strategy in BOOK_STRATEGIES[:3] or self.strategy in (LEGACY_STRATEGIES[2], HIGH_STRATEGIES[1])):
             raise ValueError('Futures and dual-leg strategies require both sides')
         for value in (self.entry_start, self.entry_end, self.anchor):
             minute(value)
@@ -336,6 +347,9 @@ def research_events(data, c, date, confirm_volume=True):
     the candidate fixed-strike option, over ten complete prior bars. It never
     invents spot volume or mixes rolling strikes to create a volume surge.
     """
+    if c.strategy=='expiry_day':
+        from quant_expiry import expiry_events
+        return expiry_events(data,c,date)
     if c.strategy in BOOK_STRATEGIES:
         from quant_book import book_events
         return book_events(data, c, date, confirm_volume=confirm_volume)
@@ -405,7 +419,7 @@ def research_events(data, c, date, confirm_volume=True):
 
 class ResearchData:
     """One immutable snapshot per instrument; API credentials are never loaded."""
-    def __init__(self, instrument, start='2025-01-01', end='2026-10-23', root=ROOT):
+    def __init__(self, instrument, start='2025-01-01', end='2026-10-23', root=ROOT, expiry_config=None):
         self.instrument, self.start, self.end, self.root = instrument, start, end, Path(root)
         self.days, self.exclusions, self._features, self._events = {}, [], {}, {}
         self.eligibility = []
@@ -421,6 +435,9 @@ class ResearchData:
         self.has_calendar = bool(self.expiry_calendar)
         self.mcx = instrument in POINT_VALUE
         self.required_windows = required_windows(self.mcx)
+        self.expiry_config = expiry_config
+        self.observed_expiry_dates = set()
+        load_start = str((pd.Timestamp(start)-pd.Timedelta(days=10)).date()) if expiry_config and expiry_config.expiry_include_prior_session else start
         selections = {}
         with QuantDataLake(self.root) as lake:
             names = {name for ds, name in lake.instruments() if
@@ -429,7 +446,7 @@ class ResearchData:
                       name in {f'{instrument}_{side}_{strike}_WEEK1' for side in ('CE','PE') for strike in ('ATM','ATM-1','ATM+1')})}
             records = [r for r in lake.manifest['chunks'].values() if r['status'] == 'complete'
                        and r['dataset'] in ('spot_1m', 'options_rolling_1m') and r['instrument'] in names
-                       and r['start'] < end and (self.mcx or r['end'] > start)]
+                       and r['start'] < end and (self.mcx or r['end'] > load_start)]
             verify_files(self.root, records)
             if self.mcx:
                 frames = [lake.query(name, start, end) for ds, name in lake.instruments()
@@ -445,8 +462,8 @@ class ResearchData:
                 spot = allspot
                 opts = pd.DataFrame()
             else:
-                spot = lake.query(instrument, start, end)
-                opts = pd.concat([lake.query(f'{instrument}_{side}_{strike}_WEEK1', start, end,
+                spot = lake.query(instrument, load_start, end)
+                opts = pd.concat([lake.query(f'{instrument}_{side}_{strike}_WEEK1', load_start, end,
                                             dataset='options_rolling_1m')
                                   for side in ('CE', 'PE') for strike in ('ATM', 'ATM-1', 'ATM+1')], ignore_index=True)
         if spot.empty:
@@ -454,8 +471,16 @@ class ResearchData:
         spot['date'] = spot.timestamp.dt.strftime('%Y-%m-%d')
         if not opts.empty:
             opts['date'] = opts.timestamp.dt.strftime('%Y-%m-%d')
+        entry_dates=set()
+        if expiry_config:
+            from quant_expiry import observed_expiries, dependency_dates
+            self.observed_expiry_dates=observed_expiries(opts)
+            needed,entry_dates=dependency_dates(self,expiry_config,sorted(spot.date.unique()))
+            spot=spot[spot.date.isin(needed)]
+            if not opts.empty: opts=opts[opts.date.isin(needed)]
         option_days = dict(tuple(opts.groupby('date'))) if not opts.empty else {}
-        self.available_days = sorted(spot.date.unique())
+        self.available_days = (sorted(d for d in self.observed_sessions if start<=d<end) if expiry_config
+                               else sorted(spot.date.unique()))
         coverage_file = self.root/'session_coverage.parquet'
         flagged = set()
         if coverage_file.exists():
@@ -463,6 +488,11 @@ class ResearchData:
             flagged = set(zip(coverage.loc[coverage.short_session_review, 'instrument'],
                               coverage.loc[coverage.short_session_review, 'session'].astype(str)))
         for date, s in spot.groupby('date', sort=True):
+            if expiry_config:
+                self.required_windows=required_windows(False)
+                if date in entry_dates and expiry_config.expiry_entry_mode=='btst':
+                    self.required_windows=dict(underlying=['09:15','15:29'],options=['09:15','15:29'],inclusive=True,
+                        basis='Engine 5.4.0 full-session checks extended through the BTST entry-session close')
             contract, prior, selection_error = selections.get(date, (instrument, None, None))
             audit = dict(date=date, instrument=instrument, selected_contract=contract if self.mcx else None,
                          selection_session=prior, required_windows=self.required_windows,
@@ -678,6 +708,9 @@ def simulate_trade(data,c,date,event,trade_id,**account):
 
 
 def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None):
+    if c.strategy=='expiry_day':
+        from quant_expiry import expiry_steps
+        return (yield from expiry_steps(data,c,date,event,trade_id,budget=budget,entry_equity=entry_equity))
     if not data.mcx and c.strategy in BOOK_STRATEGIES[:3]:
         from quant_book import basket_steps
         return (yield from basket_steps(data,c,date,event,trade_id,budget,entry_equity))
@@ -859,12 +892,15 @@ def persist_result(result, output=OUT):
 
 def run_backtest(c, data=None, output=OUT, persist=True):
     c.validate()
-    data=data or ResearchData(c.instrument,c.start,c.end)
+    data=data or ResearchData(c.instrument,c.start,c.end,**({'expiry_config':c} if c.strategy=='expiry_day' else {}))
+    if c.strategy=='expiry_day':
+        from quant_expiry import check_prepared_windows
+        check_prepared_windows(data,c)
     if (data.instrument,data.start,data.end)!=(c.instrument,c.start,c.end):
         raise ValueError('Prepared data does not match configuration window')
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-wing-v1',data=data.fingerprint),sort_keys=True)
+    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-wing-bounded-v2',data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'
@@ -901,7 +937,12 @@ def run_backtest(c, data=None, output=OUT, persist=True):
     underlying = pd.DataFrame()
     if c.strategy in STRATEGIES and len(trades) and hasattr(data, 'research_features'):
         features = data.research_features(c.timeframe)
-        underlying = pd.concat([features[d].assign(date=d) for d in sorted(trades.date.unique())], ignore_index=True)
+        dates=set(trades.date)
+        if c.strategy=='expiry_day': dates.update(trades.entry_time.dt.strftime('%Y-%m-%d'))
+        underlying = pd.concat([features[d].assign(date=d) for d in sorted(dates) if d in features], ignore_index=True)
+    if c.strategy=='expiry_day':
+        result['limitations']=LIMITATIONS+['Expiry Day holds fixed CE+PE strikes overnight. WEEK1 has no verified expiry identity; calendar/recorded-reset labels do not establish that both sessions contain the same contracts. Combined thresholds use synchronized closes, exit next open; overnight gaps and costs can exceed stops.',
+            'Period selects expiry exit sessions; optional prior-session loading is disclosed in the trade entry dates. Observed-reset mode requires recorded expiry/reset evidence, never a change in rolling ATM strike alone.']
     result['_frames'] = dict(trades=trades, equity=equity, monthly=monthly, stop_paths=pd.DataFrame(paths),
         skipped_entries=pd.DataFrame(skipped), excluded_sessions=pd.DataFrame(data.exclusions),
         daily_risk=pd.DataFrame(daily_risk), underlying=underlying)

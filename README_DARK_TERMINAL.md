@@ -53,7 +53,7 @@ research assumptions, not optimized claims of profitability.
 | `book_strap_strip` | ORB or preceding 10-bar Donchian break and fixed-contract volume ≥1.3× preceding 10 bars: long 2CE:1PE strap or 1CE:2PE strip. Index options only. |
 | `book_vol_oi_momentum` | Mean tanh(log return / lagged 10-bar return volatility), absolute signal ≥0.25; log volume expansion and positive log OI activity where OI is available. Options or MCX futures. |
 
-All eight appear in the selector and support explicit Save Result and custom-name
+All nine strategies, including [Expiry Day BTST](README_EXPIRY_DAY.md), appear in the selector and support explicit Save Result and custom-name
 Save Strategy, including virtual paper deployment. See
 [book models and verification](README_BOOK_STRATEGIES.md) for basket accounting,
 pricing provenance, and the reproducible local-lake matrix.

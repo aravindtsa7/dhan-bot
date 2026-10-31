@@ -10,6 +10,8 @@ from quant_backtester import Config, STRATEGIES
 
 def account_path(root, record):
     policy = {k:v for k,v in record['config'].items() if k not in ('start','end')}
+    if policy.get('strategy')!='expiry_day':
+        policy={k:v for k,v in policy.items() if not k.startswith('expiry_')}
     digest = hashlib.sha256(json.dumps(policy,sort_keys=True).encode()).hexdigest()[:10]
     return Path(root)/(record['strategy_id']+'_'+digest)
 

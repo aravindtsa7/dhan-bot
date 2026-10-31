@@ -17,7 +17,7 @@ from quant_book import leg_specs, activity
 from quant_option_model import wing_fallback, MissingObservedPrice, intrinsic
 from quant_terminal import STRATEGY_LABELS, build_config, save_strategy, saved_strategy_path, save_result, load_saved_strategies
 from quant_results import trade_ledger, trade_chart
-from quant_deployment import launch_strategy
+from quant_deployment import launch_strategy, account_path
 from step6_paper_trader import configuration, book_activity_confirmed
 from paper_basket import BasketPaperAccount
 from paper_engine import PaperAccount
@@ -58,7 +58,7 @@ class BookTests(unittest.TestCase):
                 self.assertEqual(actual.strategy,key)
                 with patch('quant_deployment.subprocess.Popen',return_value=Mock(pid=123)):
                     self.assertEqual(launch_strategy(record,root/'paper',saved_strategy_path(root)),123)
-            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),8)
+            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),9)
             c,d,_=fixture(); result=run_backtest(c,d,persist=False)
             save_result(root,result,'spread saved')
             self.assertTrue((root/'runs'/result['run_id']/'trades.parquet').exists())
@@ -108,7 +108,7 @@ class BookTests(unittest.TestCase):
     def test_eight_strategies_simulate_and_save_results(self):
         with TemporaryDirectory() as directory:
             root=Path(directory)
-            for key in STRATEGIES:
+            for key in STRATEGIES[:8]:
                 side={'book_vertical_spread':'BULL_CALL_SPREAD','book_iron_butterfly':'IRON_BUTTERFLY',
                       'book_strap_strip':'STRAP','mcx_evening_breakout':'LONG'}.get(key,'CE')
                 c,d,day=fixture(key,side,at=919 if side!='IRON_BUTTERFLY' else 914)
@@ -333,12 +333,17 @@ class BookTests(unittest.TestCase):
         asset=Asset('NIFTY',2,123,'2026-10-27',65,24000,'CE')
         original=asdict(c)
         for key in ('start','end','momentum_lookback','momentum_threshold'): original.pop(key)
+        for key in list(original):
+            if key.startswith('expiry_'): original.pop(key)
         digest=hashlib.sha256(json.dumps(original,sort_keys=True).encode()).hexdigest()
         with TemporaryDirectory() as directory:
             account=PaperAccount(directory,c,asset,lambda _:None)
             self.assertEqual(account.state['policy_hash'],digest)
             recovered=PaperAccount(directory,replace(c,momentum_lookback=15),asset,lambda _:None)
             self.assertEqual(recovered.state['policy_hash'],digest)
+            legacy={k:v for k,v in asdict(c).items() if not k.startswith('expiry_')}
+            self.assertEqual(account_path(directory,dict(strategy_id='old',config=legacy)),
+                             account_path(directory,dict(strategy_id='old',config=asdict(c))))
 
     def test_paper_contract_resolver_common_expiry_and_book_activity(self):
         now=datetime(2026,10,22,10,tzinfo=IST).timestamp()
