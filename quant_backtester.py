@@ -22,19 +22,30 @@ from quant_calendar import CALENDAR_HASH, expiries, next_expiry, is_expiry_day, 
 from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
 from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
+from quant_data_quality import require_current_audit
 
-ENGINE_VERSION = '5.3.0'
+ENGINE_VERSION = '5.4.0'
 OUT = ROOT / 'backtests'
-STRATEGIES = ['EMA_Supertrend_VWAP_Directional', 'ORB_Option_Momentum_Breakout',
+LEGACY_STRATEGIES = ['EMA_Supertrend_VWAP_Directional', 'ORB_Option_Momentum_Breakout',
               'Dual_CE_PE_Straddle_Breakout', 'VWAP_Trend_Pullback_Buyer',
               'MCX_Evening_Session_Breakout']
-STRATEGIES += HIGH_STRATEGIES
+LEGACY_STRATEGIES += HIGH_STRATEGIES
+# Historical strategy keys stay readable for old research artifacts and tests.
+# Existing research keys remain stable; book structures share portfolio policy.
+RESEARCH_STRATEGIES = ['vwap_ema_pullback', 'orb_volume_breakout',
+                       'supertrend_adx_trend', 'mcx_evening_breakout']
+BOOK_STRATEGIES = ['book_vertical_spread', 'book_iron_butterfly',
+                   'book_strap_strip', 'book_vol_oi_momentum']
+STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES
 INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
+    'Out-of-band fixed strikes may use intrinsic plus bounded, distance-decayed wing time value; modeled_wing_fallback flags every affected trade. Strict-observed policy still rejects modeled fills.',
+    'Book structures use atomic per-leg fills. Basket exits trigger on synchronized minute closes and fill next open; gaps, costs and slippage can exceed theoretical expiry payoff bounds. Combined candles show open/close envelopes, not executable intrabar extrema.',
     'PROVISIONAL: rolling WEEK1 options have no expiry/contract ID. Matching strike is necessary but cannot prove contract identity.',
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
-    'H1 uses observed fixed-strike option VWAP; zero-volume spot has a separate TWAP proxy. No modeled data is used in signals.',
+    'H1 uses stored fixed-strike option VWAP; zero-volume spot has a separate TWAP proxy. Repaired stored inputs may affect signals; all affected sessions are disclosed.',
+    'Synthetic flat zero-volume repair bars are modeled inputs, not provider quotes. Original partitions and quarantine evidence are retained; strict-observed runs reject synthetic inputs.',
     'MCX is a front-active-contract sample, not continuous history since 2025; daily contract choice uses prior-session volume.',
     'Expiry flags use dated exchange rules and holidays; EOD IV/extrinsic checks are retrospective diagnostics, never signal inputs or proof of expiry identity.',
     'Fees and lot schedules are configurable research assumptions; historical contract notes are the authority.',
@@ -47,7 +58,7 @@ LIMITATIONS = [
 @dataclass(frozen=True)
 class Config:
     instrument: str = 'NIFTY'
-    strategy: str = HIGH_STRATEGIES[0]
+    strategy: str = RESEARCH_STRATEGIES[0]
     timeframe: str = '5m'
     strike: str = 'ATM'
     start: str = '2025-01-01'
@@ -101,15 +112,23 @@ class Config:
     option_side: str = 'both'  # both / CE / PE
     exit_mode: str = 'legacy'  # legacy / end_of_day / trailing_sl / target_eod
     risk_basis: str = 'legacy'  # legacy ATR futures stops, or percentage of entry
+    momentum_lookback: int = 10
+    momentum_threshold: float = 0.25
 
     def validate(self):
         if self.instrument == 'BANKNIFTY':
             raise ValueError('BANKNIFTY spot is available, but option history and a dated contract schedule are not configured. Choose NIFTY 50 or SENSEX for option backtests.')
-        if self.instrument not in INSTRUMENTS or self.strategy not in STRATEGIES:
+        if self.instrument not in INSTRUMENTS or self.strategy not in STRATEGIES + LEGACY_STRATEGIES:
             raise ValueError('Unknown instrument or strategy')
         if self.timeframe not in ('1m', '3m', '5m', '15m') or self.strike not in ('ATM', 'ATM-1', 'ATM+1'):
             raise ValueError('Unsupported timeframe / moneyness')
-        if (self.instrument in POINT_VALUE) != (self.strategy in (STRATEGIES[4],HIGH_STRATEGIES[3],HIGH_STRATEGIES[5])):
+        if self.strategy in STRATEGIES and self.strike != 'ATM':
+            raise ValueError('Research strategies require rolling ATM strike selection')
+        if self.strategy == 'mcx_evening_breakout' and self.instrument not in ('NATURALGAS', 'CRUDEOIL'):
+            raise ValueError('MCX Evening Momentum supports NATURALGAS and CRUDEOIL only')
+        if self.strategy in BOOK_STRATEGIES[1:3] and self.instrument in POINT_VALUE:
+            raise ValueError('Iron butterfly and strap/strip require index option streams; MCX futures cannot reproduce these payoffs')
+        if self.strategy not in STRATEGIES and (self.instrument in POINT_VALUE) != (self.strategy in (LEGACY_STRATEGIES[4],HIGH_STRATEGIES[3],HIGH_STRATEGIES[5])):
             raise ValueError('S5/H4/H6 support MCX; other strategies support index options')
         if self.strategy==HIGH_STRATEGIES[5] and self.instrument not in ('CRUDEOIL','NATURALGAS'):
             raise ValueError('H6 supports only Crude Oil and Natural Gas')
@@ -125,11 +144,11 @@ class Config:
             raise ValueError('Lots and multipliers must be whole numbers')
         if min(self.daily_profit_target,self.daily_loss_limit,self.daily_profit_pct,self.daily_loss_pct)<0:
             raise ValueError('Daily limits cannot be negative')
-        if self.strategy in (STRATEGIES[2],HIGH_STRATEGIES[1]) and self.strike != 'ATM':
+        if self.strategy in (LEGACY_STRATEGIES[2],HIGH_STRATEGIES[1]) and self.strike != 'ATM':
             raise ValueError('Dual-leg strategy uses ATM anchor strikes')
         if self.mode not in ('A', 'B') or self.lots < 1 or self.lot_size < 0:
             raise ValueError('Invalid mode or quantity')
-        if self.strategy==STRATEGIES[2] and self.mode=='B' and self.max_trades_day!=2:
+        if self.strategy==LEGACY_STRATEGIES[2] and self.mode=='B' and self.max_trades_day!=2:
             raise ValueError('Simultaneous straddle requires a two-leg daily entry cap')
         if not 0 < self.sl_pct < 100 or self.target_pct <= 0 or self.trail_pct < 0 or self.trail_jump_pct <= 0:
             raise ValueError('Invalid stop, target or trail')
@@ -141,8 +160,10 @@ class Config:
             raise ValueError('Invalid trade cap or opening range')
         if self.price_policy not in ('strict_observed','model_continuity') or self.oi_mode not in ('rising','unwinding','either'):
             raise ValueError('Invalid pricing or OI policy')
-        if self.volume_multiple<1.5 or self.option_lookback<1 or self.oi_min_change_pct<=0 or self.atr_expansion<=0 or self.compression_ratio<=0:
+        if self.volume_multiple<(1.3 if self.strategy in STRATEGIES else 1.5) or self.option_lookback<1 or self.oi_min_change_pct<=0 or self.atr_expansion<=0 or self.compression_ratio<=0:
             raise ValueError('Invalid volume/OI/ATR filters')
+        if self.momentum_lookback < 2 or int(self.momentum_lookback)!=self.momentum_lookback or not 0 < self.momentum_threshold < 1:
+            raise ValueError('Invalid momentum lookback or threshold')
         if self.tick_size<0: raise ValueError('Tick size cannot be negative')
         if self.minimum_premium < 0 or self.option_side not in ('both', 'CE', 'PE'):
             raise ValueError('Invalid minimum premium or option side')
@@ -150,7 +171,7 @@ class Config:
             raise ValueError('Invalid exit mode or risk basis')
         if self.exit_mode == 'trailing_sl' and self.trail_pct <= 0:
             raise ValueError('Trailing SL requires a positive trailing distance')
-        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy in (STRATEGIES[2], HIGH_STRATEGIES[1])):
+        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy in BOOK_STRATEGIES[:3] or self.strategy in (LEGACY_STRATEGIES[2], HIGH_STRATEGIES[1])):
             raise ValueError('Futures and dual-leg strategies require both sides')
         for value in (self.entry_start, self.entry_end, self.anchor):
             minute(value)
@@ -248,6 +269,140 @@ def make_bars(frame, timeframe):
     return indicators(bars).reset_index()
 
 
+def wilder(series, period):
+    """Wilder RMA seeded by the first full SMA; no future backfilling."""
+    values = series.to_numpy(dtype=float)
+    out = np.full(len(values), np.nan)
+    seed = []
+    previous = np.nan
+    for i, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        if np.isnan(previous):
+            seed.append(value)
+            if len(seed) < period:
+                continue
+            previous = float(np.mean(seed))
+        else:
+            previous += (value-previous)/period
+        out[i] = previous
+    return pd.Series(out, index=series.index)
+
+
+def research_indicators(bars):
+    """Wilder ATR/ADX/RSI and true ATR(10), multiplier-3 Supertrend."""
+    f = bars.copy()
+    for n in (9, 21, 50):
+        f[f'ema{n}'] = f.close.ewm(span=n, adjust=False, min_periods=n).mean()
+    tr = pd.concat([f.high-f.low, (f.high-f.close.shift()).abs(),
+                    (f.low-f.close.shift()).abs()], axis=1).max(axis=1)
+    atr10, atr14 = wilder(tr, 10), wilder(tr, 14)
+    f['atr'], f['atr14'] = atr10, atr14
+    up, down = f.high.diff(), -f.low.diff()
+    plus = 100*wilder(up.where((up>down)&(up>0), 0), 14)/atr14
+    minus = 100*wilder(down.where((down>up)&(down>0), 0), 14)/atr14
+    dx = (100*(plus-minus).abs()/(plus+minus).replace(0, np.nan)).where((plus+minus).ne(0), 0)
+    f['adx'] = wilder(dx, 14)
+    delta = f.close.diff()
+    gain, loss = wilder(delta.clip(lower=0), 14), wilder(-delta.clip(upper=0), 14)
+    f['rsi'] = (100-100/(1+gain/loss.replace(0, np.nan))).where(loss.ne(0), 100).where((gain+loss).ne(0), 50)
+    session = f.timestamp.dt.strftime('%Y-%m-%d')
+    typical = (f.high+f.low+f.close)/3
+    volume = f.volume.groupby(session).cumsum()
+    f['vwap_proxy'] = volume.eq(0)
+    f['vwap'] = (typical*f.volume).groupby(session).cumsum()/volume.replace(0, np.nan)
+    f['vwap'] = f.vwap.fillna(typical.groupby(session).expanding().mean().reset_index(level=0, drop=True).reindex(f.index))
+    upper = ((f.high+f.low)/2+3*atr10).to_numpy(copy=True)
+    lower = ((f.high+f.low)/2-3*atr10).to_numpy(copy=True)
+    trend = np.zeros(len(f), dtype=int)
+    close = f.close.to_numpy()
+    for i in range(len(f)):
+        if not np.isfinite(upper[i]): continue
+        if i == 0 or not trend[i-1]:
+            trend[i] = -1  # conventional initial downtrend until a band break
+            continue
+        if not (upper[i]<upper[i-1] or close[i-1]>upper[i-1]): upper[i]=upper[i-1]
+        if not (lower[i]>lower[i-1] or close[i-1]<lower[i-1]): lower[i]=lower[i-1]
+        trend[i] = (1 if close[i]>upper[i] else -1) if trend[i-1]<0 else (-1 if close[i]<lower[i] else 1)
+    f['trend'] = trend
+    f['supertrend'] = np.where(trend>0, lower, upper)
+    return f
+
+
+def research_events(data, c, date, confirm_volume=True):
+    """Close-confirmed signals, executed at the next minute open, fixed ATM strike.
+
+    Spot index volume is usually zero. ORB then requires observed volume on
+    the candidate fixed-strike option, over ten complete prior bars. It never
+    invents spot volume or mixes rolling strikes to create a volume surge.
+    """
+    if c.strategy in BOOK_STRATEGIES:
+        from quant_book import book_events
+        return book_events(data, c, date, confirm_volume=confirm_volume)
+    day = data.days[date]
+    features = getattr(data, 'research_features', data.features)
+    bars = features(c.timeframe)[date]
+    n = int(c.timeframe[:-1])
+    opening = 1020 if data.mcx else 555
+    range_end = opening + (30 if data.mcx else 15)
+    range_rows = [v for t,v in day['prices'].items() if opening<=t<range_end]
+    orb_high = max((v[1] for v in range_rows), default=np.nan)
+    orb_low = min((v[2] for v in range_rows), default=np.nan)
+    result = []
+    for i, row in enumerate(bars.itertuples()):
+        at = row.timestamp.hour*60+row.timestamp.minute+n
+        lo, hi = (565, 870) if c.strategy=='vwap_ema_pullback' or not data.mcx else (1020, 1365)
+        if i<1 or not max(lo, minute(c.entry_start))<=at<=min(hi, minute(c.entry_end)):
+            continue
+        previous = bars.iloc[i-1]
+        bullish = bearish = False
+        volume_basis = 'underlying'
+        if c.strategy == 'vwap_ema_pullback':
+            # Previous candle touches EMA9 from the trend side; current close
+            # clears its high/low. A one-sided inequality isn't a pullback.
+            touch = previous.low <= previous.ema9 <= previous.high
+            bullish = touch and row.close>row.vwap and row.ema9>row.ema21 and row.adx>=18 and row.close>previous.high
+            bearish = touch and row.close<row.vwap and row.ema9<row.ema21 and row.adx>=18 and row.close<previous.low
+        elif c.strategy == 'orb_volume_breakout':
+            if at<=range_end: continue
+            bullish = row.close>orb_high and 55<=row.rsi<=78
+            bearish = row.close<orb_low and 22<=row.rsi<=45
+        elif c.strategy == 'supertrend_adx_trend':
+            # Continuation requires another close beyond the previous candle;
+            # a flip itself qualifies. Re-entry still obeys the portfolio cap.
+            bullish = row.adx>22 and row.trend==1 and (previous.trend==-1 or row.close>previous.high)
+            bearish = row.adx>22 and row.trend==-1 and (previous.trend==1 or row.close<previous.low)
+        elif c.strategy == 'mcx_evening_breakout':
+            history = bars.iloc[max(0,i-12):i]
+            if len(history)<12 or not np.isfinite(row.ema50): continue
+            expanding = abs(row.close-row.open)>1.2*row.atr14
+            bullish = expanding and row.close>history.high.max() and row.close>row.ema50
+            bearish = expanding and row.close<history.low.min() and row.close<row.ema50
+        if not (bullish or bearish): continue
+        side = ('LONG' if bullish else 'SHORT') if data.mcx else ('CE' if bullish else 'PE')
+        strike = 0 if data.mcx else day['rolling'].get((side,'ATM'),{}).get(at-1)
+        if strike is None: continue
+        if c.strategy == 'orb_volume_breakout' and confirm_volume:
+            volumes = bars.volume.iloc[max(0,i-10):i]
+            current_volume = row.volume
+            if not data.mcx and not (volumes.sum()>0):
+                volume_basis = 'fixed_strike_option'
+                # Only timestamps known at signal close; ten preceding full bars.
+                windows = []
+                for start in range(at-11*n, at, n):
+                    candles = [data.price(day,t,side,strike) for t in range(start,start+n)]
+                    if any(v is None for v in candles): break
+                    windows.append(sum(v[4] for v in candles))
+                if len(windows)!=11: continue
+                volumes, current_volume = pd.Series(windows[:-1]), windows[-1]
+            if len(volumes)!=10 or volumes.mean()<=0 or current_volume<=1.3*volumes.mean(): continue
+        evidence = dict(signal_time=row.timestamp+pd.Timedelta(minutes=n),
+                        signal_vwap_proxy=bool(row.vwap_proxy), signal_volume_basis=volume_basis)
+        day.setdefault('signal_evidence', {})[c.strategy,c.timeframe,at,side,strike] = evidence
+        result.append((at,side,strike,None,float(row.atr14)))
+    return result
+
+
 class ResearchData:
     """One immutable snapshot per instrument; API credentials are never loaded."""
     def __init__(self, instrument, start='2025-01-01', end='2026-10-23', root=ROOT):
@@ -255,11 +410,7 @@ class ResearchData:
         self.days, self.exclusions, self._features, self._events = {}, [], {}, {}
         self.eligibility = []
         report_path = self.root/'quality_report.json'
-        if not report_path.exists():
-            raise ValueError('Run audit_quant_lake.py first: quality report is required')
-        self.quality = json.loads(report_path.read_text())
-        if self.quality.get('issues'):
-            raise ValueError('Lake integrity issues must be resolved before backtesting')
+        self.quality = require_current_audit(self.root)
         self.fingerprint = hashlib.sha256((self.root/'ingestion_manifest.json').read_bytes()+report_path.read_bytes()+CALENDAR_HASH.encode()).hexdigest()[:16]
         self.expiry_calendar = set(expiries(instrument))
         calendar = self.root/'expiry_calendar.csv'
@@ -327,12 +478,23 @@ class ResearchData:
             s = s.sort_values('timestamp').copy()
             s['minute'] = s.timestamp.dt.hour*60+s.timestamp.dt.minute
             if not self.mcx and not regular_session(date):
-                audit['reasons'].append(dict(problem='calendar: no regular index session', stream=instrument))
+                regular=s[s.minute.between(9*60+15,15*60+29)]
+                valid=regular[['open','high','low','close','volume']].apply(pd.to_numeric,errors='coerce')
+                dense=(regular.timestamp.nunique()>=370 and not regular.timestamp.duplicated().any()
+                       and np.isfinite(valid).all().all() and valid.volume.ge(0).all()
+                       and valid[['open','high','low','close']].gt(0).all().all()
+                       and valid.high.ge(valid[['open','low','close']].max(axis=1)).all()
+                       and valid.low.le(valid[['open','high','close']].min(axis=1)).all())
+                if dense:
+                    audit['evidence'].append(dict(problem='Observed full-length non-weekday session accepted; required-window checks still apply',stream=instrument,
+                        calendar_verification='NSE Budget circular CMTR65729 / FAOP72352' if date in ('2025-02-01','2026-02-01') else 'Observed session evidence only; calendar identity unverified'))
+                else:audit['reasons'].append(dict(problem='calendar: no regular index session', stream=instrument))
             stream = s.instrument.iloc[0]
             reasons, notes = stream_check(s, date, stream, self.required_windows['underlying'], (stream,date) in flagged)
             rejected, evidence = rejected_evidence(self.root, records, date, stream, self.required_windows['underlying'])
             audit['reasons'].extend(reasons+rejected); audit['evidence'].extend(notes+evidence)
-            option_map, rolling, option_meta = {}, {}, {}
+            repair_frames=[s]
+            option_map, rolling, option_meta, quotes = {}, {}, {}, {}
             if not self.mcx:
                 od = option_days.get(date, pd.DataFrame())
                 for side, strike in ((side, strike) for side in ('CE','PE') for strike in ('ATM','ATM-1','ATM+1')):
@@ -342,26 +504,54 @@ class ResearchData:
                     rejected, evidence = rejected_evidence(self.root, records, date, stream, self.required_windows['options'])
                     audit['reasons'].extend(reasons+rejected); audit['evidence'].extend(notes+evidence)
                     if g.empty: continue
+                    repair_frames.append(g)
                     g['minute'] = g.timestamp.dt.hour*60+g.timestamp.dt.minute
                     rolling[side, strike] = {int(row.minute): float(row.strike) for row in g.itertuples()}
                     for row in g.itertuples():
                         key = (int(row.minute), side, float(row.strike))
                         value = (row.open, row.high, row.low, row.close, row.volume)
-                        if key in option_map and option_map[key] != value:
-                            audit['reasons'].append(dict(problem='Conflicting same-strike candles', stream=stream,
-                                                         timestamps=[row.timestamp.isoformat()]))
-                        option_map[key] = value
-                        option_meta[key] = (float(row.oi),float(row.iv),float(row.spot))
+                        meta = (float(row.oi),float(row.iv),float(row.spot))
+                        quotes.setdefault(key, {}).setdefault((value, meta), set()).add(stream)
+                begin, finish = map(minute, self.required_windows['options'])
+                for key, variants in quotes.items():
+                    if len(variants) > 1:
+                        affected = sorted(set().union(*variants.values()))
+                        required = begin <= key[0] <= finish
+                        evidence = dict(problem='Conflicting same-strike candles', streams=affected,
+                                        timestamps=[(s.timestamp.iloc[0].normalize()+pd.Timedelta(minutes=key[0])).isoformat()],
+                                        side=key[1], strike=key[2], outside_required_window=not required)
+                        audit['reasons' if required else 'evidence'].append(evidence)
+                        # Never pick a rolling stream's disputed OHLCV/metadata,
+                        # including historical quotes outside the run window.
+                        continue
+                    value, meta = next(iter(variants))
+                    option_map[key], option_meta[key] = value, meta
+            repaired=[];price_sources={}
+            for frame in repair_frames:
+                if 'candle_source' not in frame:continue
+                window=self.required_windows['options'] if 'option_type' in frame else self.required_windows['underlying']
+                lo,hi=[pd.Timestamp(f'{date} {v}',tz=IST) for v in window]
+                rows=frame[frame.timestamp.between(lo,hi)&frame.candle_source.isin(['synthetic_ffill','quarantine_volume_zero'])]
+                repaired.extend(dict(stream=r.instrument,timestamp=r.timestamp.isoformat(),method=r.candle_source) for r in rows.itertuples())
+                for row in rows.itertuples():
+                    key=int(row.timestamp.hour*60+row.timestamp.minute) if self.mcx else (int(row.timestamp.hour*60+row.timestamp.minute),getattr(row,'option_type',None),float(getattr(row,'strike',0)))
+                    price_sources[key]=row.candle_source
+            audit['repaired_inputs']=repaired
+            if repaired:audit['evidence'].append(dict(problem='Run includes repaired inputs; synthetic candles are not observed quotes',count=len(repaired)))
             if audit['reasons']:
                 self.exclusions.append(dict(date=date, instrument=instrument, contract=contract if self.mcx else None,
                                             reason='; '.join(sorted({r['problem'] for r in audit['reasons']}))))
                 continue
             audit['status'] = 'eligible'
             self.days[date] = dict(spot=s, prices={int(r.minute): (r.open,r.high,r.low,r.close,r.volume) for r in s.itertuples()},
+                                  oi={int(r.minute):float(getattr(r,'oi',np.nan)) for r in s.itertuples()},
                                   options=option_map, option_meta=option_meta, rolling=rolling, contract=s.instrument.iloc[0],
-                                  timestamp=s.timestamp.iloc[0].normalize())
+                                  timestamp=s.timestamp.iloc[0].normalize(),repaired_inputs=repaired,price_sources=price_sources)
         # An all-excluded request still has a useful eligibility report and zero
         # executions; do not erase the evidence with a generic loader exception.
+        current = require_current_audit(self.root)
+        if any(current[k] != self.quality[k] for k in ('manifest_fingerprint','file_fingerprint','calendar_fingerprint')):
+            raise ValueError('Lake evidence changed while loading. Run a local quality check and reload before backtesting.')
         self.fingerprint = hashlib.sha256(self.fingerprint.encode()+json.dumps(self.eligibility, sort_keys=True).encode()).hexdigest()[:16]
 
     def features(self, timeframe):
@@ -369,21 +559,42 @@ class ResearchData:
             self._features[timeframe] = {d: make_bars(day['spot'], timeframe) for d,day in self.days.items()}
         return self._features[timeframe]
 
+    def research_features(self, timeframe):
+        key = ('research', timeframe)
+        if key not in self._features:
+            # Carry causal indicator warm-up across sessions of the same contract.
+            # VWAP still resets daily. Never join different MCX contracts.
+            groups = {}
+            for date, day in self.days.items():
+                contract = day['contract'] if self.mcx else self.instrument
+                groups.setdefault(contract, []).append((date, day['spot']))
+            result = {}
+            for sessions in groups.values():
+                bars = pd.concat([make_bars(f, timeframe) for _, f in sorted(sessions)], ignore_index=True)
+                bars = research_indicators(bars)
+                for date, frame in bars.groupby(bars.timestamp.dt.strftime('%Y-%m-%d')):
+                    result[date] = frame.reset_index(drop=True)
+            self._features[key] = result
+        return self._features[key]
+
     def price(self, day, at, side, strike):
         return day['prices'].get(at) if self.mcx else day['options'].get((at, side, strike))
 
     def events(self, c, date):
         """Each event contains an entry minute, side, fixed strike, trigger, ATR."""
         key = (c.strategy,c.timeframe,c.strike,c.orb_minutes,c.anchor,c.mode,c.breakout_pct,c.entry_start,c.entry_end,c.adx_min,
-               c.option_lookback,c.volume_multiple,c.oi_mode,c.oi_min_change_pct,c.atr_expansion,c.compression_ratio,date)
+               c.option_lookback,c.volume_multiple,c.oi_mode,c.oi_min_change_pct,c.atr_expansion,c.compression_ratio,c.momentum_lookback,c.momentum_threshold,date)
         if key in self._events:
+            return self._events[key]
+        if c.strategy in STRATEGIES:
+            self._events[key] = research_events(self, c, date)
             return self._events[key]
         if c.strategy in HIGH_STRATEGIES:
             self._events[key]=high_edge_events(self,c,date)
             return self._events[key]
         day = self.days[date]
         result = []
-        if c.strategy == STRATEGIES[2]:
+        if c.strategy == LEGACY_STRATEGIES[2]:
             anchor = minute(c.anchor)
             refs = {}
             for side in ('CE','PE'):
@@ -415,26 +626,26 @@ class ResearchData:
             range_low = min(r[2] for r in range_rows)
             for i,row in enumerate(bars.itertuples()):
                 at = row.timestamp.hour*60+row.timestamp.minute+n
-                warmup = 1 if c.strategy == STRATEGIES[1] else 20
+                warmup = 1 if c.strategy == LEGACY_STRATEGIES[1] else 20
                 if i < warmup or at < (max(1050,minute(c.entry_start)) if self.mcx else minute(c.entry_start)) or at > (min(1350,minute(c.entry_end)) if self.mcx else minute(c.entry_end)):
                     continue
                 side = None
-                if c.strategy == STRATEGIES[0]:
+                if c.strategy == LEGACY_STRATEGIES[0]:
                     if row.adx >= c.adx_min:
                         if row.ema9>row.ema21 and row.trend>0 and row.close>row.vwap: side='CE'
                         elif row.ema9<row.ema21 and row.trend<0 and row.close<row.vwap: side='PE'
-                elif c.strategy in (STRATEGIES[1],STRATEGIES[4]):
+                elif c.strategy in (LEGACY_STRATEGIES[1],LEGACY_STRATEGIES[4]):
                     if at <= range_end: continue
                     if row.close>range_high: side='LONG' if self.mcx else 'CE'
                     elif row.close<range_low: side='SHORT' if self.mcx else 'PE'
-                elif c.strategy == STRATEGIES[3]:
+                elif c.strategy == LEGACY_STRATEGIES[3]:
                     proximity = max(row.atr*0.25,row.close*0.0003)
                     if row.close>row.ema50 and row.low<=row.vwap+proximity and row.close>row.vwap and row.close>row.open and row.close-row.low>(row.high-row.low)*0.6: side='CE'
                     elif row.close<row.ema50 and row.high>=row.vwap-proximity and row.close<row.vwap and row.close<row.open and row.high-row.close>(row.high-row.low)*0.6: side='PE'
                 if side is None: continue
                 strike = 0 if self.mcx else day['rolling'][side,c.strike].get(at-1)
                 if strike is None: continue
-                if c.strategy == STRATEGIES[1]:
+                if c.strategy == LEGACY_STRATEGIES[1]:
                     history = [self.price(day,t,side,strike) for t in range(at-21,at)]
                     option_orb = [self.price(day,t,side,strike) for t in range(opening,range_end)]
                     if any(v is None for v in history+option_orb): continue
@@ -467,6 +678,9 @@ def simulate_trade(data,c,date,event,trade_id,**account):
 
 
 def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None):
+    if not data.mcx and c.strategy in BOOK_STRATEGIES[:3]:
+        from quant_book import basket_steps
+        return (yield from basket_steps(data,c,date,event,trade_id,budget,entry_equity))
     at, side, strike, trigger, atr = event
     day = data.days[date]
     direction = -1 if side=='SHORT' else 1
@@ -480,8 +694,10 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
     qty,allocated,reserve=order_allocation(c,date,entry,budget,direction)
     if not qty: return None, []
-    atr_risk = data.mcx and c.risk_basis == 'legacy'
+    atr_risk = data.mcx and (c.risk_basis == 'legacy' or c.strategy in BOOK_STRATEGIES)
     stop_distance = atr*c.atr_sl if atr_risk else entry*c.sl_pct/100
+    if data.mcx and c.strategy in BOOK_STRATEGIES:
+        stop_distance=min(stop_distance,entry*c.sl_pct/100)
     if stop_distance<=0: return None, []
     target_distance = stop_distance*c.reward_risk if atr_risk else entry*c.target_pct/100
     stop, target = entry-direction*stop_distance, entry+direction*target_distance
@@ -489,6 +705,7 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     best = entry
     trace = []
     modeled_bars=0
+    modeled_wing_fallback=False
     previous=data.price(day,at-1,side,strike)
     final_source='observed'
     finish = 1395 if data.mcx else 920
@@ -498,11 +715,20 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     for current in range(at,finish+1):
         row = data.price(day,current,side,strike)
         source=dict(price_source='observed',model_neighbor_strike=np.nan,model_iv_pct=np.nan,model_expiry_assumption='')
+        stored_source=day.get('price_sources',{}).get(current if data.mcx else (current,side,strike))
+        if stored_source=='synthetic_ffill':
+            if c.price_policy=='strict_observed':raise MissingObservedPrice('Strict-observed execution encountered a synthetic repaired candle')
+            source['price_source']='synthetic_ffill';modeled_bars+=1
+        elif stored_source=='quarantine_volume_zero':source['price_source']='observed_price_volume_corrected'
         if row is None:
             if data.mcx or c.price_policy=='strict_observed':
                 raise MissingObservedPrice(f'{date} {side} strike {strike} missing at minute {current}; strict run is not rankable')
-            row,source=continuation_candle(data,day,current,side,strike,previous)
+            try:
+                row,source=continuation_candle(data,day,current,side,strike,previous)
+            except MissingObservedPrice as exc:
+                raise MissingObservedPrice(f'{date} {current//60:02d}:{current%60:02d} {side} {strike:g}: {exc}') from exc
             modeled_bars+=1
+        modeled_wing_fallback |= bool(source.get('modeled_wing_fallback',False))
         previous=row
         final_source=source['price_source']
         op,hi,lo,cl,_ = row
@@ -553,8 +779,9 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
                 is_expiry_day=is_expiry_day(c.instrument,date) if not data.mcx else False,
                 inferred_expiry=next_expiry(c.instrument,date) if not data.mcx else '',
                 modeled_bars=modeled_bars,used_modeled_prices=modeled_bars>0,exit_price_source=final_source,
+                modeled_wing_fallback=modeled_wing_fallback,
                 contract_identity_verified=bool(data.mcx),
-                verification_status='observed_candles_accounting_checked' if data.mcx else 'model_dependent' if modeled_bars else 'observed_strike_expiry_unverified',
+                verification_status='repaired_inputs' if day.get('repaired_inputs') else 'observed_candles_accounting_checked' if data.mcx else 'model_dependent' if modeled_bars else 'observed_strike_expiry_unverified',
                 **day.get('signal_evidence',{}).get((c.strategy,c.timeframe,at,side,strike),{}),
                 instrument=c.instrument,strategy=c.strategy,
                 capital_allocated=allocated,capital_reserved=allocated+reserve,allocation_budget=budget,
@@ -595,6 +822,7 @@ def performance(trades, dates, capital):
     metrics['unresolved_trades']=int(len(trades)-len(closed))
     metrics['modeled_trades']=int(closed.used_modeled_prices.sum()) if 'used_modeled_prices' in closed else 0
     metrics['modeled_bars']=int(closed.modeled_bars.sum()) if 'modeled_bars' in closed else 0
+    metrics['modeled_wing_fallback_trades']=int(closed.modeled_wing_fallback.sum()) if 'modeled_wing_fallback' in closed else 0
     metrics['all_closed_trades_accounted']=metrics['unresolved_trades']==0
     # Infinite PF represented as null + explicit flag, never a fake finite ratio.
     metrics['profit_factor_infinite']=bool(len(wins) and not len(losses))
@@ -611,12 +839,32 @@ def atomic_json(path, value):
     os.replace(tmp,path)
 
 
+def persist_result(result, output=OUT):
+    """Persist an already simulated session result, without rerunning it."""
+    frames = result.get('_frames')
+    if frames is None:
+        raise ValueError('This session has no result tables to save. Run the backtest again.')
+    path = Path(output)/'runs'/result['run_id']
+    path.mkdir(parents=True, exist_ok=True)
+    document = {k:v for k,v in result.items() if k != '_frames'}
+    document['path'] = str(path.resolve())
+    atomic_json(path/'eligibility.json', document['eligibility'])
+    for name, frame in frames.items():
+        temp = path/f'{name}.parquet.tmp'
+        frame.to_parquet(temp, index=False)
+        os.replace(temp, path/f'{name}.parquet')
+    atomic_json(path/'result.json', document)  # completion marker last
+    return document
+
+
 def run_backtest(c, data=None, output=OUT, persist=True):
     c.validate()
     data=data or ResearchData(c.instrument,c.start,c.end)
     if (data.instrument,data.start,data.end)!=(c.instrument,c.start,c.end):
         raise ValueError('Prepared data does not match configuration window')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,data=data.fingerprint),sort_keys=True)
+    if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
+        raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
+    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-wing-v1',data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'
@@ -644,17 +892,21 @@ def run_backtest(c, data=None, output=OUT, persist=True):
                 eligibility=getattr(data,'eligibility',[]),
                 eligibility_scope='Run dependency windows, not whole-session historical health or verified options identity',
                 first_session=min(data.days,default=None),last_session=max(data.days,default=None),runtime_seconds=round(time.perf_counter()-began,3),
-                status='observed_candles_accounting_checked' if data.mcx else 'model_dependent' if metrics['modeled_trades'] else 'observed_strike_expiry_unverified',
-                verified_price_eligible=bool(data.mcx and metrics['unresolved_trades']==0 and len(trades)>0),
+                status='repaired_inputs' if any(d.get('repaired_inputs') for d in data.days.values()) else 'observed_candles_accounting_checked' if data.mcx else 'model_dependent' if metrics['modeled_trades'] else 'observed_strike_expiry_unverified',
+                repaired_inputs=[r for d in data.days.values() for r in d.get('repaired_inputs',[])],
+                repair_disclosure='Zero-volume corrections and synthetic flat candles retain provenance; eligibility is not proof of observed prices or full historical coverage.',
+                verified_price_eligible=bool(data.mcx and not any(d.get('repaired_inputs') for d in data.days.values()) and metrics['unresolved_trades']==0 and len(trades)>0),
                 limitations=LIMITATIONS,expiry_calendar_available=data.has_calendar,
                 equity_basis='all entered trades closed; realized daily equity; modeled prices explicitly tagged',path=str(path.resolve()))
+    underlying = pd.DataFrame()
+    if c.strategy in STRATEGIES and len(trades) and hasattr(data, 'research_features'):
+        features = data.research_features(c.timeframe)
+        underlying = pd.concat([features[d].assign(date=d) for d in sorted(trades.date.unique())], ignore_index=True)
+    result['_frames'] = dict(trades=trades, equity=equity, monthly=monthly, stop_paths=pd.DataFrame(paths),
+        skipped_entries=pd.DataFrame(skipped), excluded_sessions=pd.DataFrame(data.exclusions),
+        daily_risk=pd.DataFrame(daily_risk), underlying=underlying)
     if persist:
-        path.mkdir(parents=True,exist_ok=True)
-        atomic_json(path/'eligibility.json', result['eligibility'])
-        for name,frame in [('trades',trades),('equity',equity),('monthly',monthly),('stop_paths',pd.DataFrame(paths)),('skipped_entries',pd.DataFrame(skipped)),('excluded_sessions',pd.DataFrame(data.exclusions)),('daily_risk',pd.DataFrame(daily_risk))]:
-            temp=path/f'{name}.parquet.tmp'
-            frame.to_parquet(temp,index=False); os.replace(temp,path/f'{name}.parquet')
-        atomic_json(marker,result)  # completion marker written last
+        return persist_result(result, output)
     return result
 
 

@@ -6,6 +6,8 @@ import pandas as pd
 import streamlit as st
 from quant_data_quality import (STATUSES, inventory, report_state, filtered_groups, group_status,
                                stream_sessions, preview_candles, preview_export, run_quality_check)
+from quant_data_workflows import range_panel, sync_panel, report_for_group
+from quant_coverage import finding_bucket
 
 
 def size_label(value):
@@ -56,10 +58,10 @@ def filters(inv, prefix, with_health=False):
     return dict(exchange=values['exchange'], instrument=values['underlying'], segment=values['segment'], health=health)
 
 
-def dataset_table(groups):
+def dataset_table(groups, report=None):
     return pd.DataFrame([{'Instrument': g['underlying'], 'Segment': g['segment'], 'Health': g['status'], 'First stored': g['first'][:10] if g['first'] else '—',
                           'Last stored': g['last'][:10] if g['last'] else '—', 'Interval': g['interval'],
-                          'Rows': g['rows']} for g in groups])
+                          'Rows': g['rows'], 'Backtest Usability':report_for_group(g,report)} for g in groups])
 
 
 def select_dataset(groups, key, all_option=False):
@@ -95,10 +97,46 @@ def relevant_findings(inv, state, group_id=None):
     return findings
 
 
-def findings_frame(findings):
+def finding_stream_label(item, inv):
+    sid = item.get('stream')
+    if sid:
+        stream = inv['streams'].get(sid)
+        return stream['instrument'] if stream else str(sid)+' (unresolved identifier)'
+    return 'Lake-level' if item.get('dataset', 'Lake') == 'Lake' else 'Not recorded'
+
+
+def finding_unit(item):
+    if item.get('category')=='repair':return 'input candles' if item.get('resolved_count') else 'repaired candles'
+    if isinstance(item.get('unit'), str) and item['unit']:
+        return item['unit']
+    problem = item['problem']
+    if problem.startswith('Coverage not verified:'): return 'dates unverified'
+    return {
+        'Exact duplicate input rows removed': 'input rows',
+        'Conflicting input rows rejected / quarantined': 'input rows',
+        'Invalid input candles rejected': 'input candles',
+        'Out-of-hours input rows rejected': 'input rows',
+        'Stored row count differs from manifest.': 'stored rows',
+        'Stored candles fall outside the requested partition period.': 'stored candles',
+        'Exact duplicates remain in stored candles': 'stored rows',
+        'Unresolved conflicting timestamp rows remain stored': 'stored rows',
+        'Invalid stored OHLCV candles': 'stored candles',
+        'Internal expected candle gaps': 'candles',
+        'Missing opening candles': 'candles',
+        'Missing closing candles': 'candles',
+        'Entire expected session absent': 'sessions',
+        'Candles outside the evidenced session': 'candles',
+        'Only one candle observed; session coverage cannot pass.': 'stored candles',
+        'Minute-spacing holes between observed candles; not verified missing exchange candles.': 'minute-spacing holes',
+    }.get(problem, 'Not recorded')
+
+
+def findings_frame(findings, inv):
     return pd.DataFrame([{'Severity': f.get('severity','Unknown'), 'Dataset': f.get('dataset','Lake'),
+                          'Stream / contract': finding_stream_label(f, inv),
                           'Affected date / range': f.get('period') or 'Not measured', 'Problem': f['problem'],
-                          'Count': (f"{f['count']} dates unverified" if f['problem'].startswith('Coverage not verified:') and f.get('count') is not None else f.get('count')),
+                          'Count': str(f['count']) if isinstance(f.get('count'), (int,float)) and pd.notna(f['count']) else 'Not measured',
+                          'Unit': finding_unit(f),
                           'Next action': f.get('action','Review source evidence.')} for f in findings])
 
 
@@ -157,8 +195,18 @@ def ingestion_panel(inv):
 
 
 def render_data_lake(root):
+    from quant_data_lab import render_inventory
+    inv=inventory(root);state=report_state(root,inv)
+    render_inventory(root,inv,state)
+    with st.expander('🔍 Inspect Date-Range & Candle Preview',expanded=False):
+        _render_lake_inspector(root)
+
+
+def _render_lake_inspector(root):
     inv = inventory(root); state = report_state(root, inv)
-    summary_cards(inv,state)
+    report=range_panel(root,inv)
+    if not st.session_state.get('lab_backfill'):sync_panel(root)
+    st.caption('Backtest Usability refers to the product’s complete engine bundle over the selected From / To range; it is separate from whole-history audit status and optional option wings.')
     if inv['findings']: st.warning('Some committed files or metadata need attention. Counts include readable committed files; storage includes existing committed Parquet files. See Data Quality.')
     with st.container(key='lake_browser'):
         search = st.text_input('Search datasets', placeholder='Instrument, segment, stream or contract…', key='lake_search')
@@ -168,7 +216,6 @@ def render_data_lake(root):
         with left, st.container(border=True,key='lake_table'):
             title('Dataset catalog',f'{len(groups)} logical datasets')
             if groups:
-                st.dataframe(dataset_table(groups), hide_index=True, width='stretch', height=min(440,40+len(groups)*35))
                 selected = select_dataset(groups,'lake_dataset')
                 st.caption('Counts are stored stream observations. Daily and intraday datasets are separate; related option streams and futures contracts are grouped. Files referenced twice count once.')
             else:
@@ -201,9 +248,26 @@ def render_data_lake(root):
 
 def render_data_quality(root):
     inv = inventory(root); state = report_state(root,inv)
+    from quant_coverage import inventory_health
+    from quant_inventory_health import health_summary, percent_label
+    with st.spinner('Loading calculated session health…'):health=inventory_health(root,inv,state)
+    summary=health_summary(health,inv)
+    audited=state['report'] or {}
+    integrity=[v['dimensions']['integrity'] for v in audited.get('streams',{}).values() if isinstance(v,dict) and isinstance(v.get('dimensions'),dict) and (v.get('rows',0)>0 or v['dimensions']['integrity']!='No data')]
+    passed=sum(v=='Checks passed' for v in integrity)
+    integrity_value=f'{100*passed/len(integrity):.0f}% Passed ✓' if state['current'] and integrity and passed==len(integrity) else f'{passed}/{len(integrity)} passed' if state['current'] and integrity else 'Audit required' if inv['records'] else 'No data'
+    cards=st.columns(4)
+    cards[0].metric('File Integrity',integrity_value)
+    cards[1].metric('Stored Session Readiness',percent_label(summary['percent']) if not summary['error'] else 'Unverified',f"{summary['ready']} / {summary['stored']} instrument-sessions gap-free")
+    cards[2].metric('Repaired Candles',f"{summary['restored']} restored / {summary['filled']} filled")
+    cards[3].metric('Unresolved In-Window Gaps/Conflicts',summary['excluded'] if not summary['error'] else 'Unverified')
+    st.caption('Readiness counts each instrument/date once, combining spot + six option streams for indices and prior-session selected futures for MCX. Exclusions include missing streams, short/special sessions and unavailable selection evidence, not just candle holes. BANKNIFTY measures spot only. Historical holidays/absent sessions and options expiry identity remain separate; synthetic repairs are not observed quotes.')
+    with st.expander('Check run eligibility for a date range',expanded=False):
+        range_report=range_panel(root,inv)
     with st.container(border=True,key='quality_overview'):
-        title('Data health',state['status'])
-        st.write(state['explanation'])
+        title('Audit Inspector',('Required-window checks passed' if not summary['excluded'] else f"{summary['excluded']} instrument-sessions need attention") if state['current'] and not summary['error'] else state['status'])
+        st.write('Current audit: measured required-window readiness is shown above. Historical coverage and contract-identity limitations remain in the findings.' if state['current'] else state['explanation'])
+        st.caption('Historical audit status: '+state['status']+' · '+state['explanation'])
         st.caption(f'Last audit: {checked_label(state)} · '+('Matches current manifest and file state' if state['current'] else 'Current lake audit not verified'))
         a,b=st.columns([1,2])
         with a:
@@ -225,7 +289,6 @@ def render_data_quality(root):
         choices=filters(inv,'quality',with_health=True)
         groups=filtered_groups(inv,state,search,**choices)
         if groups:
-            st.dataframe(dataset_table(groups),hide_index=True,width='stretch',height=min(400,40+35*len(groups)))
             selected=select_dataset(groups,'quality_dataset',all_option=True)
         else:
             selected=None; st.info('No datasets match these filters.' if inv['records'] else 'No data. An audit can report this empty state without inventing measurements.')
@@ -237,31 +300,54 @@ def render_data_quality(root):
                 if g['group_id'] not in selected_ids: continue
                 for sid in g['streams']:
                     result=report.get('streams',{}).get(sid,{})
-                    rows.append({'Stream / contract':inv['streams'][sid]['instrument'], **{k.title():v for k,v in result.get('dimensions',{}).items()}, 'Options identity':result.get('identity','Not checked')})
+                    metric=health['streams'].get(sid)
+                    validity=metric.get('validity','Review needed') if metric else result.get('dimensions',{}).get('validity','No data')
+                    if validity=='Checks passed':validity='Passed (Repaired) ✓' if metric and metric['repaired'] else 'Checks passed ✓'
+                    coverage=f"{percent_label(metric['percent'])} Ready ({metric['ready']}/{metric['stored']} days)" if metric and metric['percent'] is not None else 'No stored sessions' if metric and not metric['stored'] and not metric['error'] else 'Verification unavailable' if metric else 'Daily source · no intraday test'
+                    rows.append({'Stream / contract':inv['streams'][sid]['instrument'],'Integrity':result.get('dimensions',{}).get('integrity','Audit required'),
+                                 'Validity':validity,'Coverage':coverage,'Required bars':f"{metric['valid_bars']:,}/{metric['expected_bars']:,} · {percent_label(metric['bars_percent'])}" if metric and not metric['error'] else 'Not measured' if metric else 'Not applicable',
+                                 'Historical calendar':result.get('dimensions',{}).get('coverage','Unverified'),'Options identity':result.get('identity','Unverified')})
             st.dataframe(pd.DataFrame(rows),hide_index=True,width='stretch',height=min(260,40+len(rows)*35))
+            st.caption('Coverage is required-window completeness over observed stored sessions, not verified full historical exchange-calendar coverage. The historical-calendar column retains the original audit evidence.')
         else: st.info('A current audit is needed before per-check results can be presented as verified.')
+    with st.expander('Quarantine / Repair Log',expanded=True):
+        from quant_data_lab import repair_log,quarantine_preview
+        repair_log(inv)
+        quarantine_preview(root,inv)
+        ingestion_panel(inv)
     with st.container(border=True,key='quality_findings'):
-        title('Findings & next actions')
+        title('Findings & next actions','HISTORICAL HEALTH ≠ RUN ELIGIBILITY')
         severity=st.selectbox('Severity',['All','Error','Warning','Info'],key='quality_severity')
         findings=[f for f in relevant_findings(inv,state) if f.get('dataset')=='Lake' or f.get('dataset') in selected_ids]
         findings=[f for f in findings if severity=='All' or f.get('severity')==severity]
         if not state['current'] and report: st.warning('Prior report evidence is shown for review only; it is not a current verification.')
-        if findings:
-            table=findings_frame(findings)
-            table['Count']=table['Count'].map(lambda v:'Not measured' if pd.isna(v) else str(v))
-            st.dataframe(table,hide_index=True,width='stretch',height=min(350,40+35*len(table)),
-                         column_config={'Problem':st.column_config.TextColumn(width='large'),
-                                        'Next action':st.column_config.TextColumn(width='large')})
-            current=st.session_state.get('quality_finding',0)
-            st.session_state.quality_finding=current if isinstance(current,int) and 0<=current<len(findings) else 0
-            chosen=st.selectbox('Inspect finding',list(range(len(findings))),index=None,key='quality_finding',
-                                format_func=lambda i:f"{i+1}. {findings[i]['problem'][:95]}")
-            if chosen is not None:
-                item=findings[chosen]
-                st.write(item['problem'])
-                st.info('Next action: '+item.get('action','Review source evidence.'))
-            st.download_button('Export filtered findings CSV',table.to_csv(index=False),'quality_findings.csv','text/csv')
-        else: st.info('No matching recorded findings.' if report else 'No audit findings yet. Run a quality check to measure what can be verified.')
+        actionable=[f for f in findings if finding_bucket(f)=='actionable']
+        review=[f for f in findings if finding_bucket(f)=='review']
+        notes=[f for f in findings if finding_bucket(f)=='notes']
+        if range_report and range_report['product'] in {g['underlying'] for g in groups}:
+            group_id=next((g['group_id'] for g in groups if g['underlying']==range_report['product']), 'Lake')
+            for r in range_report['findings']:
+                if r['status']!='excluded':continue
+                sid=next((sid for sid,s in inv['streams'].items() if s['instrument']==r['stream']),None)
+                actionable.append(dict(severity='Warning',dataset=group_id,stream=sid,problem=r['problem'],count=r['count'],period=r['date'],
+                                       category='eligibility',unit=('rejected input rows' if r['problem'].startswith('Rejected ') else 'required candles') if r['count'] is not None else None,
+                                       action='Inspect this date and stream in the range eligibility export; explicitly backfill affected partitions if appropriate.'))
+        first=st.container(border=True,key='actionable_findings_section')
+        second=st.expander('ℹ️ Handled Ingestion Notes & Provider Limits',expanded=False)
+        with first:
+            st.markdown('### 🎯 Actionable Backtest Gaps & Conflicts')
+            st.caption('Confirmed run exclusions come from the checked date range. Integrity failures block the audit gate. Unlocalized historical evidence is labeled separately below.')
+            if actionable:render_finding_list(actionable,inv,'quality_finding')
+            elif review:
+                st.info('No localized run exclusion is shown yet. The evidence below needs date/window verification; it is not a confirmed backtest blocker.')
+            else:st.info('No confirmed required-window exclusions recorded. Check a date range to establish session usability.')
+            if review:
+                with st.expander('Historical findings requiring localization — not confirmed blockers',expanded=not actionable):
+                    render_finding_list(review,inv,'quality_review_finding' if actionable else 'quality_finding')
+        with second:
+            st.caption('Removed duplicates, rejected out-of-hours input and provider/identity disclosures do not by themselves invalidate a session that passes the engine checks; they do not prove missing history is complete.')
+            if notes:render_finding_list(notes,inv,'quality_notes_finding')
+            else:st.info('No matching ingestion notes recorded.')
         with st.expander('Technical evidence & measurement scope'):
             st.write('File integrity compares SHA-256 to the manifest. Candle validity checks stored OHLCV and duplicate timestamps. Removed input duplicates and quarantined conflicts are separate evidence. Coverage requires sourced, date-specific exchange sessions and futures applicability. Rolling options expiry identity remains unverified.')
             st.json(dict(audit_version=report.get('audit_version','Unversioned'), manifest_fingerprint=inv['manifest_fingerprint'],
@@ -275,3 +361,18 @@ def render_data_quality(root):
                     st.json(dict(scope=report.get('scope'),sample_streams=sample),expanded=False)
                 else:
                     st.json({k:v for k,v in report.items() if k not in ('findings','streams')},expanded=False)
+
+
+def render_finding_list(findings,inv,key):
+    table=findings_frame(findings,inv)
+    st.dataframe(table,hide_index=True,width='stretch',height=min(350,40+35*len(table)),
+                 column_config={'Problem':st.column_config.TextColumn(width='large'),'Next action':st.column_config.TextColumn(width='large')})
+    current=st.session_state.get(key,0)
+    st.session_state[key]=current if isinstance(current,int) and 0<=current<len(findings) else 0
+    chosen=st.selectbox('Inspect finding',list(range(len(findings))),index=None,key=key,
+                        format_func=lambda i:f"{i+1}. {finding_stream_label(findings[i], inv)} | {findings[i]['problem'][:95]}")
+    if chosen is not None:
+        item=findings[chosen];row=table.iloc[chosen]
+        st.caption(f"Stream / contract: {row['Stream / contract']} | Affected date / range: {row['Affected date / range']} | Count: {row['Count']} | Unit: {row['Unit']}")
+        st.write(item['problem']);st.info('Next action: '+item.get('action','Review source evidence.'))
+    st.download_button('Export filtered findings CSV',table.to_csv(index=False),'quality_findings.csv','text/csv',key=key+'_export')

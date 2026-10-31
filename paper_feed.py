@@ -13,7 +13,7 @@ import requests
 
 IST=ZoneInfo('Asia/Kolkata')
 MASTER_URL='https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
-SEGMENTS={0:'IDX_I',5:'MCX_COMM'}
+SEGMENTS={0:'IDX_I',2:'NSE_FNO',5:'MCX_COMM',8:'BSE_FNO'}
 # WebSocket LTT encodes IST wall-clock seconds, unlike REST chart timestamps.
 # Dhan support confirmation: https://madefortrade.in/t/57896
 FEED_IST_OFFSET=19800
@@ -30,6 +30,8 @@ class Asset:
     security_id: int
     expiry: str=''
     point_value: int=1
+    strike: float=0
+    option_type: str=''
 
     @property
     def key(self): return f'{self.segment}:{self.security_id}'
@@ -84,7 +86,7 @@ def decode_packets(message,received_time):
     return ticks
 
 
-def instruments(root,now):
+def master_path(root,now):
     """Select nearest non-expiry-day futures; never silently change an open contract."""
     root=Path(root); root.mkdir(parents=True,exist_ok=True)
     shared=Path(__file__).parent/'data_lake/scrip_master/master.csv'
@@ -101,10 +103,30 @@ def instruments(root,now):
                 raise FeedError('MASTER_SCHEMA_FAILURE')
             os.replace(tmp,local); path=local
         except requests.RequestException: raise FeedError('MASTER_NETWORK_FAILURE') from None
-    frame=pd.read_csv(path,low_memory=False)
+    return path
+
+
+def option_asset(frame, instrument, side, spot, now):
+    """Resolve a real, dated ATM contract and its current lot size."""
+    today=datetime.fromtimestamp(now,IST).date().isoformat()
+    exchange='NSE' if instrument=='NIFTY' else 'BSE'
+    f=frame[(frame.EXCH_ID==exchange)&(frame.INSTRUMENT=='OPTIDX')&
+            (frame.SYMBOL_NAME==instrument)&(frame.OPTION_TYPE==side)].copy()
+    f['expiry']=pd.to_datetime(f.SM_EXPIRY_DATE,errors='coerce').dt.strftime('%Y-%m-%d')
+    f=f[f.expiry.ge(today)]
+    if f.empty: raise FeedError('NO_ACTIVE_OPTION_CONTRACT')
+    f=f[f.expiry.eq(f.expiry.min())].copy()
+    f['distance']=(pd.to_numeric(f.STRIKE_PRICE)-spot).abs()
+    row=f.sort_values(['distance','STRIKE_PRICE','SECURITY_ID']).iloc[0]
+    return Asset(instrument,2 if exchange=='NSE' else 8,int(row.SECURITY_ID),row.expiry,
+                 int(row.LOT_SIZE),float(row.STRIKE_PRICE),side)
+
+
+def instruments(root,now):
+    frame=pd.read_csv(master_path(root,now),low_memory=False)
     today=datetime.fromtimestamp(now,IST).date().isoformat()
     result=[Asset('NIFTY',0,13),Asset('SENSEX',0,51)]
-    for symbol,multiplier in [('CRUDEOIL',100),('NATURALGAS',1250)]:
+    for symbol,multiplier in [('CRUDEOIL',100),('NATURALGAS',1250),('GOLDM',10)]:
         f=frame[(frame.EXCH_ID=='MCX')&(frame.INSTRUMENT=='FUTCOM')&(frame.SYMBOL_NAME==symbol)].copy()
         f['expiry']=pd.to_datetime(f.SM_EXPIRY_DATE,errors='coerce').dt.strftime('%Y-%m-%d')
         f=f[f.expiry.gt(today)].sort_values(['expiry','SECURITY_ID'])
@@ -114,14 +136,38 @@ def instruments(root,now):
     return result
 
 
-def warmup(client_id,token,asset,now):
+def option_structure_assets(frame,instrument,side,spot,now):
+    """Resolve a single expiry and exact ATM/wing strikes for an atomic basket."""
+    from quant_book import leg_specs
+    atm=option_asset(frame,instrument,'CE',spot,now)
+    exchange='NSE' if instrument=='NIFTY' else 'BSE'
+    f=frame[(frame.EXCH_ID==exchange)&(frame.INSTRUMENT=='OPTIDX')&(frame.SYMBOL_NAME==instrument)].copy()
+    expiry=pd.to_datetime(f.SM_EXPIRY_DATE,errors='coerce').dt.strftime('%Y-%m-%d')
+    f=f[expiry.eq(atm.expiry)].copy(); f['strike']=pd.to_numeric(f.STRIKE_PRICE)
+    strikes=sorted(f.strike.unique()); idx=strikes.index(atm.strike)
+    if idx==0 or idx+1==len(strikes): raise FeedError('MISSING_OPTION_WINGS')
+    local=datetime.fromtimestamp(now,IST); at=local.hour*60+local.minute
+    day={'rolling':{(s,m):{at-1:k} for s in ('CE','PE') for m,k in [('ATM',atm.strike),('ATM-1',strikes[idx-1]),('ATM+1',strikes[idx+1])]}}
+    specs=leg_specs(day,at,side,atm.strike)
+    if not specs: raise FeedError('INVALID_OPTION_STRUCTURE')
+    resolved=[]
+    for spec in specs:
+        rows=f[f.OPTION_TYPE.eq(spec['side'])&f.strike.eq(spec['strike'])].sort_values('SECURITY_ID')
+        if rows.empty: raise FeedError('MISSING_OPTION_LEG')
+        row=rows.iloc[0]
+        resolved.append((spec,Asset(instrument,atm.segment,int(row.SECURITY_ID),atm.expiry,int(row.LOT_SIZE),spec['strike'],spec['side'])))
+    return resolved
+
+
+def warmup(client_id,token,asset,now,history_days=0):
     """One allowed, read-only REST route; credentials are never passed to logging."""
     local=datetime.fromtimestamp(now,IST)
-    start=local.replace(hour=9,minute=0,second=0,microsecond=0)
+    from datetime import timedelta
+    start=local.replace(hour=9,minute=0,second=0,microsecond=0)-timedelta(days=history_days)
     end=local.replace(second=0,microsecond=0)
     if end<=start: return []
     payload=dict(securityId=str(asset.security_id),exchangeSegment=SEGMENTS[asset.segment],
-        instrument='FUTCOM',interval='1',oi=True,fromDate=start.strftime('%Y-%m-%d %H:%M:%S'),toDate=end.strftime('%Y-%m-%d %H:%M:%S'))
+        instrument='INDEX' if asset.segment==0 else 'OPTIDX' if asset.option_type else 'FUTCOM',interval='1',oi=asset.segment!=0,fromDate=start.strftime('%Y-%m-%d %H:%M:%S'),toDate=end.strftime('%Y-%m-%d %H:%M:%S'))
     for attempt in range(3):
         try:
             r=requests.post('https://api.dhan.co/v2/charts/intraday',json=payload,
@@ -138,8 +184,10 @@ def warmup(client_id,token,asset,now):
         if any(not isinstance(body.get(k),list) for k in keys): raise FeedError('WARMUP_SCHEMA_FAILURE')
         if len({len(body[k]) for k in keys})!=1: raise FeedError('WARMUP_ARRAY_LENGTHS')
         rows=[]
-        for values in zip(*(body[k] for k in keys)):
+        for index, values in enumerate(zip(*(body[k] for k in keys))):
             row=dict(zip(keys,values)); ts=float(row['timestamp'])
+            oi=body.get('open_interest',body.get('oi',[]))
+            if isinstance(oi,list) and index<len(oi): row['oi']=oi[index]
             if not start.timestamp()<=ts<end.timestamp() or int(ts)%60: continue
             if not all(math.isfinite(float(row[k])) for k in keys): continue
             if min(row[k] for k in ('open','high','low','close'))<=0 or row['volume']<0: continue
@@ -147,3 +195,16 @@ def warmup(client_id,token,asset,now):
             rows.append(row)
         return rows
     raise FeedError('WARMUP_RETRY_EXHAUSTED')
+
+
+def option_volume_confirmed(rows,c,event,now):
+    local=datetime.fromtimestamp(now,IST)
+    at=local.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()+event[0]*60
+    n=int(c.timeframe[:-1]); candles={int(r['timestamp']):r for r in rows}
+    volumes=[]
+    for start in range(int(at)-11*n*60,int(at),n*60):
+        times=range(start,start+n*60,60)
+        if any(t not in candles for t in times): return False
+        volumes.append(sum(candles[t]['volume'] for t in times))
+    average=sum(volumes[:-1])/10
+    return average>0 and volumes[-1]>1.3*average

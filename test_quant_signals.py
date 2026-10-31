@@ -27,7 +27,7 @@ class SignalTests(unittest.TestCase):
     def test_h1_h2_h3_generate_causal_positive_signals(self):
         date,data,bars=self.fixture()
         for strategy in HIGH_STRATEGIES[:3]:
-            c=replace(Config(),strategy=strategy,anchor='09:30',breakout_pct=18)
+            c=replace(Config(strategy=HIGH_STRATEGIES[0]),strategy=strategy,anchor='09:30',breakout_pct=18)
             events=high_edge_events(data,c,date)
             self.assertTrue(any(e[0]==590 and e[1]=='CE' for e in events),strategy)
             self.assertTrue(all(e[0]>=590 for e in events))
@@ -36,10 +36,10 @@ class SignalTests(unittest.TestCase):
         date,data,_=self.fixture(); day=data.days[date]
         p=day['options'][589,'CE',100]
         day['options'][589,'CE',100]=(*p[:4],100)
-        self.assertFalse(high_edge_events(data,Config(),date))
+        self.assertFalse(high_edge_events(data,Config(strategy=HIGH_STRATEGIES[0]),date))
         day['options'][589,'CE',100]=p; day['option_context_cache']={}
         day['option_meta'][589,'CE',100]=day['option_meta'][584,'CE',100]
-        self.assertFalse(high_edge_events(data,Config(),date))
+        self.assertFalse(high_edge_events(data,Config(strategy=HIGH_STRATEGIES[0]),date))
 
     def test_h4_compressed_range_breakout(self):
         date,data,bars=self.fixture(); data.mcx=True

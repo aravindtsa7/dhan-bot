@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,36 @@ from quant_lake import QuantDataLake, summary, ROOT, IST
 
 FIELDS=['open','high','low','close','volume','oi','iv','spot','strike']
 MASTER_URL='https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
+
+
+def provider_message(body,*,secrets=()):
+    """Allow only error description fields, never payloads/headers or credentials."""
+    messages=[]
+    def collect(value,depth=0):
+        if not isinstance(value,dict) or depth>3:return
+        for key in ('errorMessage','error_message','message','remarks'):
+            item=value.get(key)
+            if isinstance(item,str):messages.append(item)
+        for key in ('data','remarks'):collect(value.get(key),depth+1)
+    collect(body)
+    message=' | '.join(dict.fromkeys(messages))
+    for value in secrets:
+        if isinstance(value,str) and value:message=message.replace(value,'[redacted]')
+    # API initialization has already loaded .env. Also sanitize mocked records at
+    # the sync boundary; a response may echo a submitted identifier or token.
+    for key,value in os.environ.items():
+        if value and (key.startswith('DHAN_') or any(k in key.upper() for k in ('TOKEN','PASSWORD','SECRET','API_KEY'))):
+            message=message.replace(value,'[redacted]')
+    message=re.sub(r'https?://\S+','[URL redacted]',message,flags=re.I)
+    message=re.sub(r'(?i)(?:bearer\s+\S+|(?:access[-_ ]?token|client[-_ ]?id|pin|totp|password|secret)\s*[=:]\s*[^\s,;]+)','[credential redacted]',message)
+    message=re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?','[token redacted]',message)
+    return ' '.join(message.split())[:500]
+
+
+def provider_error(code,body,headers):
+    error=CheckError(code)
+    error.provider_message=provider_message(body,secrets=(headers.get('access-token'),headers.get('client-id')))
+    return error
 
 
 def atomic_json(path, value):
@@ -95,14 +126,16 @@ class API:
                         self.refreshes+=1
                     continue
                 if r.status_code==429 or r.status_code>=500 or code in ('DH-904','DH-908','DH-909','800','805'):
-                    if attempt==6: raise CheckError(code or f'HTTP-{r.status_code}')
+                    if attempt==6: raise provider_error(code or f'HTTP-{r.status_code}',body,headers)
                     try: retry=float(r.headers.get('Retry-After','0'))
                     except ValueError: retry=0
                     delay=min(60,max(retry,2**attempt+random.random()))
                     print(f'  retry {attempt+1}/6 after {delay:.1f}s ({code or r.status_code})',flush=True)
                     time.sleep(delay);continue
-                if not r.ok: raise CheckError(code or f'HTTP-{r.status_code}')
-                return unwrap(body)
+                if not r.ok: raise provider_error(code or f'HTTP-{r.status_code}',body,headers)
+                try:return unwrap(body)
+                except CheckError as exc:
+                    raise provider_error(exc.code,body,headers) from None
             except (requests.Timeout,requests.ConnectionError):
                 if attempt==6: raise CheckError('NETWORK') from None
                 time.sleep(min(60,2**attempt+random.random()))
@@ -116,6 +149,34 @@ def windows(start,end):
         stop=min(cursor+timedelta(days=28),end)
         if stop>start: yield max(cursor,start),stop
         cursor+=timedelta(days=28)
+
+
+def buffered_window(start,end):
+    """Storage end is exclusive. Expand backwards, never beyond that end.
+
+    Avoid narrow chart queries without requesting an unfinished future day.
+    Rolling requests are split into <=7 stored days; buffered queries stay <=8.
+    """
+    return min(start-timedelta(days=1),end-timedelta(days=7)),end
+
+
+def fetch_candles(api,endpoint,payload,meta,start,end,*,query_log=None):
+    parts=[];requests_made=query_log if query_log is not None else [];a=start
+    while a<end:
+        b=min(a+timedelta(days=7 if meta.get('option_type') else 28),end)
+        lo,hi=buffered_window(a,b)
+        # Record attempted windows before calling the provider, including failures.
+        requests_made.append(dict(fromDate=str(lo),toDate=str(hi),end_exclusive=True))
+        response=api.post(endpoint,dict(payload,fromDate=str(lo),toDate=str(hi)))
+        if meta.get('option_type'):
+            response=response.get(meta['option_type'].lower())
+        if not isinstance(response,dict) or 'timestamp' not in response:
+            raise ValueError('Missing candle response')
+        f=pd.DataFrame(response)
+        stamps=pd.to_datetime(f.timestamp,unit='s',utc=True).dt.tz_convert(IST)
+        parts.append(f[(stamps.dt.date>=a)&(stamps.dt.date<b)])
+        a=b
+    return pd.concat(parts,ignore_index=True).to_dict(orient='list'),requests_made
 
 
 def normalize(data,meta,start,end,daily=False):
@@ -165,6 +226,10 @@ def normalize(data,meta,start,end,daily=False):
     df=df[~invalid].copy()
     for k,v in meta.items(): df[k]=v
     if not daily:
+        from quant_repairs import recover_negative
+        df,repairs=recover_negative(df,rejected)
+        if repairs:quality['repairs']=repairs
+    if not daily:
         gaps=df.groupby(df.timestamp.dt.date).timestamp.diff().dt.total_seconds().dropna()
         quality['missing_internal_minutes']=int(((gaps/60-1).clip(lower=0)).sum())
     quality['stored']=len(df)
@@ -182,6 +247,11 @@ class Builder:
         self.manifest.update(requested_start=str(start),requested_end_exclusive=str(end))
 
     def chunk(self,dataset,meta,start,end,endpoint,payload):
+        expiry_end=pd.Timestamp(meta['contract_expiry']).date()+timedelta(days=1) if meta.get('contract_expiry') else None
+        after_expiry=expiry_end is not None and start>=expiry_end
+        if expiry_end and not after_expiry:
+            end=min(end,expiry_end)
+            payload=dict(payload,fromDate=str(start),toDate=str(end))
         key=f"{dataset}/{meta['instrument']}/{start}"
         entry=self.manifest['chunks'].get(key,{})
         target=self.root/key;target=target.with_suffix('.parquet')
@@ -194,28 +264,18 @@ class Builder:
         record=dict(dataset=dataset,instrument=meta['instrument'],start=str(start),end=str(end),
                     endpoint=endpoint,payload=payload,status='pending',checked_epoch=time.time())
         try:
-            if meta.get('option_type'):
-                # Seven-day requests avoid gateway timeouts on dense rolling data.
-                # Storage retains stable 28-day partitions for resumability.
-                parts=[];a=start
-                while a<end:
-                    b=min(a+timedelta(days=7),end)
-                    part=self.api.post(endpoint,dict(payload,fromDate=str(a),toDate=str(b)))
-                    part=part.get(meta['option_type'].lower())
-                    if not isinstance(part,dict) or 'timestamp' not in part:
-                        raise ValueError('Missing rolling option side')
-                    f=pd.DataFrame(part)
-                    stamps=pd.to_datetime(f.timestamp,unit='s',utc=True).dt.tz_convert(IST)
-                    parts.append(f[(stamps.dt.date>=a)&(stamps.dt.date<b)])
-                    a=b
-                data=pd.concat(parts,ignore_index=True).to_dict(orient='list')
-                record['request_window_days']=7
+            if after_expiry:raise CheckError('CONTRACT_EXPIRED')
+            if dataset!='daily':
+                record['query_windows']=[]
+                data,queries=fetch_candles(self.api,endpoint,payload,meta,start,end,query_log=record['query_windows'])
+                record['request_window_days']=7 if meta.get('option_type') else 28
             else:
                 data=self.api.post(endpoint,payload)
             df,q=normalize(data,meta,start,end,dataset=='daily')
             if isinstance(q,tuple): quality,rejected=q
             else: quality,rejected=q,pd.DataFrame()
             record['quality']=quality
+            if quality.get('repairs'):record['repairs']=quality['repairs']
             if df.empty:
                 record['status']='empty';record['rows']=0
             else:
@@ -230,9 +290,11 @@ class Builder:
             print(f"{record['status'].upper():8} {key} -> {end} | {len(df):,} rows",flush=True)
         except Exception as exc:
             # Never serialize raw HTTP exceptions, which can contain auth URLs.
-            unavailable=isinstance(exc,CheckError) and exc.code=='DH-907' and meta['exchange_segment']=='MCX_COMM'
+            unavailable=isinstance(exc,CheckError) and exc.code in ('DH-907','CONTRACT_EXPIRED') and meta['exchange_segment']=='MCX_COMM'
             record.update(status='unavailable' if unavailable else 'failed',
                           error=exc.code if isinstance(exc,CheckError) else type(exc).__name__)
+            if isinstance(exc,CheckError):
+                record['provider_message']=provider_message({'message':getattr(exc,'provider_message','')})
             self.failures+=int(not unavailable)
             print(f"{record['status'].upper():8} {key} | {record['error']}",flush=True)
         with self.manifest_lock:
@@ -261,7 +323,7 @@ class Builder:
                          exchange_segment='NSE_FNO' if meta['security_id']=='13' else 'BSE_FNO',instrument_type='OPTIDX')
                 for a,b in windows(self.start,self.end):
                     payload=dict(securityId=int(meta['security_id']),exchangeSegment='NSE_FNO' if meta['security_id']=='13' else 'BSE_FNO',
-                        instrument='OPTIDX',interval='1',expiryFlag='WEEK',expiryCode=1,strike=strike,
+                        instrument='OPTIDX',interval=1,expiryFlag='WEEK',expiryCode=1,strike=strike,
                         drvOptionType='CALL' if side=='CE' else 'PUT',requiredData=FIELDS,fromDate=str(a),toDate=str(b))
                     jobs.append(('options_rolling_1m',opt,a,b,'/charts/rollingoption',payload))
         with ThreadPoolExecutor(max_workers=12) as pool:

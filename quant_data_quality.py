@@ -199,22 +199,59 @@ def calendar_document(root):
     return document or {}, error
 
 
+def audit_structure_valid(report):
+    """Validate the supported report shape independently of lake currentness."""
+    def count(value):
+        return value is None or (type(value) is int and value >= 0)
+    def valid_finding(item):
+        return (isinstance(item, dict) and item.get('severity') in ('Error','Warning','Info')
+                and all(isinstance(item.get(k), str) for k in ('problem','dataset','category','period','action'))
+                and bool(item['problem']) and (item.get('stream') is None or isinstance(item['stream'], str))
+                and count(item.get('count')))
+    if not isinstance(report, dict) or not report:
+        return False
+    if not isinstance(report.get('audit_version'), str) or type(report.get('stable_snapshot')) is not bool:
+        return False
+    if not all(isinstance(report.get(k), str) and re.fullmatch('[0-9a-f]{64}', report[k])
+               for k in ('manifest_fingerprint','file_fingerprint','calendar_fingerprint')):
+        return False
+    if not all(isinstance(report.get(k), list) and all(valid_finding(f) for f in report[k]) for k in ('findings','issues')):
+        return False
+    if not isinstance(report.get('streams'), dict):
+        return False
+    try:
+        checked = pd.Timestamp(report.get('checked_at'))
+        if pd.isna(checked) or checked.tzinfo is None: return False
+        for sid, result in report['streams'].items():
+            if not isinstance(sid, str) or not isinstance(result, dict) or result.get('status') not in STATUSES:
+                return False
+            if not isinstance(result.get('dimensions'), dict) or not all(result['dimensions'].get(k) in STATUSES for k in ('integrity','validity','coverage')):
+                return False
+            if not isinstance(result.get('identity'), str) or type(result.get('rows')) is not int or result['rows'] < 0:
+                return False
+            if not all(k in result and count(result[k]) for k in ('stored_exact_duplicates','stored_conflicting_rows','invalid_stored_candles')):
+                return False
+            if not isinstance(result.get('sessions'), list): return False
+            if result.get('required_window') is not None:
+                from quant_inventory_health import valid_metric
+                if not valid_metric(result['required_window']):return False
+            for session in result['sessions']:
+                if not isinstance(session, dict) or not isinstance(session.get('date'), str): return False
+                if pd.Timestamp(session['date']).date().isoformat() != session['date']: return False
+                if type(session.get('rows')) is not int or session['rows'] < 0: return False
+                if not all(k in session and count(session[k]) for k in ('expected','internal_missing','opening_missing','closing_missing','absent_sessions','unexpected','observed_minute_holes')):
+                    return False
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return False
+    return True
+
+
 def report_state(root, inv=None):
     inv = inv or inventory(root)
     report, error = read_document(Path(root)/'quality_report.json')
     calendar, calendar_error = calendar_document(root)
     status, explanation = 'Not checked', 'No audit has been recorded for this lake.'
-    valid = bool(report and all(k in report for k in ('audit_version','manifest_fingerprint','file_fingerprint','calendar_fingerprint','stable_snapshot','streams','findings','checked_at'))
-                 and isinstance(report.get('stable_snapshot'), bool)
-                 and isinstance(report.get('streams'), dict) and all(isinstance(v,dict) and v.get('status') in STATUSES
-                     and isinstance(v.get('dimensions'),dict) and all(v['dimensions'].get(c) in STATUSES for c in ('integrity','validity','coverage'))
-                     and isinstance(v.get('sessions'),list) for v in report['streams'].values())
-                 and isinstance(report.get('findings'), list) and all(isinstance(f,dict) and isinstance(f.get('problem'),str) for f in report['findings']))
-    if valid:
-        try:
-            checked = pd.Timestamp(report['checked_at'])
-            valid = not pd.isna(checked) and checked.tzinfo is not None
-        except (ValueError, TypeError): valid = False
+    valid = audit_structure_valid(report)
     if error:
         status, explanation = 'Review needed', error
     elif report:
@@ -226,6 +263,8 @@ def report_state(root, inv=None):
         elif (not report['stable_snapshot'] or report['manifest_fingerprint'] != inv['manifest_fingerprint'] or
               report['file_fingerprint'] != inv['file_fingerprint'] or report['calendar_fingerprint'] != fingerprint(calendar)):
             status, explanation = 'Audit outdated', 'The manifest, committed files, or session evidence changed. Run a new quality check.'
+        elif set(report['streams']) != set(inv['streams']):
+            status, explanation = 'Review needed', 'Audit stream results do not match the manifest inventory. Run a new quality check.'
         else:
             status = 'Review needed' if any(f.get('severity') in ('Error', 'Warning') for f in report['findings']) else 'Checks passed'
             explanation = 'One or more checks need review; see the separate evidence categories below.' if status == 'Review needed' else 'Integrity, candle validity and coverage checks passed within the documented audit scope.'
@@ -240,9 +279,23 @@ def report_state(root, inv=None):
     current = bool(valid and status in ('Checks passed', 'Review needed') and report.get('audit_version') == AUDIT_VERSION
                    and report.get('stable_snapshot') and report.get('manifest_fingerprint') == inv['manifest_fingerprint']
                    and report.get('file_fingerprint') == inv['file_fingerprint'] and report.get('calendar_fingerprint') == fingerprint(calendar)
+                   and set(report['streams']) == set(inv['streams'])
                    and isinstance(report.get('streams'), dict) and isinstance(report.get('findings'), list) and not error and not calendar_error)
     return dict(status=status, explanation=explanation, current=current, report=report,
                 checked_at=report.get('checked_at') if report else None, error=error or calendar_error)
+
+
+def require_current_audit(root):
+    """Shared UI/loader contract: current warnings are not invalid audit evidence."""
+    inv = inventory(root)
+    state = report_state(root, inv)
+    if not state['current']:
+        raise ValueError(f"Quality audit is not usable ({state['status']}): {state['explanation']} "
+                         'Run the local quality check (audit_quant_lake.py --root <lake>) before backtesting; it does not download or repair candles.')
+    report = state['report']
+    if report['issues'] or any(f['severity'] == 'Error' for f in report['findings']+inv['findings']):
+        raise ValueError('Lake integrity issues must be resolved before backtesting; inspect Data Quality findings and affected partitions.')
+    return report
 
 
 def group_status(group, inv, state):
@@ -375,12 +428,13 @@ def _atomic_bytes(path, content):
     finally: temp.unlink(missing_ok=True)
 
 
-def run_quality_check(root, progress=None):
+def run_quality_check(root, progress=None, *, _writer_locked=False):
     """Serialize with ingestion; retain prior report bytes and verify snapshot at commit."""
     from step2_build_data_lake import writer_lock
+    from contextlib import nullcontext
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    with writer_lock(root):
+    with nullcontext() if _writer_locked else writer_lock(root):
         inv = inventory(root)
         calendar, calendar_error = calendar_document(root)
         findings = list(inv['findings'])
@@ -397,9 +451,18 @@ def run_quality_check(root, progress=None):
                 if record['status'] != 'complete':
                     add(f'Manifest record is {record["status"]}: {record.get("error", "No committed candles for this request")}', period=record['start']+' / '+record['end']+' (end exclusive)', category='availability', action='Inspect provider availability and the requested contract period before explicitly retrying ingestion.')
                 quality = record.get('quality', {})
+                for method,description in [('quarantine_volume_zero','Negative-volume-only candles restored with zero volume'),('synthetic_ffill','Synthetic flat zero-volume candles inserted; these are not observed quotes'),('provider_refetch','Missing candles restored from provider retry')]:
+                    repairs=[e for e in record.get('repairs',[]) if e.get('method')==method]
+                    if repairs:add(description,'Info',len(repairs),record['start']+' / '+record['end'],category='repair',action='Inspect repair provenance and original partition in repair_history; assess sensitivity before relying on repaired-input results.')
                 for field, text in [('exact_duplicates', 'Exact duplicate input rows removed'), ('conflicting_duplicate_rows', 'Conflicting input rows rejected / quarantined'), ('invalid_ohlcv', 'Invalid input candles rejected'), ('outside_market_hours', 'Out-of-hours input rows rejected')]:
                     if quality.get(field, 0):
                         add(text, 'Info' if field == 'exact_duplicates' else 'Warning', quality[field], record['start']+' / '+record['end'], category='validity', action='Inspect quarantine and ingestion evidence; rejected rows are excluded from stored candle counts.')
+                        if field=='invalid_ohlcv':
+                            restored=sum(e.get('method')=='quarantine_volume_zero' for e in record.get('repairs',[]))
+                            if restored:
+                                findings[-1]['resolved_count']=restored
+                                findings[-1]['action']=f'{restored} negative-volume-only candles restored with volume zero; raw rejection evidence retained. Other invalid input, if any, remains unresolved. Inspect the repair log and required-window eligibility.'
+                                if restored==quality[field]:findings[-1]['category']='repair'
             for file in stream['files']:
                 record = file['record']
                 try:
@@ -455,9 +518,20 @@ def run_quality_check(root, progress=None):
             dims = {category: 'Review needed' if any(f['category'] == category and f['severity'] != 'Info' for f in own) else 'Checks passed' for category in ('integrity', 'validity', 'coverage')}
             if not len(frame): dims['validity'] = 'No data'
             if not stream['files'] and not any(f['category']=='integrity' for f in own): dims['integrity']='No data'
+            from quant_inventory_health import measure_stream
+            required=measure_stream(root,stream,frame,error='Partition integrity not verified' if not complete_read or dims['integrity']=='Review needed' else None)
+            # Rejected out-of-window rows and resolved quarantine are historical
+            # evidence, not unresolved required-window candle invalidity.
+            if required is not None and not any(f['severity']=='Error' and f['category']=='validity' for f in own):dims['validity']=required['validity']
             results[sid] = dict(status='Review needed' if any(f['severity'] != 'Info' for f in own) else 'Checks passed',
                                 dimensions=dims, identity=identity, sessions=sessions, rows=len(frame),
-                                stored_exact_duplicates=exact, stored_conflicting_rows=conflicts, invalid_stored_candles=invalid)
+                                stored_exact_duplicates=exact, stored_conflicting_rows=conflicts, invalid_stored_candles=invalid,required_window=required)
+        from quant_inventory_health import apply_conflicts
+        measured={sid:r['required_window'] for sid,r in results.items() if r['required_window'] is not None}
+        apply_conflicts(measured,inv)
+        for sid,metric in measured.items():
+            results[sid]['required_window']=metric
+            if metric['validity']=='Review needed':results[sid]['dimensions']['validity']='Review needed'
         current, read_error = read_document(root/'ingestion_manifest.json')
         current = current or {'chunks': {}}
         current_calendar, current_calendar_error = calendar_document(root)
@@ -477,4 +551,6 @@ def run_quality_check(root, progress=None):
             target = archive/(hashlib.sha256(content).hexdigest()+'.json')
             if not target.exists(): _atomic_bytes(target, content)
         _atomic_report(previous, report)
+        from quant_inventory_health import inventory_health
+        inventory_health(root,force=True)
         return report

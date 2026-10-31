@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 import logging
@@ -17,11 +18,27 @@ from dotenv import load_dotenv
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
-from paper_feed import Asset, Tick, IST, SEGMENTS, FeedError, decode_packets, instruments, warmup
+from paper_feed import (Asset, Tick, IST, SEGMENTS, FeedError, decode_packets, instruments, warmup,
+                        master_path, option_asset, option_volume_confirmed)
 from paper_engine import PaperAccount, AccountLock, MinuteBook, atomic, stamp
-from quant_backtester import Config, HIGH_STRATEGIES
+from quant_backtester import Config, HIGH_STRATEGIES, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE
 
 BASE=Path(__file__).resolve().parent
+
+
+def book_activity_confirmed(rows,c,event,now):
+    """Same fixed-contract activity filter as historical book signals."""
+    import pandas as pd
+    from types import SimpleNamespace
+    from quant_book import activity
+    local=datetime.fromtimestamp(now,IST)
+    candles={int((datetime.fromtimestamp(r['timestamp'],IST)-local.replace(hour=0,minute=0,second=0,microsecond=0)).total_seconds()/60):r
+             for r in rows if datetime.fromtimestamp(r['timestamp'],IST).date()==local.date()}
+    day={'option_meta':{(k,'CE',0):(r.get('oi',float('nan')),) for k,r in candles.items()}}
+    data=SimpleNamespace(mcx=False,price=lambda d,k,s,strike:tuple(candles[k][v] for v in ('open','high','low','close','volume')) if k in candles else None)
+    a=activity(data,day,pd.DataFrame({'volume':[0]*(c.momentum_lookback+1)}),c.momentum_lookback,event[0],'CE',0,c)
+    return bool(a and a['signal_log_volume']>=math.log(c.volume_multiple) and
+                (c.strategy!='book_vol_oi_momentum' or not a['signal_oi_available'] or a['signal_log_oi']>0))
 
 
 def logger(root):
@@ -36,6 +53,17 @@ def logger(root):
 
 
 def configuration(args):
+    if getattr(args,'saved_strategy',None):
+        from quant_terminal import load_saved_strategies
+        records=load_saved_strategies(args.strategies_file)
+        record=next((r for r in records if args.saved_strategy in (r['strategy_id'],r['name'])),None)
+        if record is None: raise ValueError('Saved strategy was not found')
+        c=Config(**record['config'])
+        if c.strategy not in STRATEGIES: raise ValueError('Saved strategy logic is unsupported')
+        today=datetime.now(IST).date()
+        c=replace(c,start=str(today),end=str(today+timedelta(days=1)))
+        c.validate()
+        return c
     if args.strategy=='h4' and args.trade_instrument!='CRUDEOIL':
         raise ValueError('H4 default is Crude Oil; use --strategy h6 for Natural Gas')
     if args.strategy=='h4' and args.max_trades!=1:
@@ -74,13 +102,22 @@ async def live(args,c,emit,transport):
     if not client_id or not token: raise ValueError('Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env')
     assets=await asyncio.to_thread(instruments,args.output,time.time())
     chosen=next(a for a in assets if a.name==c.instrument)
-    account=PaperAccount(args.output,c,chosen,emit)
+    from paper_basket import BasketPaperAccount
+    from paper_feed import option_structure_assets
+    account=BasketPaperAccount(args.output,c,chosen,emit)
     if account.position:
         opened=Asset(**account.position['asset'])
         if opened.key not in {a.key for a in assets}: assets.append(opened)
-    by_key={a.key:a for a in assets}; book=MinuteBook()
+        for leg in account.position.get('legs',[]):
+            opened=Asset(**leg['asset'])
+            if opened.key not in {a.key for a in assets}: assets.append(opened)
+    by_key={a.key:a for a in assets}; book=MinuteBook(history_days=5 if c.strategy in STRATEGIES else 0)
+    option_master=None; pending=None
+    if c.instrument not in POINT_VALUE:
+        import pandas as pd
+        option_master=pd.read_csv(master_path(args.output,time.time()),low_memory=False)
     emit('PAPER ONLY | virtual fills; no order placement/cancellation endpoints are available')
-    emit(f'Strategy {args.strategy.upper()} {chosen.name} contract {chosen.security_id} expiry {chosen.expiry}; Nifty/Sensex monitor only')
+    emit(f'Strategy {c.strategy} {chosen.name} signal contract {chosen.security_id}; PAPER ONLY')
     emit(f'Capital INR {c.capital:,.0f} | allocation {c.capital_usage_pct:g}% | assumed margin {c.futures_margin_pct:g}% | daily loss/profit {c.daily_loss_limit:g}/{c.daily_profit_target:g}')
     stopping=False; shutdown_started=None; started=time.monotonic(); ws=None
     last_print=0.; last_seed=0.; seed_task=None; last_message=0.; retry_at=0.; attempts=0
@@ -99,14 +136,14 @@ async def live(args,c,emit,transport):
         if ws:
             try: await ws.close()
             except Exception: pass
-        ws=None; latest={}; book.disconnect(); attempts+=1
+        ws=None; latest={}; book.disconnect(); account.disconnect(); attempts+=1
         retry_at=time.monotonic()+min(30,2**min(attempts-1,5))
     try:
         while True:
             now=time.time(); mono=time.monotonic(); local=datetime.fromtimestamp(now,IST)
             if (args.output/'STOP').exists(): stop()
             if args.duration and mono-started>=args.duration: stop()
-            if local.hour*60+local.minute>=1396: stop()
+            if local.hour*60+local.minute>=(1396 if c.instrument in POINT_VALUE else 921): stop()
             if stopping:
                 account.request_exit(stop_reason)
                 p=account.position
@@ -126,7 +163,7 @@ async def live(args,c,emit,transport):
                     for code in (15,21):
                         group=[a for a in assets if (15 if a.segment==0 else 21)==code]
                         await ws.send(json.dumps(dict(RequestCode=code,InstrumentCount=len(group),InstrumentList=[dict(ExchangeSegment=SEGMENTS[a.segment],SecurityId=str(a.security_id)) for a in group])))
-                    last_message=mono; latest={}; book.disconnect()
+                    last_message=mono; latest={}; book.disconnect(); account.disconnect()
                     emit('FEED connected; subscriptions sent for '+', '.join(a.name for a in assets))
                     last_seed=0
                 except Exception:
@@ -134,7 +171,7 @@ async def live(args,c,emit,transport):
                     await drop()
             if ws and seed_task is None and mono-last_seed>=60 and not stopping:
                 last_seed=mono; snapshot=now
-                seed_task=asyncio.create_task(asyncio.to_thread(warmup,client_id,token,chosen,snapshot))
+                seed_task=asyncio.create_task(asyncio.to_thread(warmup,client_id,token,chosen,snapshot,5 if c.strategy in STRATEGIES else 0))
                 seed_task.snapshot=snapshot
             if seed_task and seed_task.done():
                 try:
@@ -174,10 +211,47 @@ async def live(args,c,emit,transport):
                     fresh_counts[name]+=1
                     attempts=0
                     account.on_tick(tick,received)
+                    if pending and isinstance(pending[1],list):
+                        event,resolved,deadline=pending
+                        if received>deadline: pending=None
+                        elif not account.position and not stopping:
+                            if account.enter_basket(event,resolved,latest,received): pending=None
+                    elif pending and tick.key==pending[1].key:
+                        event,asset,deadline=pending
+                        if received<=deadline and not account.position and not stopping:
+                            account.asset=asset
+                            account.enter(event,tick,received)
+                        pending=None
                     if tick.key==chosen.key:
                         book.ingest(tick)
                         event=book.signal(c,received)
-                        if event and not args.monitor_only and not stopping: account.enter(event,tick,received)
+                        if event and not args.monitor_only and not stopping and not account.position:
+                            if c.instrument in POINT_VALUE:
+                                account.enter(event,tick,received)
+                            elif c.strategy in BOOK_STRATEGIES[:3]:
+                                resolved=option_structure_assets(option_master,c.instrument,event[1],tick.price,received)
+                                confirmed=True
+                                if c.strategy=='book_strap_strip':
+                                    asset=next(a for spec,a in resolved if spec['side']==('CE' if event[1]=='STRAP' else 'PE'))
+                                    rows=await asyncio.to_thread(warmup,client_id,token,asset,received)
+                                    confirmed=book_activity_confirmed(rows,c,event,received)
+                                if confirmed:
+                                    for _,asset in resolved:
+                                        if asset.key not in by_key:
+                                            assets.append(asset); by_key[asset.key]=asset
+                                            await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
+                                    pending=(event,resolved,int(received)//60*60+15)
+                            else:
+                                asset=option_asset(option_master,c.instrument,event[1],tick.price,received)
+                                confirmed=True
+                                if c.strategy in ('orb_volume_breakout','book_vol_oi_momentum'):
+                                    rows=await asyncio.to_thread(warmup,client_id,token,asset,received)
+                                    confirmed=book_activity_confirmed(rows,c,event,received) if c.strategy=='book_vol_oi_momentum' else option_volume_confirmed(rows,c,event,received)
+                                if confirmed:
+                                    if asset.key not in by_key:
+                                        assets.append(asset); by_key[asset.key]=asset
+                                        await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
+                                    pending=(event,asset,int(received)//60*60+15)
             else: await asyncio.sleep(.25)
             if mono-last_print>=args.status_seconds:
                 last_print=mono; now=time.time(); quotes={}; parts=[]
@@ -193,9 +267,14 @@ async def live(args,c,emit,transport):
                 positions=[]
                 if p:
                     q=latest.get(Asset(**p['asset']).key)
+                    live_value=q.price if q and q.fresh(now) else None
+                    quote_time=stamp(q.exchange_time) if q else None
+                    if p.get('legs'):
+                        leg_quotes=account.fresh_legs(now)
+                        live_value=sum(l['ratio']*q.price for l,q in zip(p['legs'],leg_quotes)) if leg_quotes else None
+                        quote_time=stamp(min(q.exchange_time for q in leg_quotes)) if leg_quotes else None
                     positions.append(dict(trade_id=p['trade_id'],security_id=p['security_id'],
-                        ltp=q.price if q and q.fresh(now) else None,
-                        quote_time=stamp(q.exchange_time) if q else None,net_pnl=mark))
+                        ltp=live_value,quote_time=quote_time,net_pnl=mark,contract=p.get('contract','')))
                 status=dict(mode='PAPER_ONLY',timestamp=stamp(now),running=True,connected=ws is not None,quotes=quotes,positions=positions,
                     open_positions=int(p is not None),net_open_pnl=mark,realized_today=account.realized_today(now),
                     realized_equity=account.equity,daily_lock=account.session(now)['lock'],ticks=counters,
@@ -231,6 +310,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode',choices=['live','demo'],default='live')
     parser.add_argument('--strategy',choices=['h4','h6'],default='h4')
+    parser.add_argument('--saved-strategy',help='User strategy ID or name from saved_strategies.json')
+    parser.add_argument('--strategies-file',type=Path,default=BASE/'data'/'saved_strategies.json')
     parser.add_argument('--trade-instrument',choices=['CRUDEOIL','NATURALGAS'],default='CRUDEOIL')
     parser.add_argument('--capital',type=float,default=500000)
     parser.add_argument('--allocation',type=float,default=50)
@@ -248,6 +329,7 @@ def main():
     parser.add_argument('--status-seconds',type=float,default=10)
     parser.add_argument('--output',type=Path)
     args=parser.parse_args()
+    if args.mode=='demo' and args.saved_strategy: parser.error('Saved strategies deploy in live paper mode only')
     if not math.isfinite(args.duration) or args.duration<0 or not math_is_positive(args.status_seconds): parser.error('Invalid duration/status interval')
     if args.mode=='demo' and (args.strategy!='h4' or args.trade_instrument!='CRUDEOIL'): parser.error('Demo uses Crude H4 execution settings')
     args.output=(args.output or BASE/'data_lake'/('paper_demo' if args.mode=='demo' else 'paper_trades')).resolve()

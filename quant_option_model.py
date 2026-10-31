@@ -33,6 +33,9 @@ def continuation_candle(data,day,at,side,strike,previous):
     the *previous* minute. Current near-strike OHLC informs model OHLC, with
     extrema explicitly approximate because co-movement order is unobserved.
     """
+    wing = wing_fallback(day, at, side, strike)
+    if wing is not None:
+        return wing
     spot_prev=day['prices'].get(at-1)
     spot_now=day['prices'].get(at)
     if previous is None or spot_prev is None or spot_now is None:
@@ -71,3 +74,40 @@ def continuation_candle(data,day,at,side,strike,previous):
     return (op,max(op,cl,a,b),min(op,cl,a,b),cl,0),dict(
         price_source='model_delta_gamma_continuity',model_neighbor_strike=near,
         model_iv_pct=meta[1],model_expiry_assumption=expiry.date().isoformat())
+
+
+def wing_fallback(day, at, side, strike):
+    """Outside the observed rolling band only: intrinsic + bounded wing TV.
+
+    No lagged IV, previous option mark, future quote or calendar expiry is
+    needed. Time value is capped by one observed wing spacing and attenuated
+    with distance. This is a deterministic research estimate, never a quote.
+    Exact observed candles always win (including a strike in another offset).
+    """
+    if (at, side, strike) in day.get('options', {}): return None
+    spot = day.get('prices', {}).get(at)
+    if spot is None: return None
+    band = sorted({k for mon in ('ATM-1', 'ATM', 'ATM+1')
+                   if (k := day.get('rolling', {}).get((side, mon), {}).get(at)) is not None and math.isfinite(k)})
+    if len(band)<2 or band[0]<=strike<=band[-1]: return None
+    observed = []
+    for mon in ('ATM-1', 'ATM', 'ATM+1'):
+        k = day.get('rolling', {}).get((side, mon), {}).get(at)
+        row = day.get('options', {}).get((at, side, k))
+        source = day.get('price_sources', {}).get((at, side, k))
+        if k is not None and row and source != 'synthetic_ffill' and all(math.isfinite(v) and v > 0 for v in row[:4]):
+            observed.append((k, mon, row))
+    wings = [(k, row) for k, mon, row in observed if mon in ('ATM-1', 'ATM+1')]
+    if not wings: return None
+    near, row = min(wings, key=lambda x: (abs(x[0]-strike), x[0]))
+    width = min(b-a for a,b in zip(band, band[1:]))
+    decay = math.exp(-abs(near-strike)/width)
+    def mark(s, premium):
+        tv = min(width, max(0., premium-intrinsic(s, near, side))) * decay
+        return max(.05, intrinsic(s, strike, side)+tv)
+    op, cl = mark(spot[0], row[0]), mark(spot[3], row[3])
+    hi = mark(spot[1] if side=='CE' else spot[2], row[1])
+    lo = mark(spot[2] if side=='CE' else spot[1], row[2])
+    return (op, max(op, cl, hi, lo), min(op, cl, hi, lo), cl, 0), dict(
+        price_source='model_intrinsic_wing_fallback', modeled_wing_fallback=True,
+        model_neighbor_strike=near, model_iv_pct=None, model_expiry_assumption='none')

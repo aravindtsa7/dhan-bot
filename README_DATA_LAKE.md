@@ -212,3 +212,113 @@ Primary API references:
 - https://dhanhq.co/docs/v2/historical-data/
 - https://dhanhq.co/docs/v2/expired-options-data/
 - https://dhanhq.co/docs/v2/instruments/
+
+## Buffered sync and transparent repair
+
+Open **Data Lake** in `quant_ui.py` for the instrument inventory, per-row Sync,
+Backfill and Repair actions, plus global actions. Row health is automatically
+measured and cached against current manifest/audit/file/calendar/quarantine
+fingerprints; **Refresh cached health** is optional. Spot and options use their
+own stored-date denominators; BANKNIFTY receives spot-only checks. Session and
+required-bar percentages include exact counts. The inspection drawer checks arbitrary
+inclusive dates and previews/exports a bounded stream/session. Data Quality is
+the audit and quarantine/repair inspector. Downloads only begin on explicit
+action buttons; opening a page never calls the broker.
+
+Intraday chart calls use at least seven calendar days, expanding backwards from
+the exact requested exclusive end. Rolling requests are split into seven stored
+days (at most eight queried days); other intraday requests remain under 90 days.
+Responses are filtered to the exact stored interval **before** normalization or
+writing. This avoids narrow-window requests associated with DH-905; Dhan does
+not document a universal seven-day minimum, so it is a defensive workaround,
+not proof of the provider error's cause. Rolling `toDate` is non-inclusive per
+the official API documentation. No out-of-range response rows are committed.
+
+Forward MCX sync refreshes the current instrument master and selects the nearest
+two unexpired recorded/discovered expiries per product. No request extends past
+expiry; custom historical requests are clipped to recorded expiry. Historical
+availability before listing is not invented. A failed stream is isolated from
+healthy streams; authentication/subscription/connectivity errors still stop the
+batch. Existing complete partitions survive failed, empty or lossy replacements.
+
+Segment/subscription/access errors are isolated to their stream so healthy index
+spot, rolling options and active MCX requests continue. Authentication/connectivity
+failures stop further requests explicitly. Each run saves a sanitized per-request
+summary under `data_lake/sync_history/`, including unattempted streams; partial
+completion never means every dataset synced. Latest sync uses actual Parquet
+tail timestamps: a partial response cannot protect the unstored remainder of its
+requested partition. A retry preserves the original partition bounds and old
+timestamps. Audit refresh rebuilds row health automatically; failed downloads
+cannot produce a fabricated fresh coverage percentage.
+
+**Repair** is an explicit correction operation, separate from a read-only audit:
+
+- A single quarantined row rejected only for negative volume can be restored
+  when OHLC is finite, positive and consistent and optional numeric fields are
+  valid. Its volume becomes zero; original volume and `candle_source` remain
+  recorded. New ingestion applies the same normalization and keeps raw quarantine.
+- Dense index sessions (at least 370 valid candles within 09:15–15:29) can receive
+  1–3 consecutive missing **interior** minutes. Provider retry comes first when
+  credentials are configured. Offline fallback uses the immediately preceding
+  close for all four prices and zero volume, labeled `synthetic_ffill`.
+- No opening/closing extensions, sparse/short sessions, four-minute-or-longer
+  runs, invalid prices, conflicting quarantine timestamps, or rolling-strike
+  changes are filled. MCX holes are not synthesized without applicable session
+  evidence. Multiple short holes can exist in one dense session.
+- Raw quarantine stays unchanged. Original files and records are retained in
+  `data_lake/repair_history/<original-sha256>/`; the old manifest is archived in
+  `ingestion_history`. Promotion rolls back if the manifest commit fails. The
+  shared writer lock excludes concurrent ingestion and audit writers. A fresh
+  local audit is written after repair; an audit failure leaves readiness unverified.
+
+Synthetic bars can change signals, volume indicators and execution prices. They
+are **not recovered market observations**. Engine 5.4.0 records repaired inputs
+in eligibility, results and report exports; synthetic execution bars count as
+modeled prices. Strict-observed runs refuse synthetic dependency inputs. Old
+engine results remain inspectable and are not reused by current caches.
+
+Full observed special index sessions undergo ordinary required-window checks.
+Budget-session evidence: [NSE 1 February 2025](https://nsearchives.nseindia.com/content/circulars/CMTR65729.pdf)
+and [NSE 1 February 2026](https://nsearchives.nseindia.com/content/circulars/FAOP72352.pdf).
+Other dense non-weekday sessions are explicitly labeled observed/calendar-
+unverified; this does not create a holiday calendar or admit short Muhurat
+sessions. Options expiry identity remains unverified. A current integrity audit
+or zero required-window gaps never proves complete historical exchange coverage.
+
+Offline validation (the full suite includes these focused tests):
+
+```powershell
+.venv\Scripts\python.exe verify_offline_tests.py test_quant_repairs
+.venv\Scripts\python.exe verify_offline_tests.py
+.venv\Scripts\python.exe -m streamlit run quant_ui.py --server.address 127.0.0.1 --server.port 8501
+```
+
+Inventory health is independent for each of the eight displayed dataset rows.
+Spot uses only that index's stored dates and 09:15–15:20 candles. Rolling options
+uses its own observed dates and six required CE/PE streams, without inheriting
+spot-only tail dates. BANKNIFTY has ordinary spot completeness checks. The health
+pill shows `XX.X% Clean`, with ready days and gap days below; Coverage shows the
+valid/expected one-minute bar percentage. The global percentage is an equal-weight
+average of populated rows, and `X/8 datasets at latest` compares their tails with
+the latest stored date. It does not certify freshness against an exchange calendar.
+
+MCX **inventory** cleanliness measures internal continuity between each observed
+contract/session's first and last minute. Partial listing days are not penalized
+for an inferred earlier open. All observed contracts must pass for their observed
+date to be clean; one candle is insufficient evidence. This measurement cannot
+establish missing opening/closing hours or backtest readiness. The date-range
+inspector, Data Quality engine summary and backtester retain full engine dependency
+windows, warm-up, prior-session selection and integrity checks. Inventory cache
+version 2.0 invalidates the previous interpretation; engine results are unchanged.
+
+Rolling sync uses integer interval `1` and preserves the selected weekly expiry,
+offset and CALL/PUT identity. For 23–29 October, storage bounds are 23 October to
+30 October exclusive; the buffered provider request starts 22 October. Failed
+sync results now preserve attempted query bounds, safe rolling parameters and
+the provider's error description after credential/URL redaction in `sync_history`.
+An empty recent expired-options response is not evidence of successful catch-up;
+old partitions remain stored and their tail stays unchanged. No alternative
+expiry or fabricated recent candles are silently substituted.
+The most recent saved sync outcomes (or explicitly labeled read-only provider
+check) are shown after a UI restart, including sanitized provider descriptions.
+A provider check is not an ingestion job and never establishes successful sync.

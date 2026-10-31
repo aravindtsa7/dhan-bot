@@ -39,7 +39,7 @@ Equity and underwater charts use realized daily P&L. Sharpe uses returns on the 
 
 ## Reproducible verification
 
-### Run data selection and eligibility (engine 5.3.0)
+### Run data selection and eligibility (engine 5.4.0)
 
 MCX contract selection uses the immediately preceding **observed** session's
 stored total volume, including context before the requested start. Weekends
@@ -68,6 +68,19 @@ accounted-for quarantine timestamps; unavailable evidence fails closed.
 Recorded checksums are rechecked for execution and selection-context files;
 missing/changed files and the existing audit integrity gate still block loading.
 
+Same-strike OHLCV or signal-metadata conflicts inside the dependency window
+exclude the date, including warm-up and square-off. Outside-window conflicts
+remain in the run's eligibility evidence without excluding the date. Disputed
+quotes are omitted from the price/metadata maps rather than selecting one stream.
+
+Before loading and after assembling the snapshot, the loader requires the same
+supported, structurally valid, stable audit used by Data Quality. Its manifest,
+file-state and session-calendar fingerprints and stream inventory must match.
+Absent, empty, malformed, unsupported or outdated reports produce a local-quality-
+check instruction. Current coverage or options-identity warnings do not alone
+block loading; integrity errors still block. A current audit is evidence of the
+recorded checks, not proof of complete historical coverage or contract identity.
+
 Each new run saves `eligibility.json` beside `result.json` under its run directory.
 The result JSON also embeds these records: date, instrument, selected contract,
 selection-evidence session, required windows, eligible/excluded status, reasons,
@@ -76,18 +89,30 @@ results with their exclusions. `ResearchData.eligibility` exposes the same check
 without running or persisting a backtest.
 
 Eligibility is distinct from whole-session health and verified option history.
-The existing regular-index calendar policy remains; no new special sessions or
-MCX calendar completeness claims are added. Entirely unobserved MCX dates are
+The regular-index calendar remains the baseline. Full-length observed index
+special sessions (at least 370 valid regular-hours candles) undergo the same
+required-window checks; partial weekend sessions remain excluded. NSE Budget
+sessions on 2025-02-01 and 2026-02-01 have sourced circular references. Other
+observed non-weekday sessions are explicitly calendar-unverified. No MCX
+calendar completeness claims are added. Entirely unobserved MCX dates are
 not invented as expected sessions. Prior volume describes the stored sample,
 not verified full-session volume; unchanged partial prior sessions remain the
 existing selection evidence. Rolling expiry identity and modeled fixed-strike
 continuity limitations remain. Request-boundary invariance concerns selected
 contracts and execution inputs, not portfolio P&L across different trade histories.
 
-Version 5.3.0 changes the hashed run identity; existing 5.2.0 directories remain
+Version 5.4.0 changes the hashed run identity; existing 5.3.1 and older directories remain
 inspectable and are not reused or included in the current-engine leaderboard.
 Eligibility evidence is part of the data fingerprint. A cached completion also
 requires the eligibility artifact.
+
+Explicit repairs preserve original partitions and raw quarantine. Negative-volume-
+only corrections retain prices and set volume to zero; isolated synthetic flat
+bars are modeled input. Both methods appear in eligibility/result provenance.
+Synthetic execution candles are tagged in stop paths and modeled-price metrics;
+strict-observed runs reject synthetic inputs anywhere in the dependency window,
+including warm-up. Repaired runs never qualify as verified observed performance.
+Strategy conditions, indicator windows and trading hours are unchanged.
 
 Self-contained loader checks, with external sockets blocked:
 

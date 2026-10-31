@@ -11,10 +11,10 @@ from unittest.mock import patch
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from quant_backtester import Config, STRATEGIES, simulate_trade, run_backtest
+from quant_backtester import Config, LEGACY_STRATEGIES as STRATEGIES, simulate_trade, run_backtest
 from quant_portfolio import execute_portfolio
 from quant_terminal import (PAGES, STRATEGY_LABELS, build_config, register_run, load_registry,
-                            save_strategy, form_values, lake_snapshot)
+                            save_strategy, form_values, lake_snapshot, save_result, load_saved_strategies, saved_strategy_path)
 
 
 def prepared(config, price=150., events=None):
@@ -36,21 +36,21 @@ class TerminalParameterTests(unittest.TestCase):
                        trail_pct=0, **changes)
 
     def test_all_form_parameters_and_inclusive_period(self):
-        c = build_config('SENSEX', 'Reversal PE', (date(2026,10,1),date(2026,10,22)),
+        c = build_config('SENSEX', 'VWAP + EMA(9/21) Pullback', (date(2026,10,1),date(2026,10,22)),
                          250000, '50%', '1 minute', '10%', '15%', 125, 'Trailing SL')
-        self.assertEqual((c.instrument,c.strategy,c.option_side), ('SENSEX',STRATEGIES[3],'PE'))
+        self.assertEqual((c.instrument,c.strategy,c.option_side), ('SENSEX','vwap_ema_pullback','both'))
         self.assertEqual((c.start,c.end,c.capital,c.capital_usage_pct), ('2026-10-01','2026-10-23',250000,50))
         self.assertEqual((c.timeframe,c.target_pct,c.sl_pct,c.minimum_premium,c.exit_mode,c.trail_pct),
                          ('1m',10,15,125,'trailing_sl',15))
         self.assertEqual(c.sizing_mode,'allocation')
         self.assertEqual(c.risk_basis,'percentage')
-        self.assertEqual(form_values(asdict(c),'Reversal PE')['period'],(date(2026,10,1),date(2026,10,22)))
+        self.assertEqual(form_values(asdict(c),'VWAP + EMA(9/21) Pullback')['period'],(date(2026,10,1),date(2026,10,22)))
 
     def test_strategy_choices_validate_without_hidden_overrides(self):
         for strategy in STRATEGY_LABELS:
             for exit_label in ('End of day','Trailing SL','Target / EOD'):
                 with self.subTest(strategy=strategy,exit=exit_label):
-                    c = build_config('CRUDEOIL' if strategy=='MCX Breakout' else 'NIFTY 50', strategy,
+                    c = build_config('CRUDEOIL' if strategy=='MCX Evening Momentum & Donchian Breakout' else 'NIFTY 50', strategy,
                         (date(2026,10,22),date(2026,10,22)),100000,'75%','3 minutes','50%','25%',100,exit_label)
                     c.validate()
                     self.assertEqual(c.end,'2026-10-23')
@@ -58,9 +58,9 @@ class TerminalParameterTests(unittest.TestCase):
     def test_unavailable_instrument_and_incompatible_strategy_are_explicit(self):
         args=((date(2026,10,22),date(2026,10,22)),100000,'100%','5 minutes','25%','25%',100,'Target / EOD')
         with self.assertRaisesRegex(ValueError,'BANKNIFTY spot is available'):
-            build_config('BANKNIFTY','Buy CE / Buy PE',*args)
-        with self.assertRaisesRegex(ValueError,'MCX Breakout'):
-            build_config('CRUDEOIL','Buy CE / Buy PE',*args)
+            build_config('BANKNIFTY','VWAP + EMA(9/21) Pullback',*args)
+        with self.assertRaisesRegex(ValueError,'supports NATURALGAS'):
+            build_config('NIFTY 50','MCX Evening Momentum & Donchian Breakout',*args)
 
     def test_invalid_premium_exit_and_partial_period_rejected(self):
         for values in [dict(minimum_premium=-1),dict(minimum_premium=float('nan')),dict(exit_mode='guess'),
@@ -68,7 +68,7 @@ class TerminalParameterTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 replace(Config(),**values).validate()
         with self.assertRaisesRegex(ValueError,'both the start and end'):
-            build_config('NIFTY 50','Buy CE / Buy PE',(date(2026,10,22),),100000,'100%','1 minute','25%','25%',100,'Target / EOD')
+            build_config('NIFTY 50','VWAP + EMA(9/21) Pullback',(date(2026,10,22),),100000,'100%','1 minute','25%','25%',100,'Target / EOD')
 
     def test_premium_threshold_is_observed_price_not_slipped_price(self):
         c = replace(self.config(minimum_premium=100), slippage=.5)
@@ -127,31 +127,38 @@ class TerminalParameterTests(unittest.TestCase):
         self.assertEqual(trade['target'],95)
         self.assertEqual(trade['exit_reason'],'stop_loss')
 
-    def test_runs_and_strategies_are_durable_and_deduplicated(self):
-        c = self.config(minimum_premium=100,exit_mode='target_eod')
+    def test_runs_and_named_strategies_are_explicit_and_durable(self):
+        c = replace(self.config(minimum_premium=100,exit_mode='target_eod'), strategy='vwap_ema_pullback')
+        with TemporaryDirectory() as directory:
+            output=Path(directory)/'backtests'
+            with self.assertRaisesRegex(ValueError,'custom Strategy Name'): save_strategy(output,c,' ')
+            record=save_strategy(output,c,'Nifty_5m_1L')
+            self.assertEqual(record['strategy_key'],c.strategy)
+            result=run_backtest(c,data=prepared(c),output=output,persist=False)
+            self.assertFalse((output/'runs').exists())
+            self.assertEqual(load_registry(output)['runs'],[])
+            first=save_result(output,result,'Reviewed result')
+            self.assertEqual(first['display_id'],'BT-001')
+            self.assertEqual(save_result(output,result)['display_id'],'BT-001')
+            self.assertEqual(len(load_registry(output)['runs']),1)
+            self.assertEqual(load_saved_strategies(saved_strategy_path(output))[0]['config'],asdict(c))
+            self.assertTrue((output/'runs'/result['run_id']/'trades.parquet').exists())
+
+    def test_legacy_auto_saved_runs_are_hidden_and_files_preserved(self):
         with TemporaryDirectory() as directory:
             output=Path(directory)
-            save_strategy(output,c,'Buy CE / Buy PE')
-            result=run_backtest(c,data=prepared(c),output=output)
-            first=register_run(output,result,'Buy CE / Buy PE')
-            self.assertEqual(first['display_id'],'BT-001')
-            self.assertEqual(register_run(output,result,'Buy CE / Buy PE')['display_id'],'BT-001')
-            registry=load_registry(output)
-            self.assertEqual(len(registry['runs']),1)
-            self.assertEqual(registry['strategies'][0]['last_run'],'BT-001')
-            changed=replace(c,minimum_premium=200)
-            result2=run_backtest(changed,data=prepared(changed),output=output)
-            self.assertNotEqual(result['run_id'],result2['run_id'])
-            self.assertEqual(register_run(output,result2,'Buy CE / Buy PE')['display_id'],'BT-002')
-            self.assertEqual(result2['metrics']['total_trades'],0)
-            self.assertEqual(load_registry(output)['runs'][-1]['config']['minimum_premium'],200)
+            path=output/'terminal';path.mkdir()
+            old={'version':1,'runs':[{'display_id':'BT-999'}],'strategies':[]}
+            target=path/'registry.json';target.write_text(json.dumps(old))
+            self.assertEqual(load_registry(output)['runs'],[])
+            self.assertEqual(json.loads(target.read_text()),old)
 
     def test_corrupt_history_is_not_overwritten(self):
         with TemporaryDirectory() as directory:
-            path=Path(directory)/'terminal'; path.mkdir()
+            output=Path(directory); path=output/'terminal'; path.mkdir()
             (path/'registry.json').write_text('not json')
-            with self.assertRaisesRegex(ValueError,'registry.json'):
-                save_strategy(directory,self.config(),'Buy CE / Buy PE')
+            result=run_backtest(self.config(),data=prepared(self.config()),persist=False)
+            with self.assertRaisesRegex(ValueError,'registry.json'): save_result(output,result)
             self.assertEqual((path/'registry.json').read_text(),'not json')
 
     def test_empty_lake_does_not_fabricate_prices_or_quality(self):
@@ -181,12 +188,13 @@ class TerminalUITests(unittest.TestCase):
         self.assertFalse(app.exception,[e.message for e in app.exception])
         self.assertFalse(app.error,[e.value for e in app.error])
 
-    def test_seven_pages_empty_states_and_removed_clutter(self):
+    def test_six_pages_empty_states_and_clean_strategy_choices(self):
         app=self.app();self.clean(app)
         self.assertEqual(app.radio(key='page').value,'Backtests')
-        self.assertEqual(len(app.tabs),0)
-        self.assertNotIn('Result collection',[w.label for w in app.selectbox])
-        self.assertEqual(app.selectbox(key='bt_instrument').options,['NIFTY 50','SENSEX','BANKNIFTY','CRUDEOIL','NATURALGAS'])
+        self.assertEqual(len(PAGES),6)
+        self.assertNotIn('Strategy Builder',PAGES)
+        self.assertEqual(app.selectbox(key='bt_strategy').options,list(STRATEGY_LABELS))
+        self.assertIn('GOLDM',app.selectbox(key='bt_instrument').options)
         for page in PAGES:
             app.radio(key='page').set_value(page).run();self.clean(app)
             self.assertEqual(len(app.tabs),0)
@@ -194,56 +202,48 @@ class TerminalUITests(unittest.TestCase):
         app.text_input(key='search').set_value('does-not-exist').run();self.clean(app)
         self.assertTrue(any('No matches' in i.value for i in app.info))
 
-    def test_real_execution_from_controls_saved_strategy_reports_and_reload(self):
+    def test_session_result_explicit_saves_reports_and_paper_selector(self):
         configs=[]
-        def execute(c,output):
+        def execute(c,output,persist):
+            self.assertFalse(persist)
             configs.append(c)
-            return run_backtest(c,data=prepared(c),output=output)
+            return run_backtest(c,data=prepared(c),output=output,persist=False)
         with patch('quant_backtester.run_backtest',side_effect=execute):
             app=self.app()
             app.selectbox(key='bt_instrument').select('SENSEX')
-            app.selectbox(key='bt_strategy').select('Reversal PE')
             app.date_input(key='bt_period').set_value((date(2026,10,22),date(2026,10,22)))
             app.number_input(key='bt_capital').set_value(250000)
             app.selectbox(key='bt_allocation').select('50%')
-            app.selectbox(key='bt_interval').select('1 minute')
-            app.selectbox(key='bt_take_profit').select('10%')
-            app.selectbox(key='bt_stop_loss').select('15%')
             app.number_input(key='bt_minimum_premium').set_value(125)
             app.selectbox(key='bt_exit_label').select('Trailing SL')
             app.button(key='run_backtest').click().run();self.clean(app)
-            expected=build_config('SENSEX','Reversal PE',(date(2026,10,22),date(2026,10,22)),250000,'50%','1 minute','10%','15%',125,'Trailing SL')
-            self.assertEqual(configs,[expected])
-            self.assertTrue(any('BT-001 complete' in i.value for i in app.success))
-            self.assertEqual(len(app.get('plotly_chart')),1)
-            self.assertIn('Closed trades',[m.label for m in app.metric])
+            self.assertEqual(len(configs),1)
+            self.assertEqual(load_registry(self.output)['runs'],[])
+            self.assertFalse((self.output/'runs').exists())
+            self.assertEqual(len(app.get('plotly_chart')),3)
+            self.assertTrue(any('Net P&amp;L' in x.value or 'Net P&L' in x.value for x in app.markdown))
+            app.button(key='save_strategy').click().run()
+            self.assertTrue(any('custom Strategy Name' in x.value for x in app.error))
+            app.text_input(key='strategy_name').set_value('Sensex_Custom_5m')
             app.button(key='save_strategy').click().run();self.clean(app)
+            records=load_saved_strategies(saved_strategy_path(self.output))
+            self.assertEqual(records[0]['config'],asdict(configs[0]))
+            self.assertEqual(load_registry(self.output)['runs'],[])
+            app.text_input(key='result_note_'+app.session_state['active_result']['run_id']).set_value('Reviewed')
+            app.button(key='save_result').click().run();self.clean(app)
             registry=load_registry(self.output)
-            self.assertEqual(registry['strategies'][0]['config'],asdict(expected))
-            self.assertEqual(registry['strategies'][0]['last_run'],'BT-001')
-            app.number_input(key='bt_minimum_premium').set_value(200)
-            app.button(key='run_backtest').click().run();self.clean(app)
-            self.assertTrue(any('BT-002 complete' in i.value for i in app.success))
-            self.assertTrue(any('No trades met' in i.value for i in app.info))
+            self.assertEqual(len(registry['runs']),1)
+            self.assertEqual(registry['runs'][0]['note'],'Reviewed')
             app.radio(key='page').set_value('Reports').run();self.clean(app)
-            app.selectbox(key='report_run').select(registry['runs'][0]['run_id']).run();self.clean(app)
-            self.assertEqual(len(app.get('plotly_chart')),2)
-            app.radio(key='page').set_value('Strategy Builder').run();self.clean(app)
-            app.button(key='load_'+registry['strategies'][0]['strategy_id']).click().run();self.clean(app)
-            self.assertEqual(app.number_input(key='bt_minimum_premium').value,125)
-            self.assertEqual(app.number_input(key='bt_capital').value,250000)
-            self.assertEqual(app.selectbox(key='bt_strategy').value,'Reversal PE')
-            app.radio(key='page').set_value('Overview').run();self.clean(app)
-            app.radio(key='page').set_value('Backtests').run();self.clean(app)
-            self.assertEqual(app.number_input(key='bt_capital').value,250000)
-            self.assertEqual(app.number_input(key='bt_minimum_premium').value,125)
-            app.text_input(key='search').set_value('BT-001').run();self.clean(app)
-            app.selectbox(key='search_run').select(registry['runs'][0]['run_id']).run();self.clean(app)
-            self.assertEqual(app.selectbox(key='recent_run').value,registry['runs'][0]['run_id'])
+            self.assertEqual(len(app.get('plotly_chart')),3)
+            app.radio(key='page').set_value('Live Paper Trading').run();self.clean(app)
+            self.assertEqual(app.selectbox(key='paper_saved_strategy').options,['Sensex_Custom_5m'])
+            self.assertIn('deploy_paper',[x.key for x in app.button])
             fresh=self.app();self.clean(fresh)
-            self.assertEqual(len(fresh.selectbox(key='recent_run').options),2)
+            self.assertNotIn('active_result',fresh.session_state)
+            self.assertEqual(len(load_registry(self.output)['runs']),1)
 
-    def test_banknifty_and_incompatible_configuration_do_not_execute(self):
+    def test_banknifty_and_mcx_only_strategy_validation(self):
         with patch('quant_backtester.run_backtest') as execute:
             app=self.app()
             app.selectbox(key='bt_instrument').select('BANKNIFTY')
@@ -251,10 +251,11 @@ class TerminalUITests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertTrue(any('BANKNIFTY spot is available' in e.value for e in app.error))
             execute.assert_not_called()
-            app.selectbox(key='bt_instrument').select('CRUDEOIL')
+            app.selectbox(key='bt_instrument').select('NIFTY 50')
+            app.selectbox(key='bt_strategy').select('MCX Evening Momentum & Donchian Breakout')
             app.button(key='run_backtest').click().run()
             self.assertFalse(app.exception)
-            self.assertTrue(any('MCX Breakout' in e.value for e in app.error))
+            self.assertTrue(any('supports NATURALGAS' in e.value for e in app.error))
             execute.assert_not_called()
 
 

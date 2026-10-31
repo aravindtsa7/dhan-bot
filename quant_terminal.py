@@ -7,31 +7,48 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant_backtester import Config, STRATEGIES, HIGH_STRATEGIES, POINT_VALUE, atomic_json
+from quant_backtester import Config, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE, atomic_json, persist_result
 from quant_lake import QuantDataLake, IST
 from step2_build_data_lake import writer_lock
 
-PAGES = ['Overview', 'Data Lake', 'Data Quality', 'Strategy Builder', 'Backtests', 'Reports', 'Live Paper Trading']
+PAGES = ['Overview', 'Data Lake', 'Data Quality', 'Backtests', 'Reports', 'Live Paper Trading']
 INSTRUMENT_LABELS = {'NIFTY 50': 'NIFTY', 'SENSEX': 'SENSEX', 'BANKNIFTY': 'BANKNIFTY',
-                     'CRUDEOIL': 'CRUDEOIL', 'NATURALGAS': 'NATURALGAS'}
+                     'CRUDEOIL': 'CRUDEOIL', 'NATURALGAS': 'NATURALGAS', 'GOLDM': 'GOLDM'}
 STRATEGY_LABELS = {
-    'Buy CE / Buy PE': (STRATEGIES[0], 'both'),
-    'Momentum CE': (STRATEGIES[1], 'CE'),
-    'Reversal PE': (STRATEGIES[3], 'PE'),
-    'Straddle Breakout': (STRATEGIES[2], 'both'),
-    'Expiry Gamma': (HIGH_STRATEGIES[4], 'both'),
-    'MCX Breakout': (STRATEGIES[4], 'both'),
+    'VWAP + EMA(9/21) Pullback': (RESEARCH_STRATEGIES[0], 'both'),
+    'Opening Range Breakout + Volume Surge': (RESEARCH_STRATEGIES[1], 'both'),
+    'Supertrend (10, 3) + ADX Trend Follower': (RESEARCH_STRATEGIES[2], 'both'),
+    'MCX Evening Momentum & Donchian Breakout': (RESEARCH_STRATEGIES[3], 'both'),
+    'Vertical Bull/Bear Debit Spread (Sec 2.6 & 2.9)': (BOOK_STRATEGIES[0], 'both'),
+    'Iron Butterfly Income Spread (Sec 2.44)': (BOOK_STRATEGIES[1], 'both'),
+    'Strap / Strip Volatility Breakout (Sec 2.34 & 2.35)': (BOOK_STRATEGIES[2], 'both'),
+    'Vol-Scaled Momentum + Volume/OI Activity Filter (Sec 10.3.1 & 10.4)': (BOOK_STRATEGIES[3], 'both'),
 }
 INTERVALS = {'1 minute': '1m', '3 minutes': '3m', '5 minutes': '5m', '15 minutes': '15m'}
 EXITS = {'End of day': 'end_of_day', 'Trailing SL': 'trailing_sl', 'Target / EOD': 'target_eod'}
 STRATEGY_NOTES = {
-    'Buy CE / Buy PE': 'EMA / Supertrend trend signals select calls or puts.',
-    'Momentum CE': 'Call-only opening-range breakout with option-volume confirmation.',
-    'Reversal PE': 'Put-only bearish VWAP pullback with candle confirmation.',
-    'Straddle Breakout': 'Fixed ATM call / put breakout; the first qualifying leg enters.',
-    'Expiry Gamma': 'Afternoon momentum on calendar-inferred expiry sessions.',
-    'MCX Breakout': 'Completed candles break the 17:00–17:30 commodity range.',
+    list(STRATEGY_LABELS)[0]: 'EMA9 pullback, EMA9/21 alignment, session VWAP and ADX ≥18; next-open execution. Zero-volume spot uses a disclosed TWAP proxy.',
+    list(STRATEGY_LABELS)[1]: 'Index 09:15–09:30 / MCX 17:00–17:30 range, RSI and >1.3× prior 10-bar volume. Zero-volume indices require complete observed fixed-strike option volume. Maximum two entries per session.',
+    list(STRATEGY_LABELS)[2]: 'Wilder ATR(10) Supertrend ×3 and ADX >22; confirmed flip or continuation. Supports Trailing SL.',
+    list(STRATEGY_LABELS)[3]: 'NATURALGAS / CRUDEOIL only. 17:00–22:45; prior 12-bar Donchian channel, EMA50 and body >1.2× ATR14. Morning warm-up retained.',
+    list(STRATEGY_LABELS)[4]: 'ATM debit vertical on VWAP/EMA alignment and ADX(14) ≥18. MCX uses directional futures with ATR-capped risk. Per-leg fees and adverse fills.',
+    list(STRATEGY_LABELS)[5]: 'Index options only: sell ATM CE/PE, buy equidistant wings after 09:45, ADX <22 and within 0.25% of VWAP. Credit decay/expansion exits and 15:15 EOD; reserve max loss plus fees.',
+    list(STRATEGY_LABELS)[6]: 'Index options only: 2CE:1PE strap or 1CE:2PE strip on ORB/Donchian break with fixed-contract volume expansion. Combined portfolio exits.',
+    list(STRATEGY_LABELS)[7]: 'Mean tanh(return / lagged volatility), 10-bar lookback, threshold 0.25; log volume expansion and positive log OI activity where available. Missing OI is disclosed.',
 }
+
+SAVED_STRATEGIES = Path(__file__).resolve().parent/'data'/'saved_strategies.json'
+
+
+def instrument_defaults(instrument):
+    """Conservative price-risk defaults, not fitted claims of profitability."""
+    # Full-notional futures funding at 25% allocation must afford at least one
+    # exchange lot plus costs; options and futures have very different units.
+    return dict(capital={'NATURALGAS':2_000_000,'CRUDEOIL':4_000_000,'GOLDM':8_000_000}.get(instrument,100_000),
+                allocation='25%',
+                take_profit='5%' if instrument in POINT_VALUE else '25%',
+                stop_loss='5%' if instrument in POINT_VALUE else '15%',
+                minimum_premium=0. if instrument in POINT_VALUE else 50.)
 
 
 def build_config(instrument, strategy, period, capital, allocation, interval,
@@ -45,8 +62,6 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
     code = INSTRUMENT_LABELS[instrument]
     engine_strategy, side = STRATEGY_LABELS[strategy]
     mcx = code in POINT_VALUE
-    if mcx != (strategy == 'MCX Breakout'):
-        raise ValueError('Choose MCX Breakout for CRUDEOIL / NATURALGAS, or an index instrument for option strategies.')
     sl, tp = float(str(stop_loss).rstrip('%')), float(str(take_profit).rstrip('%'))
     config = Config(
         instrument=code, strategy=engine_strategy, option_side=side,
@@ -54,10 +69,10 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
         capital=float(capital), capital_usage_pct=float(str(allocation).rstrip('%')),
         timeframe=INTERVALS[interval], sl_pct=sl, target_pct=tp,
         minimum_premium=float(minimum_premium), exit_mode=EXITS[exit_label],
-        trail_pct=sl if exit_label == 'Trailing SL' else 0, risk_basis='percentage',
-        sizing_mode='allocation', slippage=1.0 if mcx else .5,
-        entry_start='17:30' if mcx else '13:00' if strategy == 'Expiry Gamma' else '09:30',
-        entry_end='21:30' if mcx else '14:30', price_policy='strict_observed' if mcx else 'model_continuity',
+        trail_pct=sl if exit_label == 'Trailing SL' else 0, risk_basis='legacy' if mcx and engine_strategy in BOOK_STRATEGIES else 'percentage',
+        sizing_mode='allocation', slippage=.5 if code=='NATURALGAS' or not mcx else 1.0,
+        entry_start='17:00' if mcx and engine_strategy!='vwap_ema_pullback' else '09:25', volume_multiple=1.3,
+        entry_end='22:45' if mcx and engine_strategy!='vwap_ema_pullback' else '14:30', price_policy='strict_observed' if mcx else 'model_continuity',
     )
     config.validate()
     return config
@@ -139,29 +154,23 @@ def _entry(result, display_id, created_at):
 
 
 def load_registry(output):
-    """Old results remain inspectable after engine upgrades, with original configs."""
+    """Only explicitly saved results enter Reports. Never import result folders.
+
+    Version-one auto-save registries are ignored without deleting their files.
+    """
     output = Path(output)
     path = output / 'terminal' / 'registry.json'
     if path.exists():
         data = read_json(path)
         if not isinstance(data, dict) or not isinstance(data.get('runs'), list) or not isinstance(data.get('strategies'), list):
             raise ValueError('Run history is invalid. Restore registry.json before saving.')
-        return data
-    runs = []
-    paths = sorted((output / 'runs').glob('*/result.json'), key=lambda p: (p.stat().st_mtime_ns, p.parent.name))
-    for path in paths:
-        try:
-            result = read_json(path)
-            if not all((path.parent / f'{name}.parquet').exists() for name in ('trades', 'equity')):
-                continue
-            runs.append(_entry(result, f'BT-{len(runs)+1:03d}',
-                               pd.Timestamp.fromtimestamp(path.stat().st_mtime, tz=IST).isoformat()))
-        except (ValueError, KeyError):
-            continue
-    return dict(version=1, runs=runs, strategies=[])
+        if data.get('version') == 2:
+            data['runs'] = [r for r in data['runs'] if r.get('explicit_save')]
+            return data
+    return dict(version=2, runs=[], strategies=[])
 
 
-def register_run(output, result, label):
+def register_run(output, result, label, note=''):
     output = Path(output)
     directory = output / 'terminal'
     directory.mkdir(parents=True, exist_ok=True)
@@ -173,6 +182,8 @@ def register_run(output, result, label):
             entry = _entry(result, f'BT-{next_id:03d}', pd.Timestamp.now(tz=IST).isoformat())
             registry['runs'].append(entry)
         entry['strategy_label'] = label
+        entry['explicit_save'] = True
+        entry['note'] = note.strip()
         entry['last_opened'] = pd.Timestamp.now(tz=IST).isoformat()
         for strategy in registry['strategies']:
             if strategy['config'] == result['config']:
@@ -181,27 +192,71 @@ def register_run(output, result, label):
     return entry
 
 
+def save_result(output, result, note=''):
+    load_registry(output)  # Validate history before writing any result artifact.
+    document = persist_result(result, output)
+    return register_run(output, document, strategy_label(document['config']), note)
+
+
+def saved_strategy_path(output=None):
+    # Isolate temporary/custom workspaces while using the requested repo path
+    # for the real terminal and CLI.
+    default_output = Path(__file__).resolve().parent/'data_lake'/'backtests'
+    return SAVED_STRATEGIES if output is None or Path(output).resolve() == default_output else Path(output)/'terminal'/'saved_strategies.json'
+
+
+def load_saved_strategies(path=None):
+    path = Path(path) if path is not None else SAVED_STRATEGIES
+    if not path.exists(): return []
+    data = read_json(path)
+    if not isinstance(data, list): raise ValueError('saved_strategies.json must contain a list')
+    seen = set()
+    for record in data:
+        if not isinstance(record,dict) or not isinstance(record.get('name'),str) or not record['name'].strip() or not record.get('strategy_id') or not isinstance(record.get('config'),dict):
+            raise ValueError('Invalid saved strategy record')
+        if record['strategy_id'] in seen: raise ValueError('Duplicate saved strategy ID')
+        seen.add(record['strategy_id'])
+        try:
+            config = Config(**record['config'])
+        except TypeError as exc:
+            raise ValueError('Invalid parameters in saved_strategies.json') from exc
+        config.validate()
+        if config.strategy not in STRATEGIES:
+            raise ValueError('Saved strategies must use one of the eight terminal strategies')
+    return data
+
+
 def save_strategy(output, config, label):
-    output = Path(output)
-    directory = output / 'terminal'
+    name = label.strip()
+    if not name or name in STRATEGY_LABELS:
+        raise ValueError('Enter a custom Strategy Name before saving.')
+    config.validate()
+    if config.strategy not in STRATEGIES:
+        raise ValueError('Save one of the eight terminal strategies')
+    path = saved_strategy_path(output)
+    directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     values = asdict(config)
-    identifier = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:12]
+    identifier = hashlib.sha256(name.casefold().encode()).hexdigest()[:12]
     with writer_lock(directory):
-        registry = load_registry(output)
-        matching = next((r for r in reversed(registry['runs']) if r['config'] == values), None)
-        record = dict(strategy_id=identifier, name=label, config=values,
+        records = load_saved_strategies(path)
+        record = dict(strategy_id=identifier, name=name, config=values,
+                      instrument=config.instrument, strategy_key=config.strategy,
+                      candle_interval=config.timeframe, capital=config.capital,
+                      capital_allocation_pct=config.capital_usage_pct,
+                      take_profit_pct=config.target_pct, stop_loss_pct=config.sl_pct,
+                      minimum_premium=config.minimum_premium, exit_mode=config.exit_mode,
                       saved_at=pd.Timestamp.now(tz=IST).isoformat(),
-                      last_run=matching['display_id'] if matching else None)
-        registry['strategies'] = [s for s in registry['strategies'] if s['strategy_id'] != identifier] + [record]
-        atomic_json(directory / 'registry.json', registry)
+                      last_run=None)
+        records = [s for s in records if s['strategy_id'] != identifier] + [record]
+        atomic_json(path, records)
     return record
 
 
 def form_values(config, label):
     """Restore a saved terminal configuration without silently changing defaults."""
     return dict(instrument=next(k for k, v in INSTRUMENT_LABELS.items() if v == config['instrument']),
-                strategy=label, period=(date.fromisoformat(config['start']), date.fromisoformat(config['end'])-timedelta(days=1)),
+                strategy=strategy_label(config), period=(date.fromisoformat(config['start']), date.fromisoformat(config['end'])-timedelta(days=1)),
                 capital=int(config['capital']), allocation=f"{config['capital_usage_pct']:g}%",
                 interval=next(k for k, v in INTERVALS.items() if v == config['timeframe']),
                 take_profit=f"{config['target_pct']:g}%", stop_loss=f"{config['sl_pct']:g}%",

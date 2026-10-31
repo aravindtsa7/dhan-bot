@@ -14,6 +14,7 @@ from streamlit.testing.v1 import AppTest
 from quant_data_quality import (inventory, report_state, group_status, filtered_groups,
     run_quality_check, stream_sessions, preview_candles, preview_export, _hash_file)
 from quant_terminal import lake_snapshot
+from quant_data_ui import findings_frame, finding_stream_label
 
 
 class LakeFixture(unittest.TestCase):
@@ -215,6 +216,38 @@ class QualityTests(LakeFixture):
 
 
 class CatalogTests(LakeFixture):
+    def test_finding_streams_units_and_csv_preserve_actionable_evidence(self):
+        for name in ('NIFTY_CE_ATM_WEEK1','NIFTY_PE_ATM+1_WEEK1'):
+            self.add(name=name,dataset='options_rolling_1m')
+        inv=inventory(self.root)
+        def item(stream, problem, count, dataset='NSE|NIFTY|Rolling options|1 minute'):
+            return dict(stream=stream,problem=problem,count=count,dataset=dataset,severity='Warning',period='2026-01-05',action='Inspect exact stream')
+        findings=[item('options_rolling_1m|NIFTY_CE_ATM_WEEK1','Missing closing candles',2),
+                  item('options_rolling_1m|NIFTY_PE_ATM+1_WEEK1','Minute-spacing holes between observed candles; not verified missing exchange candles.',4),
+                  item(None,'Coverage not verified: session evidence missing.',None),
+                  item(None,'Lake metadata warning',None,dataset='Lake'),
+                  item('unknown_recorded_id','Unknown count semantics',3)]
+        table=findings_frame(findings,inv)
+        self.assertEqual(table['Stream / contract'].tolist(),['NIFTY_CE_ATM_WEEK1','NIFTY_PE_ATM+1_WEEK1','Not recorded','Lake-level','unknown_recorded_id (unresolved identifier)'])
+        self.assertEqual(table.Unit.tolist(),['candles','minute-spacing holes','dates unverified','Not recorded','Not recorded'])
+        self.assertEqual(table.Count.tolist(),['2','4','Not measured','Not measured','3'])
+        exported=pd.read_csv(io.StringIO(table.to_csv(index=False)),dtype=str,keep_default_na=False)
+        pd.testing.assert_frame_equal(table,exported)
+
+    def test_finding_units_distinguish_rows_candles_sessions_and_unknown(self):
+        inv=inventory(self.root)
+        cases=[('Exact duplicate input rows removed',4,'input rows'),
+               ('Unresolved conflicting timestamp rows remain stored',2,'stored rows'),
+               ('Entire expected session absent',1,'sessions'),
+               ('Coverage not verified: no calendar',5,'dates unverified'),
+               ('Invalid stored OHLCV candles',None,'stored candles'),
+               ('Unrecognized measurement',7,'Not recorded')]
+        for problem,count,unit in cases:
+            row=findings_frame([dict(problem=problem,count=count)],inv).iloc[0]
+            self.assertEqual(row.Unit,unit)
+            self.assertEqual(row.Count,'Not measured' if count is None else str(count))
+        self.assertEqual(finding_stream_label({},inv),'Lake-level')
+
     def test_grouping_daily_intraday_and_physical_bytes_are_not_duplicated(self):
         r=self.add()
         self.add(name='NIFTY_CE_ATM_WEEK1',dataset='options_rolling_1m')
@@ -276,6 +309,11 @@ class DataPageTests(LakeFixture):
             self.assertTrue(any('Matches current' in c.value for c in app.caption))
             self.assertTrue(app.get('download_button'))
             self.assertTrue(app.selectbox(key='quality_finding').options)
+            table=next(df.value for df in app.dataframe if 'Problem' in df.value.columns)
+            self.assertIn('Stream / contract',table.columns);self.assertIn('Unit',table.columns)
+            self.assertEqual(set(table['Stream / contract']),{'NIFTY'})
+            self.assertTrue(all('NIFTY' in label for label in app.selectbox(key='quality_finding').options))
+            self.assertTrue(any('Stream / contract: NIFTY' in c.value and 'Unit:' in c.value for c in app.caption))
             self.assertTrue(any('Next action:' in i.value for i in app.info))
 
     def test_empty_and_corrupt_lakes_render_both_pages(self):

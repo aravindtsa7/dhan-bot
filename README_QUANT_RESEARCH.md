@@ -1,6 +1,6 @@
 # Options and commodities research
 
-**Current engine: Step 4.** See [README_STEP4.md](README_STEP4.md) for H1–H4, option VWAP/OI, explicit continuity estimates, dated expiries, and the current 252-run grid. The remainder of this file documents the retained Step 3 baseline and original cost assumptions.
+**Current engine: 5.4.0.** See [README_DARK_TERMINAL.md](README_DARK_TERMINAL.md) for the eight terminal strategies, eligibility and repair workflow, and [README_BOOK_STRATEGIES.md](README_BOOK_STRATEGIES.md) for atomic option baskets and large-move fixed-strike pricing. [README_STEP4.md](README_STEP4.md) retains the H1–H4 research reference. The remainder of this file documents the retained Step 3 baseline and original cost assumptions, including its historical censoring behavior; current runs require all positions to close or fail explicitly.
 
 Run from `C:\Dhan\dhan-bot`:
 
@@ -42,7 +42,7 @@ Ordinary signals use completed bars; execution starts at the next minute's open.
 
 Trailing stops move only after a favorable jump and become active in the next minute. Options use entry-premium percentage distances; futures use ATR distance and quarter-stop-distance jumps. All positions with available candles close at the **15:20 IST open** for indices and **23:15 IST open** for MCX. A missing candle produces censoring, not a fictitious square-off.
 
-The engine requires `quality_report.json` without integrity issues. It uses only clean manifest partitions, excludes flagged short sessions, requires every underlying/option minute in the relevant execution window, rejects conflicting same-strike observations across rolling streams, and never forward-fills gaps. Exclusion logs are saved per run. These filters condition the sample on data availability and can create selection bias.
+The engine requires a supported, structurally valid, stable `quality_report.json` matching the manifest, file state, session evidence and stream inventory, without integrity errors. Current coverage and options-identity warnings remain visible and do not alone block a run. Direct partition checks remain enforced. The loader checks every underlying/option minute in its dependency windows, including indicator warm-up and square-off, rather than automatically vetoing legacy whole-session short flags. Conflicting same-strike OHLCV or signal metadata inside those windows excludes the date; outside-window conflicts remain evidence and disputed quotes are omitted from the lookup maps. Gaps are never forward-filled. Eligibility evidence and exclusion logs are saved per run. These filters condition the sample on data availability and can create selection bias.
 
 Default sizing is one lot and fixed ₹1,000,000 research capital, no compounding. Options check entry-premium affordability (each straddle leg receives at most half the research capital). Futures margin and capital depletion are not modeled; fixed-notional research may continue after cumulative losses. No market depth, partial fills, price limits, exchange halts, or liquidity impact model is present.
 

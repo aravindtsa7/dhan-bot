@@ -67,6 +67,13 @@ def select_contracts(daily, dates):
             continue
         prior = previous[-1]
         rows = daily[daily.date.eq(prior)].sort_values('instrument')
+        # Recorded FUTCOM names include expiry. A previous-session winner
+        # that has expired cannot be traded on the execution date.
+        import re
+        rows=rows[rows.instrument.map(lambda name: not (m:=re.search(r'_(\d{4}-\d{2}-\d{2})_\d+$',name)) or m[1]>=date)]
+        if rows.empty:
+            selected[date]=(None,prior,'No unexpired contract with preceding-session volume evidence')
+            continue
         if rows.invalid.any():
             selected[date] = (None, prior, 'Invalid or duplicate preceding-session volume evidence')
             continue
@@ -130,6 +137,13 @@ def rejected_evidence(root, records, date, stream, window):
             lo, hi = [pd.Timestamp(f'{date} {v}', tz=IST) for v in window]
             relevant = relevant[relevant.timestamp.between(lo, hi)]
             relevant = relevant[relevant.rejection_reason.isin(['invalid_ohlcv', 'conflicting_duplicate_timestamp'])]
+            # Raw quarantine remains immutable evidence. Reconcile only the
+            # negative-volume-only rows explicitly restored by the writer.
+            from quant_repairs import negative_only
+            recovered={pd.Timestamp(e['timestamp']) for e in record.get('repairs',[]) if e.get('method')=='quarantine_volume_zero'}
+            resolved=relevant.apply(lambda r:r.rejection_reason=='invalid_ohlcv' and r.timestamp in recovered and negative_only(r),axis=1) if len(relevant) else pd.Series(False,index=relevant.index)
+            if resolved.any():notes.append(dict(stream=stream,problem='Negative-volume-only quarantine candles restored with volume zero; original evidence retained',count=int(resolved.sum())))
+            relevant=relevant[~resolved]
             if len(relevant):
                 reasons.append(dict(problem='Rejected invalid/conflicting input in required window', stream=stream,
                                     count=len(relevant), timestamps=sorted({t.isoformat() for t in relevant.timestamp})))

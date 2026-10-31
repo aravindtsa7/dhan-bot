@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 import pandas as pd
 
-from quant_backtester import Config, STRATEGIES, fees, quantity, simulate_trade, performance, indicators
+from quant_backtester import Config, LEGACY_STRATEGIES as STRATEGIES, fees, quantity, simulate_trade, performance, indicators
 from quant_option_model import MissingObservedPrice, continuation_candle, intrinsic
 from quant_high_edge import HIGH_STRATEGIES, option_statistics, option_confirmation
 from quant_calendar import is_expiry_day, next_expiry

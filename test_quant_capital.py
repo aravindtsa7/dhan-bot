@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 import pandas as pd
-from quant_backtester import Config, STRATEGIES, HIGH_STRATEGIES, order_allocation
+from quant_backtester import Config, LEGACY_STRATEGIES as STRATEGIES, HIGH_STRATEGIES, order_allocation
 from quant_portfolio import execute_portfolio
 from quant_high_edge import high_edge_events
 

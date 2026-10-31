@@ -3,7 +3,7 @@ from collections import defaultdict
 
 
 def execute_portfolio(data,c,run_id,daily_audit=None):
-    from quant_backtester import _trade_steps, HIGH_STRATEGIES, STRATEGIES
+    from quant_backtester import _trade_steps, HIGH_STRATEGIES, LEGACY_STRATEGIES as STRATEGIES, RESEARCH_STRATEGIES, BOOK_STRATEGIES
     records,paths,skipped=[],[],[]
     equity=c.capital
     serial=0
@@ -34,7 +34,7 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
                     audit['blocked_entries']+=1
                     continue
                 if len(entered)>=cap or equity<=0: continue
-                if not data.mcx and 690<=at<795 and c.strategy!=HIGH_STRATEGIES[4]: continue
+                if not data.mcx and 690<=at<795 and c.strategy not in RESEARCH_STRATEGIES+BOOK_STRATEGIES and c.strategy!=HIGH_STRATEGIES[4]: continue
                 if not pair and (active or at<=last_exit): continue
                 if c.strategy in (HIGH_STRATEGIES[1],STRATEGIES[2]) and event[1] in entered: continue
                 if c.strategy==STRATEGIES[2] and not pair and day_closed and day_closed[-1]['exit_reason'] not in ('stop_loss','trailing_stop'): continue
@@ -58,7 +58,7 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
                     trade,trace=done.value; active.remove(p)
                     if trade is None:
                         reason='unavailable_entry_or_insufficient_capital'
-                        first=data.price(data.days[date],at,event[1],event[2])
+                        first=None if c.strategy in BOOK_STRATEGIES[:3] and not data.mcx else data.price(data.days[date],at,event[1],event[2])
                         if not data.mcx:
                             if c.option_side not in ('both',event[1]): reason='option_side_filter'
                             elif first and max(first[0],event[3] or first[0])<c.minimum_premium: reason='below_minimum_premium'
