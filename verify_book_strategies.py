@@ -10,14 +10,14 @@ from quant_option_model import MissingObservedPrice
 
 
 def verify(start='2025-01-01',end='2026-10-31',output=Path('data/book_verification'),
-           instruments=('NIFTY','SENSEX','NATURALGAS')):
+           instruments=('NIFTY','SENSEX','NATURALGAS'),strategies=BOOK_STRATEGIES,timeframes=('5m','15m')):
     output=Path(output); output.mkdir(parents=True,exist_ok=True); rows=[]
     for instrument in instruments:
         data=ResearchData(instrument,start,end)
         print(f'{instrument}: {len(data.days)} eligible / {len(data.exclusions)} excluded',flush=True)
         atomic_json(output/f'{instrument}_eligibility.json',data.eligibility)
-        for tf in ('5m','15m'):
-            for strategy in BOOK_STRATEGIES:
+        for tf in timeframes:
+            for strategy in strategies:
                 row=dict(instrument=instrument,timeframe=tf,strategy=strategy,
                          eligible_sessions=len(data.days),excluded_sessions=len(data.exclusions),data_fingerprint=data.fingerprint)
                 c=Config(instrument=instrument,strategy=strategy,start=start,end=end,timeframe=tf,
@@ -75,8 +75,10 @@ if __name__=='__main__':
     parser.add_argument('--start',default='2025-01-01');parser.add_argument('--end',default='2026-10-31')
     parser.add_argument('--output',type=Path,default=Path('data/book_verification'))
     parser.add_argument('--instruments',nargs='+',choices=('NIFTY','SENSEX','NATURALGAS'),default=('NIFTY','SENSEX','NATURALGAS'))
+    parser.add_argument('--strategies',nargs='+',choices=BOOK_STRATEGIES,default=BOOK_STRATEGIES)
+    parser.add_argument('--timeframes',nargs='+',choices=('1m','3m','5m','15m'),default=('5m','15m'))
     args=parser.parse_args()
     def blocked(*args,**kwargs): raise AssertionError('External network forbidden during lake verification')
     socket.socket.connect=blocked; socket.socket.connect_ex=blocked
-    result=verify(args.start,args.end,args.output,args.instruments)
+    result=verify(args.start,args.end,args.output,args.instruments,args.strategies,args.timeframes)
     raise SystemExit(int(result.status.str.startswith('FAILED:').any()))

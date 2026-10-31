@@ -151,58 +151,94 @@ def basket_allocation(c,date,legs,budget):
     return 0,0.,0.,debit
 
 
-def bounded_spread_rows(day, at, side, legs, rows, sources):
-    """Reconcile fallback legs jointly, leaving exact observed quotes untouched.
+def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
+    """Causal pair valuation: last mark + spot delta, with a bounded local anchor.
 
-    Only synchronized open/close prices are executable basket marks. Two modeled
-    strikes share one bounded extrinsic anchor; one modeled strike is anchored
-    to its observed partner. Projection happens BEFORE slippage, fees and risk.
-    A saturated intrinsic floor is capped at width - .05 (otherwise the user's
-    requested floor and ceiling would contradict each other deep ITM).
+    The .20 delta and .25 sensitivity ceiling are research assumptions, not
+    universal option Greek bounds. Observed quotes win; no intrinsic floor or
+    independent wing time-value decay is imposed on the spread.
+    State is trade-local and advances entry open -> close -> next open.
     """
-    if side not in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY') or 'model_intrinsic_wing_fallback' not in sources:
+    if side not in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY'):
         return rows, False
     mutable=[s not in ('observed','observed_price_volume_corrected') for s in sources]
+    if state is None:
+        if any(mutable): raise MissingObservedPrice('Spread continuity requires its previous pair mark and spot')
+        return rows, False
     pairs=[(0,2),(1,3)] if side=='IRON_BUTTERFLY' else [(0,1)]
     result=[list(r) for r in rows]
     for field in (0,3):
         spot=day['prices'][at][field]; intervals=[]; values=[]
-        for h,l in pairs:  # h has higher intrinsic value for its option type
+        for h,l in pairs:
             width=abs(legs[h]['strike']-legs[l]['strike'])
-            if width<=.1: raise MissingObservedPrice('Spread width cannot accommodate fallback tick bounds')
-            ih=intrinsic(spot,legs[h]['strike'],legs[h]['side'])
-            il=intrinsic(spot,legs[l]['strike'],legs[l]['side'])
-            low,high=(0.,width) if side=='IRON_BUTTERFLY' else (min(width-.05,max(.05,ih-il)),width-.05)
-            a,b=result[h][field],result[l][field]
+            option=legs[h]['side']; direction=1 if option=='CE' else -1
+            if not (mutable[h] or mutable[l]):
+                value=result[h][field]-result[l][field]
+                intervals.append((value,value));values.append(value);continue
+            previous,prior_spot,prior_low=state[h,l]
+            near=day.get('rolling',{}).get((option,'ATM'),{}).get(at)
+            far=day.get('rolling',{}).get((option,'ATM+1' if option=='CE' else 'ATM-1'),{}).get(at)
+            def observed_pair(a,b):
+                quotes=[day.get('options',{}).get((at,option,k)) for k in (a,b)]
+                if (a is None or b is None or not math.isclose(direction*(b-a),width) or
+                    any(q is None or not math.isfinite(q[field]) or q[field]<=0 for q in quotes) or
+                    any(day.get('price_sources',{}).get((at,option,k))=='synthetic_ffill' for k in (a,b))):return None
+                return quotes
+            quotes=observed_pair(near,far)
+            if quotes is None:
+                # A stored offset can contain a different strike spacing. Use
+                # another actually observed one-width pair, never treat that
+                # wider quote difference as this spread's value.
+                strikes={day.get('rolling',{}).get((option,m),{}).get(at) for m in ('ATM-1','ATM','ATM+1')}-{None}
+                candidates=[(abs(a-legs[h]['strike']),a,b,q) for a in strikes for b in strikes
+                            if (q:=observed_pair(a,b)) is not None]
+                if not candidates:
+                    raise MissingObservedPrice(f'{day.get("timestamp", "")} {at//60:02d}:{at%60:02d} {option}: spread continuity requires observed adjacent strikes of matching width')
+                _,near,far,quotes=min(candidates,key=lambda item:item[:3])
+            clip=lambda v,lo,hi:min(hi,max(lo,v))
+            adjacent=clip(quotes[0][field]-quotes[1][field],.05,width-.05)
+            anchor=clip(adjacent+direction*.20*(near-legs[h]['strike']),.05,width-.05)
+            ds=spot-prior_spot
+            predicted=previous+direction*.20*ds
+            correction=clip(.25*(anchor-predicted),-.05*abs(ds),.05*abs(ds))
+            low,high=(0.,width) if side=='IRON_BUTTERFLY' else (.05,width-.05)
+            if mutable[l] and not mutable[h]: high=min(high,result[h][field]-.05)
+            if low>high+1e-8: raise MissingObservedPrice('Observed leg cannot support positive bounded spread premiums')
+            value=clip(predicted+correction,low,high)
+            # Reject inconsistent exact quotes rather than manufacture a jump
+            # to preserve positivity. Width clipping can only reduce a move.
+            prior_bounded=clip(previous,0. if side=='IRON_BUTTERFLY' else .05,width if side=='IRON_BUTTERFLY' else width-.05)
+            radius=.25*abs(ds)
+            low=max(low,prior_bounded-radius);high=min(high,prior_bounded+radius)
+            if low>high+1e-8: raise MissingObservedPrice('Observed leg incompatible with spread delta continuity')
+            value=clip(value,low,high)
             if mutable[h] and mutable[l]:
-                # A common time value eliminates independent distance-decay
-                # differences. Keep the lower-intrinsic leg as shared anchor.
-                tv=min(width,max(0.,a-ih),max(0.,b-il))
-                a,b=max(.05,ih+tv),max(.05,il+tv)
-                result[l][field]=b
-            elif mutable[h]: low=max(low,.05-b)
-            elif mutable[l]: high=min(high,a-.05)
-            else: low=max(low,a-b); high=min(high,a-b)
-            if low>high+1e-8:
-                raise MissingObservedPrice('Observed spread quotes incompatible with fallback no-arbitrage bounds')
-            intervals.append((low,high));values.append(min(high,max(low,a-b)))
-        if side=='IRON_BUTTERFLY':
+                # Allocate the pair value to positive legs without letting an
+                # independently collapsed time value determine the difference.
+                result[l][field]=max(.05,prior_low+intrinsic(spot,legs[l]['strike'],option)-intrinsic(prior_spot,legs[l]['strike'],option))
+            # The butterfly has one joint liability budget. An exact observed
+            # pair can consume that budget, requiring its modeled companion to
+            # shrink further than the standalone delta band (even to zero).
+            intervals.append((0. if side=='IRON_BUTTERFLY' else low,high));values.append(value)
+        if side=='IRON_BUTTERFLY' and any(mutable):
             width=abs(legs[0]['strike']-legs[2]['strike'])
-            # The call and put liabilities share ONE wing-width budget.
+            if any(v<0 or v>width for v in values):
+                raise MissingObservedPrice('Observed butterfly pair violates its wing bound')
             excess=max(0.,sum(values)-width)
             capacity=sum(v-lo for v,(lo,_) in zip(values,intervals))
             if excess>capacity+1e-8:
-                raise MissingObservedPrice('Observed butterfly quotes incompatible with fallback wing bound')
+                raise MissingObservedPrice('Butterfly wing bound incompatible with observed quotes')
             if excess and capacity:
                 values=[v-excess*(v-lo)/capacity for v,(lo,_) in zip(values,intervals)]
         for (h,l),value in zip(pairs,values):
             if mutable[h]: result[h][field]=result[l][field]+value
             elif mutable[l]: result[l][field]=result[h][field]-value
+            state[h,l]=(value,spot,result[l][field])
     for i,changed in enumerate(mutable):
         if changed:
             result[i][1]=max(result[i][0],result[i][3])
             result[i][2]=min(result[i][0],result[i][3])
-    return [tuple(r) for r in result], True
+    return [tuple(r) for r in result], any(mutable)
 
 
 def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
@@ -224,6 +260,10 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
     entry_equity=c.capital if entry_equity is None else entry_equity
     qty,allocated,reserve,entry=basket_allocation(c,date,legs,budget)
     if not qty: return None,[]
+    spread=side in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY')
+    pairs=[(0,2),(1,3)] if side=='IRON_BUTTERFLY' else [(0,1)]
+    spread_state={(h,l):(legs[h]['raw_entry_price']-legs[l]['raw_entry_price'],day['prices'][at][0],legs[l]['raw_entry_price'])
+                  for h,l in pairs} if spread else None
     credit=side=='IRON_BUTTERFLY'; basis=abs(entry)
     stop=entry-basis*c.sl_pct/100; target=entry+basis*c.target_pct/100
     initial_stop=stop; best=entry; trace=[]; force=None; modeled_bars=0
@@ -241,15 +281,23 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
             elif stored=='quarantine_volume_zero': source='observed_price_volume_corrected'
             if row is None:
                 if c.price_policy=='strict_observed': raise MissingObservedPrice(f'{date} unpriceable fixed-strike basket leg {leg["side"]} {leg["strike"]}')
-                try:
-                    row,meta=continuation_candle(data,day,current,leg['side'],leg['strike'],leg['previous'])
-                except MissingObservedPrice as exc:
-                    raise MissingObservedPrice(f'{date} {current//60:02d}:{current%60:02d} {side} {leg["side"]} {leg["strike"]:g}: {exc}') from exc
-                source=meta['price_source']; wing=meta.get('modeled_wing_fallback',False); modeled=True
+                if spread:
+                    band=[day.get('rolling',{}).get((leg['side'],m),{}).get(current) for m in ('ATM-1','ATM','ATM+1')]
+                    band=[k for k in band if k is not None]
+                    wing=bool(band and not min(band)<=leg['strike']<=max(band))
+                    source='model_spread_wing_continuity' if wing else 'model_spread_continuity'
+                    row=(.05,.05,.05,.05,0)  # replaced jointly before any valuation
+                else:
+                    try:
+                        row,meta=continuation_candle(data,day,current,leg['side'],leg['strike'],leg['previous'])
+                    except MissingObservedPrice as exc:
+                        raise MissingObservedPrice(f'{date} {current//60:02d}:{current%60:02d} {side} {leg["side"]} {leg["strike"]:g}: {exc}') from exc
+                    source=meta['price_source']; wing=meta.get('modeled_wing_fallback',False)
+                modeled=True
             leg['previous']=row; leg['modeled_bars']+=int(modeled)
             leg['modeled_wing_fallback'] |= wing; leg['exit_price_source']=source
             rows.append(row); sources.append(source)
-        rows,bounded=bounded_spread_rows(day,current,side,legs,rows,sources)
+        rows,bounded=bounded_spread_rows(day,current,side,legs,rows,sources,spread_state)
         for leg,row,source in zip(legs,rows,sources):
             leg['previous']=row
             leg['spread_bounds_applied'] |= bounded and source not in ('observed','observed_price_volume_corrected')

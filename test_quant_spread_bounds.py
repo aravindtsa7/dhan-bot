@@ -91,14 +91,16 @@ class SpreadBoundTests(unittest.TestCase):
             actual,changed=bounded_spread_rows({},600,side,legs,rows,sources)
             self.assertFalse(changed);self.assertEqual(actual,rows)
 
-    def test_intrinsic_floor_and_saturated_tick_ceiling_at_open_and_close(self):
+    def test_continuity_replaces_intrinsic_floor_at_open_and_close(self):
         legs=[dict(side='CE',strike=24650,ratio=1),dict(side='CE',strike=24700,ratio=-1)]
         rows=[(500,500,500,500,0),(20,20,20,20,1)]
-        day={'prices':{600:(24675,25200,24600,25150,0)}}
+        day={'prices':{600:(24675,25200,24600,25150,0)},
+             'rolling':{('CE','ATM'):{600:24700},('CE','ATM+1'):{600:24750}},
+             'options':{(600,'CE',24700):(20,20,20,20,1),(600,'CE',24750):(10,10,10,10,1)}}
         actual,changed=bounded_spread_rows(day,600,'BULL_CALL_SPREAD',legs,rows,
-                                          ['model_intrinsic_wing_fallback','observed'])
+                                          ['model_intrinsic_wing_fallback','observed'],{(0,1):(20,24675,20)})
         self.assertTrue(changed);self.assertEqual(actual[1],rows[1])
-        self.assertGreaterEqual(actual[0][0]-actual[1][0],25)
+        self.assertAlmostEqual(actual[0][0]-actual[1][0],20)  # no spot move, no fallback jump
         self.assertAlmostEqual(actual[0][3]-actual[1][3],49.95)
 
 

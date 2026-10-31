@@ -41,7 +41,7 @@ INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
     'Out-of-band fixed strikes may use intrinsic plus bounded, distance-decayed wing time value; modeled_wing_fallback flags every affected trade. Strict-observed policy still rejects modeled fills.',
-    'Book structures use atomic per-leg fills. Wing-modeled vertical marks are bounded to [min(intrinsic spread, width-0.05), width-0.05], with a 0.05 floor; iron butterfly liability is bounded to one wing width. Exact observed quotes are retained. Costs and slippage are applied after bounds and may exceed payoff limits. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
+    'Book structures use atomic per-leg fills. Missing spread legs use prior pair value plus signed 0.20 spot change and an adjacent-spread correction capped at 0.05 times absolute spot change. These are research delta assumptions. Vertical values stay in [0.05, width-0.05], without an intrinsic floor; butterfly liability stays within one wing width. Exact observed quotes are retained. Costs and slippage are applied after bounds and may exceed payoff limits. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
     'PROVISIONAL: rolling WEEK1 options have no expiry/contract ID. Matching strike is necessary but cannot prove contract identity.',
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
     'H1 uses stored fixed-strike option VWAP; zero-volume spot has a separate TWAP proxy. Repaired stored inputs may affect signals; all affected sessions are disclosed.',
@@ -900,7 +900,7 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         raise ValueError('Prepared data does not match configuration window')
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-wing-bounded-v2',data=data.fingerprint),sort_keys=True)
+    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-spread-continuity-v3',data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'
