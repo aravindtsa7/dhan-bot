@@ -24,11 +24,13 @@ STRATEGY_LABELS = {
     'Strap / Strip Volatility Breakout (Sec 2.34 & 2.35)': (BOOK_STRATEGIES[2], 'both'),
     'Vol-Scaled Momentum + Volume/OI Activity Filter (Sec 10.3.1 & 10.4)': (BOOK_STRATEGIES[3], 'both'),
     'Expiry Day': ('expiry_day','both'),
+    'Expiry Intraday': ('expiry_intraday','both'),
 }
 INTERVALS = {'1 minute': '1m', '3 minutes': '3m', '5 minutes': '5m', '15 minutes': '15m'}
 EXITS = {'End of day': 'end_of_day', 'Trailing SL': 'trailing_sl', 'Target / EOD': 'target_eod'}
 EXPIRY_EXITS = {'Target + SL':'target_eod','Trailing SL':'trailing_sl','EOD':'end_of_day'}
 STRATEGY_NOTES = {
+    'Expiry Intraday': 'NIFTY / SENSEX expiry sessions only: 09:20 signal / 09:21 fill, balanced CE+PE basket, combined TP/SL and optional trailing, 15:20 EOD. No overnight hold.',
     list(STRATEGY_LABELS)[0]: 'Fresh EMA9 pullback/cross, directional body, EMA9/21 and VWAP alignment, rising ADX >=18. Max two entries; three-bar cooldown after stop. Historical index VWAP uses rolling ATM CE+PE activity.',
     list(STRATEGY_LABELS)[1]: 'Index 09:15-09:30 / MCX 17:00-17:30 range, RSI and configured volume expansion over ten prior bars. Index activity uses observed rolling ATM CE+PE. Max two entries.',
     list(STRATEGY_LABELS)[2]: 'Wilder ATR(10) Supertrend x3 and ADX >22; confirmed flip or continuation. Supports Trailing SL.',
@@ -55,14 +57,9 @@ def instrument_defaults(instrument):
 
 
 def strategy_defaults(instrument,strategy):
-    from quant_strategy_models import DIRECTIONAL_OPTIONS
-    values=instrument_defaults(instrument)
-    if strategy=='expiry_day':
-        values.update(take_profit='25%',stop_loss='60%',minimum_premium=70.,allocation='50%')
-    elif strategy in DIRECTIONAL_OPTIONS:
-        values.update(take_profit='30%',stop_loss='20%')
-    elif instrument in POINT_VALUE:values.update(take_profit='25%',stop_loss='15%')
-    return values
+    """Public export retained for UI imports and saved-strategy tools."""
+    from quant_strategy_defaults import strategy_defaults as defaults
+    return defaults(instrument,strategy)
 
 
 def build_config(instrument, strategy, period, capital, allocation, interval,
@@ -277,5 +274,5 @@ def form_values(config, label):
                 interval=next(k for k, v in INTERVALS.items() if v == config['timeframe']),
                 take_profit=f"{config['target_pct']:g}%", stop_loss=f"{config['sl_pct']:g}%",
                 minimum_premium=float(config['minimum_premium']),
-                exit_label=next(k for k, v in (EXPIRY_EXITS if config['strategy']=='expiry_day' else EXITS).items() if v == config['exit_mode']),
-                **{k:v for k,v in config.items() if k.startswith('expiry_')})
+                exit_label=next(k for k, v in (EXPIRY_EXITS if config['strategy'] in ('expiry_day','expiry_intraday') else EXITS).items() if v == config['exit_mode']),
+                **{k:v for k,v in config.items() if k.startswith(('expiry_','intraday_'))})

@@ -8,6 +8,7 @@ SIDE_LABELS = {'CE':'BUY CE', 'PE':'BUY PE', 'LONG':'LONG FUT', 'SHORT':'SHORT F
 from quant_book import SIDE_LABELS as BOOK_SIDE_LABELS
 SIDE_LABELS.update(BOOK_SIDE_LABELS)
 SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
+SIDE_LABELS['EXPIRY_INTRADAY']='EXPIRY INTRADAY (CE+PE)'
 REASONS = {'target':'Target', 'stop_loss':'Stop Loss', 'trailing_stop':'Trailing SL', 'square_off':'EOD',
            'daily_loss_limit':'Daily loss limit', 'daily_profit_target':'Daily profit target'}
 
@@ -32,7 +33,7 @@ def trade_ledger(trades, config):
         'Balance (₹)':c.capital+f.net_pnl.cumsum(),
         'Modeled wing fallback':f.get('modeled_wing_fallback',pd.Series(False,index=f.index)).fillna(False),
     })
-    if c.strategy=='expiry_day':
+    if c.strategy in ('expiry_day','expiry_intraday'):
         ledger['Signal Date & Time']=pd.to_datetime(f.signal_time).dt.strftime('%Y-%m-%d %H:%M:%S')
         ledger['Entry Date & Time']=pd.to_datetime(f.entry_time).dt.strftime('%Y-%m-%d %H:%M:%S')
         ledger['Exit Date & Time']=pd.to_datetime(f.exit_time).dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -68,7 +69,7 @@ def trade_chart(trade, underlying, paths, config):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.09,
                         row_heights=[.55,.45], subplot_titles=('Underlying session · IST', 'Traded contract · IST'))
     if not underlying.empty:
-        if config['strategy']=='expiry_day' and 'date' in underlying:
+        if config['strategy'] in ('expiry_day','expiry_intraday') and 'date' in underlying:
             f=underlying[underlying.date.between(str(pd.Timestamp(trade['entry_time']).date()),str(pd.Timestamp(trade['exit_time']).date()))]
         else:
             f = underlying[underlying.date.eq(trade['date'])] if 'date' in underlying else underlying
@@ -109,7 +110,7 @@ def trade_chart(trade, underlying, paths, config):
         fig.add_trace(go.Scatter(x=[entry_at,exit_at],y=[trade[key]]*2,name=label,mode='lines',line=dict(color=color,dash='dash',width=1)),row=2,col=1)
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_layout(title=side+' · '+str(trade.get('entry_value_type','premium / futures'))+' · '+contract)
-    if config['strategy']=='expiry_day':
+    if config['strategy'] in ('expiry_day','expiry_intraday'):
         summary=(f"Signal {pd.Timestamp(trade['signal_time']):%Y-%m-%d %H:%M} | Fill {entry_at:%Y-%m-%d %H:%M} → Exit {exit_at:%Y-%m-%d %H:%M} IST<br>"
                  f"CE ₹{trade['ce_entry_price']:.2f} → ₹{trade['ce_exit_price']:.2f} | "
                  f"PE ₹{trade['pe_entry_price']:.2f} → ₹{trade['pe_exit_price']:.2f} | "

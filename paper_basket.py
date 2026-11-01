@@ -10,6 +10,7 @@ from quant_backtester import fees, minute
 from quant_book import basket_allocation, SIDE_LABELS
 from quant_strategy_models import basket_slippage, profit_lock
 SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
+SIDE_LABELS['EXPIRY_INTRADAY']='EXPIRY INTRADAY (CE+PE)'
 
 
 class BasketPaperAccount(PaperAccount):
@@ -39,13 +40,16 @@ class BasketPaperAccount(PaperAccount):
         if expiry_day:
             from quant_expiry import live_event
             if event!=live_event(self.c,now) or event[1]!='EXPIRY_DAY': return False
+        elif self.c.strategy=='expiry_intraday':
+            from quant_expiry_intraday import live_event
+            if event!=live_event(self.c,now):return False
         elif event[0]!=at or local.weekday()>=5 or not minute(self.c.entry_start)<=at<=minute(self.c.entry_end): return False
         if event[1]=='IRON_BUTTERFLY' and not 585<=at<915: return False
         if self.session(now)['lock']: return False
         key=f'{date}:basket:{at}'
         if key in self.state['seen_signals']: return False
         today=[t for t in self.state['trades'] if t['entry_time'][:10]==date]
-        cap=1 if self.c.strategy in ('book_strap_strip','expiry_day') else self.c.max_trades_day
+        cap=1 if self.c.strategy in ('book_strap_strip','expiry_day','expiry_intraday') else self.c.max_trades_day
         if len(today)>=cap: return False
         if self.c.strategy=='book_vertical_spread' and today and today[-1]['exit_reason'] in ('stop_loss','trailing_stop'):
             if now-datetime.fromisoformat(today[-1]['exit_time']).timestamp()<3*int(self.c.timeframe[:-1])*60:return False
@@ -55,6 +59,8 @@ class BasketPaperAccount(PaperAccount):
             from quant_expiry import previous_session
             if len(resolved)!=2 or {s['side'] for s,_ in resolved}!={'CE','PE'} or any(s['ratio']!=1 for s,_ in resolved): return False
             if (previous_session(assets[0].expiry) if self.c.expiry_entry_mode=='btst' else assets[0].expiry)!=date: return False
+        if self.c.strategy=='expiry_intraday':
+            if assets[0].expiry!=date or len(resolved)!=2 or {s['side'] for s,_ in resolved}!={'CE','PE'} or any(s['ratio']!=1 for s,_ in resolved):return False
         legs=[]
         for spec,asset in resolved:
             q=quotes.get(asset.key)
@@ -76,6 +82,8 @@ class BasketPaperAccount(PaperAccount):
             best=entry,net_pnl=None,exit_reason='',pending_exit='',paper=True)
         if expiry_day:
             p.update(expiry_exit_session=assets[0].expiry,combined_entry_value=entry*qty,overnight=self.c.expiry_entry_mode=='btst')
+        if self.c.strategy=='expiry_intraday':
+            p.update(expiry_exit_session=date,combined_entry_value=entry*qty,overnight=False)
         self.quotes.update(quotes); self.state['seen_signals'].append(key); self.state['trades'].append(p)
         self.save(); self.emit(f'PAPER OPEN {p["structure_label"]} | {p["contract"]} | net value {entry:.2f}')
         self.on_tick(quotes[assets[0].key],now)
@@ -108,7 +116,7 @@ class BasketPaperAccount(PaperAccount):
         p.update(status='CLOSED',exit_time=stamp(now),exit_price=sum(l['ratio']*l['exit_price'] for l in p['legs']),
                  exit_reason=reason,pending_exit='',gross_pnl=gross,gross_before_slippage=raw_gross,
                  slippage_cost=raw_gross-gross,net_pnl=net,roi_pct=100*net/p['capital_allocated'],**costs)
-        if p['side']=='EXPIRY_DAY':
+        if p['side'] in ('EXPIRY_DAY','EXPIRY_INTRADAY'):
             ce=next(l for l in p['legs'] if l['side']=='CE');pe=next(l for l in p['legs'] if l['side']=='PE')
             p.update(combined_exit_value=p['exit_price']*p['quantity'],combined_return_pct=100*(p['exit_price']/p['entry_price']-1),
                      ce_entry_price=ce['entry_price'],ce_exit_price=ce['exit_price'],pe_entry_price=pe['entry_price'],pe_exit_price=pe['exit_price'])
@@ -144,7 +152,7 @@ class BasketPaperAccount(PaperAccount):
                 steps=math.floor(max(0,p['best']-p['entry_price'])/jump+1e-10)
                 if steps: p['stop']=max(p['stop'],p['entry_price']*(1-self.c.trail_pct/100)+steps*jump)
             self.save();return
-        finish=915 if p['side']=='IRON_BUTTERFLY' else 920
+        finish=minute(self.c.intraday_exit_cutoff) if p['side']=='EXPIRY_INTRADAY' else 915 if p['side']=='IRON_BUTTERFLY' else 920
         if p['entry_time'][:10]!=local.date().isoformat(): self.request_exit('overnight_recovery')
         elif local.hour*60+local.minute>=finish: self.request_exit('square_off')
         self.lock_if_needed(tick,now)
@@ -155,7 +163,7 @@ class BasketPaperAccount(PaperAccount):
         if reason: self.close(tick,now,reason); return
         p['best']=max(p['best'],value)
         p['stop']=profit_lock(self.c,p['entry_price'],p['best'],p['stop'])
-        if self.c.exit_mode in ('legacy','trailing_sl') and self.c.trail_pct>0:
+        if (self.c.exit_mode=='trailing_sl' or (self.c.exit_mode=='legacy' and self.c.strategy!='expiry_intraday')) and self.c.trail_pct>0:
             basis=abs(p['entry_price']); jump=basis*self.c.trail_jump_pct/100
             steps=math.floor(max(0,p['best']-p['entry_price'])/jump+1e-10)
             if steps: p['stop']=max(p['stop'],p['entry_price']-basis*self.c.trail_pct/100+steps*jump)
@@ -170,5 +178,5 @@ class BasketPaperAccount(PaperAccount):
             if date>p['expiry_exit_session']: self.request_exit('overdue_expiry_recovery')
             elif date==p['expiry_exit_session'] and local.hour*60+local.minute>=minute(self.c.expiry_exit_cutoff): self.request_exit('square_off')
             return
-        if p['entry_time'][:10]!=local.date().isoformat() or local.hour*60+local.minute>=(915 if p['side']=='IRON_BUTTERFLY' else 920):
+        if p['entry_time'][:10]!=local.date().isoformat() or local.hour*60+local.minute>=(minute(self.c.intraday_exit_cutoff) if p['side']=='EXPIRY_INTRADAY' else 915 if p['side']=='IRON_BUTTERFLY' else 920):
             self.request_exit('square_off')

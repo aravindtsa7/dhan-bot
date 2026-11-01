@@ -7,11 +7,12 @@ DIRECTIONAL_OPTIONS=('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_t
 
 
 def futures_risk(c,entry,atr):
-    """UI return percentages use explicit 5x risk leverage, with ATR caps."""
-    return min(entry*c.sl_pct/500,1.5*atr),min(entry*c.target_pct/500,2.5*atr)
+    """ATR-scaled risk: UI TP30/SL15 maps to 2.2/1.2 entry ATR."""
+    return atr*1.2*c.sl_pct/15,atr*2.2*c.target_pct/30
 
 
 def profit_lock(c,entry,best,stop,direction=1,atr=None):
+    if c.exit_mode!='trailing_sl':return stop
     gain=direction*(best-entry)
     if atr is not None:
         if gain<1.2*atr:return stop

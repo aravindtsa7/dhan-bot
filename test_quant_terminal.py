@@ -117,7 +117,7 @@ class TerminalParameterTests(unittest.TestCase):
         self.assertEqual(trade['exit_reason'],'trailing_stop')
         self.assertEqual([p['stop'] for p in trace],[75,120])
         trade,_ = simulate_trade(data,replace(c,exit_mode='target_eod'),c.start,(600,'CE',24000,None,1),'fixed')
-        self.assertEqual(trade['exit_reason'],'trailing_stop')
+        self.assertEqual(trade['exit_reason'],'square_off')
         trade,_ = simulate_trade(data,replace(c,exit_mode='end_of_day'),c.start,(600,'CE',24000,None,1),'eod')
         self.assertEqual(trade['exit_reason'],'square_off')
 

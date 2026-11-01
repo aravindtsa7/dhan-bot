@@ -1,4 +1,4 @@
-"""All nine strategies, two windows/intervals; offline, no saved user runs."""
+"""All ten strategies, two windows/intervals; offline, no saved user runs."""
 import argparse
 from dataclasses import asdict
 import json
@@ -21,8 +21,8 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
             for strategy in strategies:
                 defaults=strategy_defaults(instrument,strategy)
                 c=Config(instrument=instrument,strategy=strategy,timeframe=tf,start=start,end=end,
-                    capital=100000,capital_usage_pct=50 if strategy=='expiry_day' else 100,sizing_mode='fixed_lots',lots=1,
-                    futures_margin_pct=20,minimum_premium=70 if strategy=='expiry_day' else 0,
+                    capital=100000,capital_usage_pct=50 if strategy in ('expiry_day','expiry_intraday') else 100,sizing_mode='fixed_lots',lots=1,
+                    futures_margin_pct=20,minimum_premium=(70 if strategy=='expiry_day' else 40 if strategy=='expiry_intraday' else 50 if not data.mcx and strategy in ('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend','book_vol_oi_momentum') else 0),
                     target_pct=float(defaults['take_profit'].rstrip('%')),sl_pct=float(defaults['stop_loss'].rstrip('%')),
                     trail_pct=0,exit_mode='target_eod',risk_basis='percentage',volume_multiple=1.3,
                     entry_start='17:00' if data.mcx and strategy!='vwap_ema_pullback' else '09:30',
@@ -44,7 +44,7 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
                             assert (abs(trades.gross_pnl-trades.total_cost-trades.net_pnl)<1e-6).all()
                             assert (abs(trades.gross_before_slippage-trades.slippage_cost-trades.gross_pnl)<1e-6).all()
                             assert (trades.capital_reserved<=trades.allocation_budget+1e-6).all()
-                            assert trades.groupby('date').size().max()<=(1 if strategy in ('book_strap_strip','mcx_evening_breakout','expiry_day') else 2)
+                            assert trades.groupby('date').size().max()<=(1 if strategy in ('book_strap_strip','mcx_evening_breakout','expiry_day','expiry_intraday') else 2)
                             if 'legs' in trades:
                                 for trade in trades.itertuples():
                                     legs=json.loads(trade.legs)

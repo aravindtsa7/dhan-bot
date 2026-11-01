@@ -58,7 +58,7 @@ class BookTests(unittest.TestCase):
                 self.assertEqual(actual.strategy,key)
                 with patch('quant_deployment.subprocess.Popen',return_value=Mock(pid=123)):
                     self.assertEqual(launch_strategy(record,root/'paper',saved_strategy_path(root)),123)
-            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),9)
+            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),10)
             c,d,_=fixture(); result=run_backtest(c,d,persist=False)
             save_result(root,result,'spread saved')
             self.assertTrue((root/'runs'/result['run_id']/'trades.parquet').exists())
@@ -320,7 +320,7 @@ class BookTests(unittest.TestCase):
         c,d,day=fixture();c=replace(c,instrument='NATURALGAS',risk_basis='percentage')
         d.mcx=True;d.price=lambda *args:(100,100,100,100,100)
         t,_=simulate_trade(d,c,DATE,(1394,'LONG',0,None,2),'t')
-        self.assertEqual(t['initial_stop'],97);self.assertEqual(t['target'],105)
+        self.assertAlmostEqual(t['initial_stop'],97.6);self.assertAlmostEqual(t['target'],100+2*2.2*25/30)
 
     def test_paper_atomic_fresh_quotes_recovery_and_per_leg_fees(self):
         c,d,day=fixture();now=datetime(2026,10,22,10,tzinfo=IST).timestamp()
@@ -346,14 +346,14 @@ class BookTests(unittest.TestCase):
         original=asdict(c)
         for key in ('start','end','momentum_lookback','momentum_threshold'): original.pop(key)
         for key in list(original):
-            if key.startswith('expiry_'): original.pop(key)
+            if key.startswith(('expiry_','intraday_')): original.pop(key)
         digest=hashlib.sha256(json.dumps(original,sort_keys=True).encode()).hexdigest()
         with TemporaryDirectory() as directory:
             account=PaperAccount(directory,c,asset,lambda _:None)
             self.assertEqual(account.state['policy_hash'],digest)
             recovered=PaperAccount(directory,replace(c,momentum_lookback=15),asset,lambda _:None)
             self.assertEqual(recovered.state['policy_hash'],digest)
-            legacy={k:v for k,v in asdict(c).items() if not k.startswith('expiry_')}
+            legacy={k:v for k,v in asdict(c).items() if not k.startswith(('expiry_','intraday_'))}
             self.assertEqual(account_path(directory,dict(strategy_id='old',config=legacy)),
                              account_path(directory,dict(strategy_id='old',config=asdict(c))))
 

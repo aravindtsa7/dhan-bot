@@ -78,15 +78,15 @@ class ExecutionV5Tests(unittest.TestCase):
         again,_=continuation_candle(data,day,600,'CE',k,None,state=dict(state),open_only=True)
         self.assertEqual(first,again)
 
-    def test_futures_five_x_percentage_distances_and_atr_caps(self):
+    def test_futures_atr_scaled_percentage_distances(self):
         for instrument in ('NATURALGAS','CRUDEOIL','GOLDM'):
-            c=Config(instrument=instrument,sl_pct=15,target_pct=25)
-            self.assertEqual(futures_risk(c,220,2),(3,5))
+            c=Config(instrument=instrument,sl_pct=15,target_pct=30)
+            self.assertEqual(futures_risk(c,220,2),(2.4,4.4))
             sl,tp=futures_risk(c,220,100)
-            self.assertAlmostEqual(sl,6.6);self.assertAlmostEqual(tp,11)
+            self.assertAlmostEqual(sl,120);self.assertAlmostEqual(tp,220)
 
     def test_futures_trailing_activates_at_12_atr_in_both_directions(self):
-        c=Config(instrument='NATURALGAS',strategy='book_vertical_spread')
+        c=Config(instrument='NATURALGAS',strategy='book_vertical_spread',exit_mode='trailing_sl')
         for d in (1,-1):
             stop=220-d*3
             self.assertEqual(profit_lock(c,220,220+d*2.39,stop,d,2),stop)
@@ -94,7 +94,7 @@ class ExecutionV5Tests(unittest.TestCase):
             self.assertAlmostEqual(profit_lock(c,220,220+d*2.9,stop,d,2),220+d*.9)
 
     def test_directional_profit_lock_requires_18_percent_then_steps(self):
-        c=Config(strategy='book_vertical_spread',exit_mode='target_eod')
+        c=Config(strategy='book_vertical_spread',exit_mode='trailing_sl')
         self.assertEqual(profit_lock(c,100,117.99,80),80)
         self.assertEqual(profit_lock(c,100,118,80),110)
         self.assertEqual(profit_lock(c,100,123,110),115)
@@ -126,7 +126,7 @@ class ExecutionV5Tests(unittest.TestCase):
         from test_paper_trader import config, tick, NOW, ASSET
         from paper_engine import PaperAccount
         for direction,side in [(1,'LONG'),(-1,'SHORT')]:
-            c=config(strategy='book_vol_oi_momentum',slippage=0,sl_pct=15,target_pct=25,exit_mode='target_eod')
+            c=config(strategy='book_vol_oi_momentum',slippage=0,sl_pct=15,target_pct=30,exit_mode='trailing_sl')
             date='2026-10-23'
             quotes={1055:(220,max(220,220+direction*2.4),min(220,220+direction*2.4),220+direction*2.4,100),
                     1056:(220+direction*.3,)*4+(100,)}
@@ -134,8 +134,8 @@ class ExecutionV5Tests(unittest.TestCase):
                 days={date:dict(timestamp=pd.Timestamp(date,tz='Asia/Kolkata'),contract='TEST')},
                 price=lambda day,at,*args:quotes.get(at))
             trade,path=simulate_trade(data,c,date,(1055,side,0,None,2),'risk')
-            self.assertAlmostEqual(trade['initial_stop'],220-direction*3)
-            self.assertAlmostEqual(trade['target'],220+direction*5)
+            self.assertAlmostEqual(trade['initial_stop'],220-direction*2.4)
+            self.assertAlmostEqual(trade['target'],220+direction*4.4)
             self.assertEqual(trade['exit_reason'],'trailing_stop')
             self.assertAlmostEqual(path[1]['stop'],220+direction*.4)
             with TemporaryDirectory() as root:

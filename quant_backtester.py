@@ -37,7 +37,7 @@ RESEARCH_STRATEGIES = ['vwap_ema_pullback', 'orb_volume_breakout',
                        'supertrend_adx_trend', 'mcx_evening_breakout']
 BOOK_STRATEGIES = ['book_vertical_spread', 'book_iron_butterfly',
                    'book_strap_strip', 'book_vol_oi_momentum']
-STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day']
+STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day','expiry_intraday']
 INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
@@ -47,7 +47,7 @@ LIMITATIONS = [
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
     'Research index VWAP weights zero-volume spot minutes by synchronized observed ATM CE+PE activity. If activity is unavailable, TWAP remains explicitly tagged. H1 retains fixed-strike option VWAP. Repaired inputs are disclosed. Live broker warmup supplies resolved-contract activity rather than historical rolling ATM chains.',
     'Basket slippage per leg is min(configured, 0.50, max(0.05, tick-rounded 1.25% of premium)); butterfly capital reserves full wing width plus estimated round-trip fees. Expiry Day uses stateful remaining-session theta once on modeled expiry legs; observed quotes remain unchanged.',
-    'Public MCX strategies interpret UI TP/SL as returns at assumed 5x leverage, capped at 2.5/1.5 entry ATR. At 1.2 ATR profit, lock 0.2 ATR and advance in 0.25 ATR steps. Directional options/spreads lock 10% after 18% gain, advancing by trail_jump_pct, except explicit EOD mode. These locks are gross-price thresholds, not net profit guarantees.',
+    'Public MCX target/stop distances scale with entry ATR: TP30/SL15 maps to 2.2/1.2 ATR (gross 1.83:1 before fees). Target / EOD uses fixed thresholds. Only explicit Trailing SL activates futures locks at 1.2 ATR or directional option locks at 18% gain. These locks are gross-price thresholds, not net profit guarantees.',
     'Synthetic flat zero-volume repair bars are modeled inputs, not provider quotes. Original partitions and quarantine evidence are retained; strict-observed runs reject synthetic inputs.',
     'MCX is a front-active-contract sample, not continuous history since 2025; daily contract choice uses prior-session volume.',
     'Expiry flags use dated exchange rules and holidays; EOD IV/extrinsic checks are retrospective diagnostics, never signal inputs or proof of expiry identity.',
@@ -123,6 +123,9 @@ class Config:
     expiry_include_prior_session: bool = True  # Period selects expiry/exit dates
     expiry_calendar_mode: str = 'calendar'  # calendar / observed_reset (recorded evidence only)
 
+    intraday_entry_signal: str = '09:20'
+    intraday_exit_cutoff: str = '15:20'
+
     def validate(self):
         if self.instrument == 'BANKNIFTY':
             raise ValueError('BANKNIFTY spot is available, but option history and a dated contract schedule are not configured. Choose NIFTY 50 or SENSEX for option backtests.')
@@ -138,6 +141,11 @@ class Config:
             raise ValueError('Iron butterfly and strap/strip require index option streams; MCX futures cannot reproduce these payoffs')
         if self.strategy=='expiry_day' and self.instrument not in ('NIFTY','SENSEX'):
             raise ValueError('Expiry Day supports NIFTY and SENSEX weekly index options only; MCX is unsupported')
+        if self.strategy=='expiry_intraday':
+            if self.instrument not in ('NIFTY','SENSEX'):
+                raise ValueError('Expiry Intraday supports NIFTY and SENSEX only; MCX is unsupported')
+            if not 555<=minute(self.intraday_entry_signal)<=660 or self.intraday_exit_cutoff not in ('15:15','15:20'):
+                raise ValueError('Expiry Intraday signal must be 09:15–11:00; cutoff must be 15:15 or 15:20')
         if self.expiry_entry_mode not in ('btst','expiry_intraday') or self.expiry_calendar_mode not in ('calendar','observed_reset'):
             raise ValueError('Invalid Expiry Day entry or calendar mode')
         if not 925<=minute(self.expiry_entry_signal)<=928 or self.expiry_exit_cutoff not in ('15:15','15:20') or not isinstance(self.expiry_include_prior_session,bool):
@@ -185,7 +193,7 @@ class Config:
             raise ValueError('Invalid exit mode or risk basis')
         if self.exit_mode == 'trailing_sl' and self.trail_pct <= 0:
             raise ValueError('Trailing SL requires a positive trailing distance')
-        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy=='expiry_day' or self.strategy in BOOK_STRATEGIES[:3] or self.strategy in (LEGACY_STRATEGIES[2], HIGH_STRATEGIES[1])):
+        if self.option_side != 'both' and (self.instrument in POINT_VALUE or self.strategy in ('expiry_day','expiry_intraday') or self.strategy in BOOK_STRATEGIES[:3] or self.strategy in (LEGACY_STRATEGIES[2], HIGH_STRATEGIES[1])):
             raise ValueError('Futures and dual-leg strategies require both sides')
         for value in (self.entry_start, self.entry_end, self.anchor):
             minute(value)
@@ -351,6 +359,9 @@ def research_events(data, c, date, confirm_volume=True):
     Zero-volume index minutes use synchronized rolling ATM CE+PE activity;
     execution still resolves and retains a fixed strike at signal close.
     """
+    if c.strategy=='expiry_intraday':
+        from quant_expiry_intraday import intraday_events
+        return intraday_events(data,c,date)
     if c.strategy=='expiry_day':
         from quant_expiry import expiry_events
         return expiry_events(data,c,date)
@@ -711,6 +722,9 @@ def simulate_trade(data,c,date,event,trade_id,**account):
 
 
 def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None):
+    if c.strategy=='expiry_intraday':
+        from quant_expiry_intraday import intraday_steps
+        return (yield from intraday_steps(data,c,date,event,trade_id,budget,entry_equity))
     if c.strategy=='expiry_day':
         from quant_expiry import expiry_steps
         return (yield from expiry_steps(data,c,date,event,trade_id,budget=budget,entry_equity=entry_equity))
@@ -911,7 +925,11 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         raise ValueError('Prepared data does not match configuration window')
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='stateful-execution-v5',data=data.fingerprint),sort_keys=True)
+    identity_config=asdict(c)
+    if c.strategy!='expiry_intraday':
+        identity_config={k:v for k,v in identity_config.items() if not k.startswith('intraday_')}
+    revision='stateful-execution-v5' if c.strategy=='expiry_day' else 'explicit-exits-v6'
+    identity=json.dumps(dict(config=identity_config,engine=ENGINE_VERSION,pricing_revision=revision,data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'
@@ -954,6 +972,8 @@ def run_backtest(c, data=None, output=OUT, persist=True):
     if c.strategy=='expiry_day':
         result['limitations']=LIMITATIONS+['Expiry Day holds fixed CE+PE strikes overnight. WEEK1 has no verified expiry identity; calendar/recorded-reset labels do not establish that both sessions contain the same contracts. Combined thresholds use synchronized closes, exit next open; overnight gaps and costs can exceed stops.',
             'Period selects expiry exit sessions; optional prior-session loading is disclosed in the trade entry dates. Observed-reset mode requires recorded expiry/reset evidence, never a change in rolling ATM strike alone.']
+    if c.strategy=='expiry_intraday':
+        result['limitations']=LIMITATIONS+['Expiry Intraday enters only on dated expiry mornings and closes the fixed CE+PE basket the same day. Combined close triggers next-open exit; WEEK1 expiry identity remains unverified.']
     result['_frames'] = dict(trades=trades, equity=equity, monthly=monthly, stop_paths=pd.DataFrame(paths),
         skipped_entries=pd.DataFrame(skipped), excluded_sessions=pd.DataFrame(data.exclusions),
         daily_risk=pd.DataFrame(daily_risk), underlying=underlying)

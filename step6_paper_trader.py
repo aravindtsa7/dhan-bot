@@ -150,12 +150,12 @@ async def live(args,c,emit,transport):
             if (args.output/'STOP').exists(): stop()
             if args.duration and mono-started>=args.duration: stop()
             clock_minute=local.hour*60+local.minute
-            expiry_strategy=c.strategy=='expiry_day'
+            expiry_strategy=c.strategy in ('expiry_day','expiry_intraday')
             market_open=not expiry_strategy or 555<=clock_minute<930
             if expiry_strategy:
                 from quant_calendar import is_expiry_day
                 from quant_backtester import minute
-                if is_expiry_day(c.instrument,local.date().isoformat()) and clock_minute>=minute(c.expiry_exit_cutoff)+1: stop()
+                if is_expiry_day(c.instrument,local.date().isoformat()) and clock_minute>=minute(c.intraday_exit_cutoff if c.strategy=='expiry_intraday' else c.expiry_exit_cutoff)+1: stop()
                 if ws and not market_open: await drop()
             elif clock_minute>=(1396 if c.instrument in POINT_VALUE else 921): stop()
             if stopping:
@@ -242,7 +242,7 @@ async def live(args,c,emit,transport):
                         if event and not args.monitor_only and not stopping and not account.position:
                             if c.instrument in POINT_VALUE:
                                 account.enter(event,tick,received)
-                            elif c.strategy=='expiry_day':
+                            elif c.strategy in ('expiry_day','expiry_intraday'):
                                 from quant_expiry import paper_candidates, paper_selection
                                 candidates=paper_candidates(option_master,c.instrument,tick.price,received)
                                 histories={}

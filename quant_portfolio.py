@@ -25,7 +25,7 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
             if daily_audit is not None: daily_audit.append(audit)
             continue
         active=[]; entered=[]; day_closed=[]; locked=None; last_exit=-1
-        cap=1 if c.strategy in (HIGH_STRATEGIES[2],HIGH_STRATEGIES[3],'book_strap_strip','mcx_evening_breakout') else c.max_trades_day
+        cap=1 if c.strategy in (HIGH_STRATEGIES[2],HIGH_STRATEGIES[3],'book_strap_strip','mcx_evening_breakout','expiry_intraday') else c.max_trades_day
         pair=c.strategy==STRATEGIES[2] and c.mode=='B'
         finish=1395 if data.mcx else 920
         last_event=max(events)

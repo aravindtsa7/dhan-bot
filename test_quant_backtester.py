@@ -31,7 +31,7 @@ class EngineTests(unittest.TestCase):
 
     def test_trailing_update_only_next_bar(self):
         d=self.fake({(600,24000):(100,130,90,125,1),(601,24000):(120,125,105,110,1)})
-        c=replace(self.config(),trail_pct=20,trail_jump_pct=5)
+        c=replace(self.config(),trail_pct=20,trail_jump_pct=5,exit_mode='trailing_sl')
         t,path=simulate_trade(d,c,'2026-10-22',(600,'CE',24000,None,0),'t')
         self.assertEqual(t['exit_time'].minute,1)
         self.assertEqual(t['exit_price'],120)
@@ -39,7 +39,7 @@ class EngineTests(unittest.TestCase):
 
     def test_trailing_overshoot_moves_only_whole_jumps(self):
         d=self.fake({(600,24000):(100,132,90,125,1),(601,24000):(120,124,109,112,1)})
-        c=replace(self.config(),trail_pct=20,trail_jump_pct=5)
+        c=replace(self.config(),trail_pct=20,trail_jump_pct=5,exit_mode='trailing_sl')
         t,path=simulate_trade(d,c,'2026-10-22',(600,'CE',24000,None,0),'t')
         self.assertEqual([r['stop'] for r in path],[80,120])
         self.assertEqual(t['exit_price'],120)
