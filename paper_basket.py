@@ -1,13 +1,17 @@
 """Atomic virtual option baskets; every leg needs a fresh real contract quote."""
 from dataclasses import asdict, replace
 from datetime import datetime
+import json
 import math
+import os
+from pathlib import Path
 import uuid
 
 from paper_engine import PaperAccount, stamp
 from paper_feed import Asset, IST
 from quant_backtester import fees, minute
-from quant_book import basket_allocation, SIDE_LABELS
+from quant_book import (basket_allocation, SIDE_LABELS, validate_raw_basket_rows,
+                        InvalidBasketObservation)
 from quant_strategy_models import basket_slippage, profit_lock
 SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
 SIDE_LABELS['EXPIRY_INTRADAY']='EXPIRY INTRADAY (CE+PE)'
@@ -22,7 +26,106 @@ class BasketPaperAccount(PaperAccount):
 
     def __init__(self,*args,**kwargs):
         self.quotes={}
+        root=Path(args[0] if args else kwargs['root'])
+        self._frozen_evidence=None
+        # An immutable invalidation intent is a durable fail-closed barrier,
+        # independent of a denied/interrupted state+ledger publication. A torn
+        # intent blocks restart rather than permitting a favorable new quote.
+        for path in sorted((root/'basket_invalidations').glob('*.intent.json')):
+            try:
+                evidence=json.loads(path.read_text(encoding='utf-8'))
+                if not evidence.get('simulation_invalidated'):raise ValueError('Invalid intent')
+            except (OSError,ValueError) as exc:
+                raise ValueError('Incomplete basket invalidation evidence; refuse paper simulation restart: '+str(path)) from exc
+            if self._frozen_evidence is None:self._frozen_evidence=evidence
         super().__init__(*args,**kwargs)
+
+    def _apply_invalidation(self):
+        evidence=self._frozen_evidence or self.state.get('invalidation_evidence')
+        if evidence:
+            self._frozen_evidence=evidence
+            self.state.update(simulation_status='INVALIDATED',invalidation_evidence=evidence)
+            for p in self.state['trades']:
+                if p['status']=='OPEN':
+                    # Keep the original open position and reserve. There is no
+                    # invented liquidation, realized P&L or subsequent exit.
+                    p.update(simulation_status='INVALIDATED',invalidation_evidence=evidence)
+
+    def save(self):
+        self._apply_invalidation()
+        return super().save()  # recoverable joint state/ledger publication
+
+    def _ensure_valid_simulation(self):
+        evidence=self._frozen_evidence or self.state.get('invalidation_evidence')
+        if evidence:
+            raise InvalidBasketObservation('Paper basket simulation frozen after invalid raw evidence',evidence)
+
+    def _invalidate(self,evidence):
+        evidence=dict(evidence,simulation_invalidated=True,contract_identity_verified=False,
+            account_action='FROZEN; retain open position/reserve; no exit or realized P&L',
+            paper=True)
+        self._frozen_evidence=evidence
+        self._apply_invalidation()
+        path=self.root/'basket_invalidations'/(uuid.uuid4().hex+'.intent.json')
+        try:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            evidence['invalidation_evidence_path']=str(path.relative_to(self.root))
+            with path.open('x',encoding='utf-8') as stream:
+                json.dump(evidence,stream,indent=2,allow_nan=False)
+                stream.flush();os.fsync(stream.fileno())
+        except Exception as exc:
+            evidence['invalidation_intent_failure']=dict(type=type(exc).__name__,reason=str(exc))
+        try:self.save()
+        except Exception as exc:
+            evidence['invalidation_publication_failure']=dict(type=type(exc).__name__,reason=str(exc))
+            # Report secondary publication failures without overwriting the
+            # original intent; the T2 journal also retains its recovery proof.
+            try:
+                failure=path.with_name(path.stem+'.publication_failure.json')
+                with failure.open('x',encoding='utf-8') as stream:
+                    json.dump(evidence['invalidation_publication_failure'],stream,indent=2)
+                    stream.flush();os.fsync(stream.fileno())
+            except Exception as secondary:
+                evidence['secondary_evidence_failure']=dict(type=type(secondary).__name__,reason=str(secondary))
+        raise InvalidBasketObservation('Invalid raw paper basket snapshot; simulation frozen',evidence)
+
+    def _validate_snapshot(self,side,legs,quotes,now,phase):
+        self._ensure_valid_simulation()
+        if side not in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY'):return
+        def number(value):
+            return str(value) if isinstance(value,float) and not math.isfinite(value) else value
+        snapshot=[dict(asset=l['asset'],side=l['side'],strike=l['strike'],ratio=l['ratio'],
+            raw_price=number(q.price),bid=number(q.bid),ask=number(q.ask),
+            exchange_time=q.exchange_time,received_time=q.received_time,
+            exchange_time_ist=stamp(q.exchange_time),received_time_ist=stamp(q.received_time),
+            wire_epoch=q.wire_epoch) for l,q in zip(legs,quotes)]
+        times=[q.exchange_time for q in quotes]
+        local=datetime.fromtimestamp(now,IST);at=local.hour*60+local.minute
+        context=dict(phase=phase,instrument=self.c.instrument,strategy=self.c.strategy,
+            trade_id=self.position['trade_id'] if self.position else None,
+            position_open=self.position is not None,price_policy=self.c.price_policy,
+            decision_time_epoch=now,decision_time_ist=stamp(now),
+            quote_snapshot=snapshot,quote_time_spread_seconds=max(times)-min(times),
+            quote_exchange_times_equal=len(set(times))==1,snapshot_synchronization_verified=False,
+            time_basis='fresh live LTP snapshot; asynchronous exchange times retained, not a synchronized candle',
+            contract_identity_status='supplied resolved asset IDs and expiry; independent provider identity not verified')
+        rows=[(q.price,)*4+(0,) for q in quotes]
+        try:validate_raw_basket_rows(dict(timestamp=local.replace(hour=0,minute=0,second=0,microsecond=0)),
+            at,side,legs,rows,['observed']*len(legs),open_only=True,context=context)
+        except InvalidBasketObservation as exc:self._invalidate(exc.evidence)
+        return context
+
+    def enter(self,*args,**kwargs):
+        self._ensure_valid_simulation()
+        return super().enter(*args,**kwargs)
+
+    def request_exit(self,reason):
+        self._ensure_valid_simulation()
+        return super().request_exit(reason)
+
+    def lock_if_needed(self,tick,now):
+        self._ensure_valid_simulation()
+        return super().lock_if_needed(tick,now)
 
     def disconnect(self):
         self.quotes.clear()
@@ -34,6 +137,7 @@ class BasketPaperAccount(PaperAccount):
         return quotes if all(q and q.fresh(now) for q in quotes) else None
 
     def enter_basket(self,event,resolved,quotes,now):
+        self._ensure_valid_simulation()
         if self.position or not resolved: return False
         local=datetime.fromtimestamp(now,IST); date=local.date().isoformat(); at=local.hour*60+local.minute
         expiry_day=self.c.strategy=='expiry_day'
@@ -64,9 +168,11 @@ class BasketPaperAccount(PaperAccount):
         legs=[]
         for spec,asset in resolved:
             q=quotes.get(asset.key)
-            if not q or not q.fresh(now) or (spec['ratio']>0 and q.price<self.c.minimum_premium): return False
+            if not q or not q.fresh(now): return False
             legs.append(dict(spec,asset=asdict(asset),raw_entry_price=q.price,
                              entry_price=self.price(q,spec['ratio']>0),last_epoch=q.exchange_time))
+        raw_snapshot=self._validate_snapshot(event[1],legs,[quotes[a.key] for a in assets],now,'paper_entry')
+        if any(l['ratio']>0 and l['raw_entry_price']<self.c.minimum_premium for l in legs):return False
         allocation=replace(self.c,lot_size=assets[0].point_value)
         budget=max(0,min(self.c.capital,self.equity))*self.c.capital_usage_pct/100
         qty,allocated,reserve,entry=basket_allocation(allocation,date,legs,budget)
@@ -78,8 +184,12 @@ class BasketPaperAccount(PaperAccount):
             contract=' / '.join(f'{l["ratio"]:+g}x{l["strike"]:g}{l["side"]}' for l in legs),
             entry_time=stamp(now),exit_time='',entry_price=entry,exit_price=None,quantity=qty,lots=qty/assets[0].point_value,
             entry_value_type='credit' if entry<0 else 'debit',capital_allocated=allocated,capital_reserved=allocated+reserve,
+            raw_entry_price=sum(l['ratio']*l['raw_entry_price'] for l in legs),
+            capital_basis=('full_wing_width_plus_execution_debit' if entry>0 else 'full_wing_width_margin')
+                if event[1]=='IRON_BUTTERFLY' else 'net_option_debit',
             stop=entry-distance,initial_stop=entry-distance,stop_distance=distance,target=entry+abs(entry)*self.c.target_pct/100,
             best=entry,net_pnl=None,exit_reason='',pending_exit='',paper=True)
+        if raw_snapshot:p.update(entry_raw_quote_snapshot=raw_snapshot,contract_identity_verified=False)
         if expiry_day:
             p.update(expiry_exit_session=assets[0].expiry,combined_entry_value=entry*qty,overnight=self.c.expiry_entry_mode=='btst')
         if self.c.strategy=='expiry_intraday':
@@ -90,19 +200,23 @@ class BasketPaperAccount(PaperAccount):
         return True
 
     def mark(self,tick):
+        self._ensure_valid_simulation()
         p=self.position
         if not p or not p.get('legs'): return super().mark(tick)
         quotes=self.fresh_legs(tick.received_time)
         if quotes is None: return None
+        self._validate_snapshot(p['side'],p['legs'],quotes,tick.received_time,'paper_mark')
         return sum(l['ratio']*(self.price(q,l['ratio']<0)-l['entry_price'])*p['quantity']-
             fees(self.c,l['entry_price'],self.price(q,l['ratio']<0),p['quantity']*abs(l['ratio']),stamp(tick.received_time)[:10],
                  1 if l['ratio']>0 else -1)['total_cost'] for l,q in zip(p['legs'],quotes))
 
     def close(self,tick,now,reason):
+        self._ensure_valid_simulation()
         p=self.position
         if not p or not p.get('legs'): return super().close(tick,now,reason)
         quotes=self.fresh_legs(now)
         if quotes is None: self.request_exit(reason); return
+        raw_snapshot=self._validate_snapshot(p['side'],p['legs'],quotes,now,'paper_close')
         costs={}; gross=raw_gross=0.
         for leg,q in zip(p['legs'],quotes):
             price=self.price(q,leg['ratio']<0); qty=p['quantity']*abs(leg['ratio'])
@@ -114,8 +228,10 @@ class BasketPaperAccount(PaperAccount):
             raw_gross+=leg['ratio']*(q.price-leg['raw_entry_price'])*p['quantity']
         net=gross-costs['total_cost']
         p.update(status='CLOSED',exit_time=stamp(now),exit_price=sum(l['ratio']*l['exit_price'] for l in p['legs']),
+                 raw_exit_price=sum(l['ratio']*l['raw_exit_price'] for l in p['legs']),
                  exit_reason=reason,pending_exit='',gross_pnl=gross,gross_before_slippage=raw_gross,
                  slippage_cost=raw_gross-gross,net_pnl=net,roi_pct=100*net/p['capital_allocated'],**costs)
+        if raw_snapshot:p['exit_raw_quote_snapshot']=raw_snapshot
         if p['side'] in ('EXPIRY_DAY','EXPIRY_INTRADAY'):
             ce=next(l for l in p['legs'] if l['side']=='CE');pe=next(l for l in p['legs'] if l['side']=='PE')
             p.update(combined_exit_value=p['exit_price']*p['quantity'],combined_return_pct=100*(p['exit_price']/p['entry_price']-1),
@@ -124,12 +240,15 @@ class BasketPaperAccount(PaperAccount):
         self.lock_if_needed(tick,now)
 
     def on_tick(self,tick,now):
+        self._ensure_valid_simulation()
         p=self.position
         if not p or not p.get('legs'): return super().on_tick(tick,now)
         leg=next((l for l in p['legs'] if Asset(**l['asset']).key==tick.key),None)
         if not leg or not tick.fresh(now) or tick.exchange_time<leg['last_epoch']: return
         leg['last_epoch']=tick.exchange_time; self.quotes[tick.key]=tick
-        if self.fresh_legs(now) is None: return
+        snapshot=self.fresh_legs(now)
+        if snapshot is None: return
+        self._validate_snapshot(p['side'],p['legs'],snapshot,now,'paper_on_tick')
         local=datetime.fromtimestamp(now,IST)
         if p['side']=='EXPIRY_DAY':
             date=local.date().isoformat();expiry=p['expiry_exit_session']
@@ -159,7 +278,7 @@ class BasketPaperAccount(PaperAccount):
         value=sum(l['ratio']*q.price for l,q in zip(p['legs'],self.fresh_legs(now)))
         reason=p['pending_exit'] or self.session(now)['lock']
         if not reason and value<=p['stop']: reason='trailing_stop' if p['stop']!=p['initial_stop'] else 'stop_loss'
-        if not reason and (p['side']=='IRON_BUTTERFLY' or self.c.exit_mode!='end_of_day') and value>=p['target']: reason='target'
+        if not reason and self.c.exit_mode!='end_of_day' and value>=p['target']: reason='target'
         if reason: self.close(tick,now,reason); return
         p['best']=max(p['best'],value)
         p['stop']=profit_lock(self.c,p['entry_price'],p['best'],p['stop'])
@@ -170,6 +289,7 @@ class BasketPaperAccount(PaperAccount):
         self.save()
 
     def heartbeat(self,now):
+        self._ensure_valid_simulation()
         p=self.position
         if not p or not p.get('legs'): return super().heartbeat(now)
         local=datetime.fromtimestamp(now,IST)

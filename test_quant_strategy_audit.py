@@ -42,17 +42,20 @@ class StrategyAuditTests(unittest.TestCase):
         self.assertEqual(marked[0][0],14.65)
         self.assertTrue(all(r[0]==r[3] for r in marked))
 
-    def test_butterfly_observed_decay_projects_wing_to_positive_feasible_price(self):
+    def test_inconsistent_observed_calibration_rejected_without_projecting_wing(self):
         legs=[dict(side=s,strike=k) for s,k in [('CE',100),('PE',100),('CE',150),('PE',50)]]
         rows=[(6,)*4+(100,),(60,)*4+(100,),(.05,)*4+(0,),(30,)*4+(100,)]
         day=dict(prices={900:(90,)*4+(0,)},rolling={('CE','ATM'):{900:50},('CE','ATM+1'):{900:100}},
                  options={(900,'CE',50):(60,)*4+(100,),(900,'CE',100):rows[0]})
         state={(0,2):(6.244,90,8.406),(1,3):(30,90,30)}
-        marked,_=bounded_spread_rows(day,900,'IRON_BUTTERFLY',legs,rows,
-            ['observed','observed','model_spread_wing_continuity','observed'],state)
-        self.assertEqual(marked[0],rows[0]);self.assertEqual(marked[1],rows[1]);self.assertEqual(marked[3],rows[3])
-        self.assertAlmostEqual(marked[2][0],.05)
-        self.assertTrue(0<=marked[0][0]+marked[1][0]-marked[2][0]-marked[3][0]<=50)
+        from quant_book import InvalidBasketObservation
+        with self.assertRaises(InvalidBasketObservation) as caught:
+            bounded_spread_rows(day,900,'IRON_BUTTERFLY',legs,rows,
+                ['observed','observed','model_spread_wing_continuity','observed'],state)
+        self.assertEqual(caught.exception.evidence['phase'],'continuity_calibration')
+        self.assertEqual(caught.exception.evidence['raw_basket_value'],54)
+        self.assertEqual(day['options'][900,'CE',50][0],60)
+        self.assertEqual(rows[0][0],6)
 
     def test_sigmoid_anchor_intrinsic_floor_direction_and_width(self):
         for direction in (-1,1):

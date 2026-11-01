@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import csv
+import io
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ from paper_feed import IST, Asset, Tick
 from quant_backtester import (Config, make_bars, adverse_tick, order_allocation, fees, HIGH_STRATEGIES,
                               RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE, research_events, research_indicators, minute)
 from quant_high_edge import high_edge_events
+from quant_publication import publication_lock, recover_publication, publish_files
 
 
 def stamp(epoch): return datetime.fromtimestamp(epoch,IST).isoformat(timespec='seconds')
@@ -44,6 +46,11 @@ class AccountLock:
                 fcntl.flock(self.file,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except OSError:
             self.file.close(); raise ValueError('This paper account is already running') from None
+        try:
+            recover_publication(self.path.parent,'paper')
+        except BaseException:
+            self.file.close()
+            raise
         return self
     def __exit__(self,*args): self.file.close()
 
@@ -149,8 +156,13 @@ class PaperAccount:
             policy.pop('momentum_lookback'); policy.pop('momentum_threshold')
         signature=hashlib.sha256(json.dumps(policy,sort_keys=True).encode()).hexdigest()
         path=self.root/'state.json'
-        if path.exists():
-            self.state=json.loads(path.read_text(encoding='utf-8'))
+        # Recovery is serialized even for API users constructing an account
+        # outside the runner's AccountLock. Never read a partially published pair.
+        with publication_lock(self.root,'paper'):
+            recover_publication(self.root,'paper',_locked=True)
+            loaded=json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+        if loaded is not None:
+            self.state=loaded
             if self.state.get('schema')!=1 or self.state.get('policy_hash')!=signature:
                 raise ValueError('Paper account settings differ; use the original settings or a new --output directory')
             if sum(t['status']=='OPEN' for t in self.state['trades'])>1: raise ValueError('Invalid paper state: multiple open positions')
@@ -171,18 +183,16 @@ class PaperAccount:
         date=stamp(now)[:10]
         return sum(t['net_pnl'] for t in self.state['trades'] if t['status']=='CLOSED' and t['exit_time'][:10]==date)
     def save(self):
-        atomic(self.root/'state.json',self.state)
         records=[]
         for t in self.state['trades']:
             records.append({k:v for k,v in t.items() if k not in ('asset',)})
         columns=['trade_id','instrument','strategy','security_id','expiry','status','side','entry_time','exit_time',
             'entry_price','exit_price','quantity','lots','capital_allocated','capital_reserved','stop','target','net_pnl','exit_reason']
         columns+=sorted(set().union(*(r.keys() for r in records))-set(columns)) if records else []
-        tmp=self.root/'ledger.csv.tmp'
-        with tmp.open('w',newline='',encoding='utf-8') as f:
-            writer=csv.DictWriter(f,fieldnames=columns); writer.writeheader(); writer.writerows(records)
-            f.flush(); os.fsync(f.fileno())
-        os.replace(tmp,self.root/'ledger.csv')
+        ledger=io.StringIO(newline='')
+        writer=csv.DictWriter(ledger,fieldnames=columns);writer.writeheader();writer.writerows(records)
+        state=json.dumps(self.state,indent=2,allow_nan=False).replace('\n',os.linesep).encode('utf-8')
+        publish_files(self.root,'paper',{'state.json':state,'ledger.csv':ledger.getvalue().encode('utf-8')})
     def price(self,tick,buy):
         depth=tick.ask if buy else tick.bid
         base=depth if depth is not None else tick.price

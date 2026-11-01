@@ -88,7 +88,10 @@ def writer_lock(root):
         else:
             import fcntl
             fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        try: yield
+        try:
+            from quant_publication import recover_publication
+            recover_publication(root,'lake')
+            yield
         finally:
             f.seek(0)
             if os.name=='nt': msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)
@@ -216,10 +219,8 @@ def normalize(data,meta,start,end,daily=False):
         rejected=pd.concat([conflicts,df[~good].assign(rejection_reason='outside_market_hours')],ignore_index=True)
         df=df[good].copy()
     else: rejected=conflicts
-    prices=df[['open','high','low','close']]
-    invalid=(prices.lt(0).any(axis=1) | df.volume.lt(0) |
-             df.high.lt(prices.max(axis=1)) | df.low.gt(prices.min(axis=1)))
-    if 'oi' in df: invalid |= df.oi.lt(0)
+    from quant_candle_rules import invalid_candles
+    invalid=invalid_candles(df,option_prices=bool(meta.get('option_type')))
     quality['invalid_ohlcv']=int(invalid.sum())
     rejected=pd.concat([rejected,
                         df[invalid].assign(rejection_reason='invalid_ohlcv')],ignore_index=True)
@@ -238,6 +239,8 @@ def normalize(data,meta,start,end,daily=False):
 
 class Builder:
     def __init__(self,root,start,end):
+        from quant_publication import assert_publication_ready
+        assert_publication_ready(root)
         self.root=root;self.start=start;self.end=end;self.api=API();self.failures=0;self.skipped=0
         self.path=root/'ingestion_manifest.json'
         self.manifest_lock=threading.Lock()
@@ -247,6 +250,11 @@ class Builder:
         self.manifest.update(requested_start=str(start),requested_end_exclusive=str(end))
 
     def chunk(self,dataset,meta,start,end,endpoint,payload):
+        from quant_publication import assert_publication_ready, publish_files
+        # Other option workers may currently be committing another partition;
+        # wait for the in-process publisher before testing the durable barrier.
+        with self.manifest_lock:
+            assert_publication_ready(self.root)
         expiry_end=pd.Timestamp(meta['contract_expiry']).date()+timedelta(days=1) if meta.get('contract_expiry') else None
         after_expiry=expiry_end is not None and start>=expiry_end
         if expiry_end and not after_expiry:
@@ -263,6 +271,7 @@ class Builder:
                 self.skipped+=1;return entry
         record=dict(dataset=dataset,instrument=meta['instrument'],start=str(start),end=str(end),
                     endpoint=endpoint,payload=payload,status='pending',checked_epoch=time.time())
+        files={}
         try:
             if after_expiry:raise CheckError('CONTRACT_EXPIRED')
             if dataset!='daily':
@@ -279,16 +288,17 @@ class Builder:
             if df.empty:
                 record['status']='empty';record['rows']=0
             else:
-                target.parent.mkdir(parents=True,exist_ok=True)
-                tmp=target.with_suffix('.tmp');df.to_parquet(tmp,index=False,compression='zstd');os.replace(tmp,target)
-                record.update(status='complete',path=target.relative_to(self.root).as_posix(),rows=len(df),
-                              sha256=digest(target),first=str(df.timestamp.min()),last=str(df.timestamp.max()))
+                relative=target.relative_to(self.root).as_posix()
+                files[relative]=df.to_parquet(index=False,compression='zstd')
+                record.update(status='complete',path=relative,rows=len(df),
+                              sha256=hashlib.sha256(files[relative]).hexdigest(),first=str(df.timestamp.min()),last=str(df.timestamp.max()))
             if not rejected.empty:
                 reject=self.root/'quarantine'/dataset/meta['instrument']/f'{start}.parquet'
-                reject.parent.mkdir(parents=True,exist_ok=True);rejected.to_parquet(reject,index=False)
                 record['quarantine_path']=reject.relative_to(self.root).as_posix()
+                files[record['quarantine_path']]=rejected.to_parquet(index=False)
             print(f"{record['status'].upper():8} {key} -> {end} | {len(df):,} rows",flush=True)
         except Exception as exc:
+            files={}
             # Never serialize raw HTTP exceptions, which can contain auth URLs.
             unavailable=isinstance(exc,CheckError) and exc.code in ('DH-907','CONTRACT_EXPIRED') and meta['exchange_segment']=='MCX_COMM'
             record.update(status='unavailable' if unavailable else 'failed',
@@ -298,8 +308,13 @@ class Builder:
             self.failures+=int(not unavailable)
             print(f"{record['status'].upper():8} {key} | {record['error']}",flush=True)
         with self.manifest_lock:
-            self.manifest['chunks'][key]=record
-            atomic_json(self.path,self.manifest)
+            # Do not mutate even the in-memory committed view until the exact
+            # partition/quarantine/manifest generation is verified and committed.
+            candidate=json.loads(json.dumps(self.manifest))
+            candidate['chunks'][key]=record
+            files['ingestion_manifest.json']=json.dumps(candidate,indent=2,default=str).replace('\n',os.linesep).encode('utf-8')
+            publish_files(self.root,'lake',files,final_writer=lambda path:atomic_json(path,candidate))
+            self.manifest=candidate
         return record
 
     def spot(self,meta,start=None):

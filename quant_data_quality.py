@@ -14,7 +14,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 IST = 'Asia/Kolkata'
-AUDIT_VERSION = '2.0'
+AUDIT_VERSION = '2.1'
 STATUSES = ('No data', 'Not checked', 'Audit outdated', 'Review needed', 'Checks passed')
 
 
@@ -91,6 +91,8 @@ def stream_identity(record):
 def inventory(root):
     """Footers/stat only; no full candle scans. Physical files are counted once."""
     root = Path(root)
+    from quant_publication import assert_publication_ready
+    publication_token = assert_publication_ready(root)
     manifest, error = read_document(root/'ingestion_manifest.json')
     issues = [finding(error, severity='Error', category='integrity')] if error else []
     manifest = manifest or {'chunks': {}}
@@ -150,9 +152,12 @@ def inventory(root):
         for field, func in [('first', min), ('last', max)]:
             values = list(filter(None, [group.get(field), stream[field]]))
             group[field] = func(values, key=pd.Timestamp) if values else None
-    return dict(root=str(root), manifest=manifest, manifest_fingerprint=fingerprint(manifest),
+    result = dict(root=str(root), manifest=manifest, manifest_fingerprint=fingerprint(manifest),
                 streams=streams, groups=list(groups.values()), records=records, findings=issues,
                 file_fingerprint=file_fingerprint(root, manifest))
+    if assert_publication_ready(root) != publication_token:
+        raise ValueError('Lake publication changed while reading inventory; reload verified evidence')
+    return result
 
 
 def file_fingerprint(root, manifest):
@@ -488,9 +493,8 @@ def run_quality_check(root, progress=None, *, _writer_locked=False):
                 exact = int(frame.duplicated().sum())
                 distinct = frame.drop_duplicates()
                 conflicts = int(distinct.timestamp.duplicated(keep=False).sum())
-                values = frame[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric, errors='coerce')
-                bad = ~np.isfinite(values).all(axis=1) | values.lt(0).any(axis=1) | values.high.lt(values[['open','close','low']].max(axis=1)) | values.low.gt(values[['open','close','high']].min(axis=1))
-                if 'oi' in frame: bad |= pd.to_numeric(frame.oi, errors='coerce').lt(0)
+                from quant_candle_rules import invalid_candles
+                bad = invalid_candles(frame,option_prices=stream['dataset'].startswith('options_'))
                 invalid = int(bad.sum())
                 for count, text in [(exact, 'Exact duplicates remain in stored candles'), (conflicts, 'Unresolved conflicting timestamp rows remain stored'), (invalid, 'Invalid stored OHLCV candles')]:
                     if count: add(text, 'Error', count, category='validity')

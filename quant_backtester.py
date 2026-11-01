@@ -25,7 +25,7 @@ from quant_high_edge import HIGH_STRATEGIES, high_edge_events
 from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
 from quant_data_quality import require_current_audit
 
-ENGINE_VERSION = '5.4.0'
+ENGINE_VERSION = '5.5.0'
 OUT = ROOT / 'backtests'
 LEGACY_STRATEGIES = ['EMA_Supertrend_VWAP_Directional', 'ORB_Option_Momentum_Breakout',
               'Dual_CE_PE_Straddle_Breakout', 'VWAP_Trend_Pullback_Buyer',
@@ -428,9 +428,25 @@ def research_events(data, c, date, confirm_volume=True):
 
 
 class ResearchData:
-    """One immutable snapshot per instrument; API credentials are never loaded."""
+    """Immutable execution snapshot with canonical, causal indicator context.
+
+    Non-expiry research loads all available earlier committed sessions, rather
+    than a request-relative rolling preload. Recursive indicators start at the
+    earliest contiguous eligible session of the same selected contract. Missing
+    expected sessions, ineligible dependencies and contract changes reset that
+    seed. ``days`` and ``available_days`` remain execution-window only; earlier
+    inputs and eligibility are retained separately, never as tradable dates.
+    Non-expiry research indicators consume only the inclusive validated
+    underlying window (indices through 15:20, futures through 23:15); stored
+    post-square-off tails cannot enter a later session's recursive seed.
+    Wilder/EMA minimum periods still apply after each reset. Extending history
+    backwards changes the canonical dataset and its fingerprint, not just seeds.
+    Expiry Day retains its separate existing dependency-session loading policy.
+    """
     def __init__(self, instrument, start='2025-01-01', end='2026-10-23', root=ROOT, expiry_config=None):
         self.instrument, self.start, self.end, self.root = instrument, start, end, Path(root)
+        from quant_publication import assert_publication_ready
+        assert_publication_ready(self.root)
         self.days, self.exclusions, self._features, self._events = {}, [], {}, {}
         self.eligibility = []
         report_path = self.root/'quality_report.json'
@@ -454,12 +470,15 @@ class ResearchData:
                      (ds == 'spot_1m' and (name.startswith(instrument+'_') if self.mcx else name == instrument)) or
                      (not self.mcx and ds == 'options_rolling_1m' and
                       name in {f'{instrument}_{side}_{strike}_WEEK1' for side in ('CE','PE') for strike in ('ATM','ATM-1','ATM+1')})}
-            records = [r for r in lake.manifest['chunks'].values() if r['status'] == 'complete'
+            candidates = [r for r in lake.manifest['chunks'].values() if r['status'] == 'complete'
                        and r['dataset'] in ('spot_1m', 'options_rolling_1m') and r['instrument'] in names
-                       and r['start'] < end and (self.mcx or r['end'] > load_start)]
+                       and r['start'] < end]
+            if not expiry_config:
+                load_start = min([start]+[r['start'] for r in candidates])
+            records = [r for r in candidates if self.mcx or r['end'] > load_start]
             verify_files(self.root, records)
             if self.mcx:
-                frames = [lake.query(name, start, end) for ds, name in lake.instruments()
+                frames = [lake.query(name, load_start, end) for ds, name in lake.instruments()
                           if ds == 'spot_1m' and name.startswith(instrument+'_')]
                 frames = [f for f in frames if not f.empty]
                 if not frames:
@@ -479,6 +498,8 @@ class ResearchData:
         if spot.empty:
             raise ValueError('No spot data in requested window')
         spot['date'] = spot.timestamp.dt.strftime('%Y-%m-%d')
+        if not expiry_config and not spot.date.between(start, end, inclusive='left').any():
+            raise ValueError('No spot data in requested window')
         if not opts.empty:
             opts['date'] = opts.timestamp.dt.strftime('%Y-%m-%d')
         entry_dates=set()
@@ -490,7 +511,8 @@ class ResearchData:
             if not opts.empty: opts=opts[opts.date.isin(needed)]
         option_days = dict(tuple(opts.groupby('date'))) if not opts.empty else {}
         self.available_days = (sorted(d for d in self.observed_sessions if start<=d<end) if expiry_config
-                               else sorted(spot.date.unique()))
+                               else sorted(d for d in spot.date.unique() if start<=d<end))
+        self.indicator_available_days = sorted(spot.date.unique())
         coverage_file = self.root/'session_coverage.parquet'
         flagged = set()
         if coverage_file.exists():
@@ -592,12 +614,87 @@ class ResearchData:
         current = require_current_audit(self.root)
         if any(current[k] != self.quality[k] for k in ('manifest_fingerprint','file_fingerprint','calendar_fingerprint')):
             raise ValueError('Lake evidence changed while loading. Run a local quality check and reload before backtesting.')
-        self.fingerprint = hashlib.sha256(self.fingerprint.encode()+json.dumps(self.eligibility, sort_keys=True).encode()).hexdigest()[:16]
+        all_eligibility = self.eligibility
+        self.warmup_eligibility = []
+        self.warmup_exclusions = []
+        self.indicator_days = {}
+        if not expiry_config:
+            # Keep only the frame needed for warm-up, not years of detached
+            # option quote dictionaries. Activity is synchronized and causal.
+            from quant_strategy_models import activity_frame
+            for date, day in self.days.items():
+                self.indicator_days[date] = dict(
+                    spot=day['spot'] if self.mcx else activity_frame(day),
+                    contract=day['contract'], activity_prepared=True)
+            self.days = {date:day for date,day in self.days.items() if start<=date<end}
+            self.warmup_eligibility = [row for row in all_eligibility if row['date']<start]
+            self.eligibility = [row for row in all_eligibility if start<=row['date']<end]
+            self.warmup_exclusions = [row for row in self.exclusions if row['date']<start]
+            self.exclusions = [row for row in self.exclusions if start<=row['date']<end]
+        else:
+            self.indicator_days = self.days
+        self.indicator_initialization = dict(
+            policy='expiry-day-existing-dependency-sessions' if expiry_config else 'canonical-validated-segment-v2',
+            load_start=load_start, end_exclusive=end,
+            indicator_window=None if expiry_config else list(self.required_windows['underlying']),
+            indicator_window_inclusive=not bool(expiry_config),
+            calendar_basis=('Conservative prior weekday plus observed special dates; absent a sourced MCX calendar, unobserved weekday closures may cause false breaks'
+                            if self.mcx else 'dated regular_session rules plus observed full-session special dates; market calendar identity remains unverified'),
+            minimum_history='Existing EMA/Wilder min_periods; no backfill, shortened seed, future input or forced signal',
+            sessions={})
+        for sessions in self._research_segments().values():
+            origin = sessions[0][0]
+            for count,(date,day) in enumerate(sessions,1):
+                self.indicator_initialization['sessions'][date] = dict(
+                    origin=origin, history_sessions=count, contract=day['contract'],
+                    role='execution' if date in self.days else 'warmup')
+        # Warm-up eligibility and manifest/report checksums are part of the
+        # identity even though pre-request dates can never execute a trade.
+        identity=dict(eligibility=all_eligibility, initialization=self.indicator_initialization)
+        self.fingerprint = hashlib.sha256(self.fingerprint.encode()+json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+
+    def _research_segments(self):
+        """Canonical eligible segments; never hop over an excluded/missing day."""
+        from quant_expiry import previous_session
+        groups = {}; segment=0; last_date=None; last_contract=None
+        days = getattr(self, 'indicator_days', self.days)
+        observed = getattr(self, 'indicator_available_days', getattr(self,'available_days',[]))
+        for date,day in sorted(days.items()):
+            contract = day['contract'] if self.mcx else self.instrument
+            if self.mcx:
+                # NSE daytime holidays do not establish MCX evening closures.
+                # Prefer a conservative reset on an unobserved weekday until a
+                # sourced, instrument-applicable calendar is supplied.
+                prior = pd.Timestamp(date)-pd.Timedelta(days=1)
+                while prior.weekday()>=5:
+                    prior-=pd.Timedelta(days=1)
+                expected = max([str(prior.date())]+[d for d in observed if str(prior.date())<d<date])
+            else:
+                expected = previous_session(date,observed)
+            if last_contract!=contract or last_date!=expected:
+                segment+=1
+            groups.setdefault((contract,segment), []).append((date,day))
+            last_date,last_contract=date,contract
+        return groups
 
     def features(self, timeframe):
         if timeframe not in self._features:
             self._features[timeframe] = {d: make_bars(day['spot'], timeframe) for d,day in self.days.items()}
         return self._features[timeframe]
+
+    def _validated_indicator_frame(self, frame):
+        """Clip canonical research inputs to the window actually validated.
+
+        This changes indicator dependencies only; original execution/evidence
+        frames and the stored lake remain untouched. Expiry Day keeps its
+        separate historical dependency-session feature behavior.
+        """
+        if getattr(self,'expiry_config',None) is not None:
+            return frame
+        window=getattr(self,'required_windows',required_windows(self.mcx))['underlying']
+        begin,finish=map(minute,window)
+        minutes=frame.timestamp.dt.hour*60+frame.timestamp.dt.minute
+        return frame.loc[minutes.between(begin,finish)]
 
     def research_features(self, timeframe):
         key = ('research', timeframe)
@@ -605,19 +702,15 @@ class ResearchData:
             # Carry causal indicator warm-up across sessions of the same contract.
             # VWAP still resets daily. Never join different MCX contracts.
             from quant_strategy_models import activity_frame
-            from quant_expiry import previous_session
-            groups = {};segment=0;last_date=None;last_contract=None
-            for date, day in sorted(self.days.items()):
-                contract = day['contract'] if self.mcx else self.instrument
-                if last_contract!=contract or last_date!=previous_session(date,getattr(self,'available_days',[])):segment+=1
-                groups.setdefault((contract,segment), []).append((date, day['spot'] if self.mcx else activity_frame(day)))
-                last_date,last_contract=date,contract
             result = {}
-            for sessions in groups.values():
-                bars = pd.concat([make_bars(f, timeframe) for _, f in sorted(sessions)], ignore_index=True)
+            for sessions in self._research_segments().values():
+                bars = pd.concat([make_bars(self._validated_indicator_frame(
+                                      day['spot'] if self.mcx or day.get('activity_prepared') else activity_frame(day)), timeframe)
+                                  for _,day in sessions], ignore_index=True)
                 bars = research_indicators(bars)
                 for date, frame in bars.groupby(bars.timestamp.dt.strftime('%Y-%m-%d')):
-                    result[date] = frame.reset_index(drop=True)
+                    if date in self.days:
+                        result[date] = frame.reset_index(drop=True)
             self._features[key] = result
         return self._features[key]
 
@@ -923,12 +1016,21 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         check_prepared_windows(data,c)
     if (data.instrument,data.start,data.end)!=(c.instrument,c.start,c.end):
         raise ValueError('Prepared data does not match configuration window')
-    if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
+    warmup_eligibility=getattr(data,'warmup_eligibility',[])
+    uses_canonical_indicators=c.strategy in RESEARCH_STRATEGIES+BOOK_STRATEGIES
+    initialization=getattr(data,'indicator_initialization',{})
+    origins=initialization.get('sessions',{})
+    active_segments={(v.get('origin'),v.get('contract')) for date,v in origins.items() if date in data.days}
+    used_warmup={date for date,v in origins.items() if (v.get('origin'),v.get('contract')) in active_segments}
+    warmup_repairs=[e for row in warmup_eligibility if row.get('status')=='eligible' and
+                    (not origins or row['date'] in used_warmup) for e in row.get('repaired_inputs',[])] if uses_canonical_indicators else []
+    execution_repairs=[e for d in data.days.values() for e in d.get('repaired_inputs',[])]
+    if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for e in execution_repairs+warmup_repairs):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
     identity_config=asdict(c)
     if c.strategy!='expiry_intraday':
         identity_config={k:v for k,v in identity_config.items() if not k.startswith('intraday_')}
-    revision='stateful-execution-v5' if c.strategy=='expiry_day' else 'explicit-exits-v6'
+    revision='stateful-execution-v5' if c.strategy=='expiry_day' else 'validated-window-baskets-v8'
     identity=json.dumps(dict(config=identity_config,engine=ENGINE_VERSION,pricing_revision=revision,data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
@@ -938,7 +1040,24 @@ def run_backtest(c, data=None, output=OUT, persist=True):
     began=time.perf_counter()
     from quant_portfolio import execute_portfolio
     daily_risk=[]
-    records,paths,skipped=execute_portfolio(data,c,run_id,daily_audit=daily_risk)
+    try:
+        records,paths,skipped=execute_portfolio(data,c,run_id,daily_audit=daily_risk)
+    except Exception as exc:
+        from quant_book import InvalidBasketObservation
+        if isinstance(exc,InvalidBasketObservation):
+            exc.run_id=run_id
+            if persist:
+                # Failed simulations never acquire a successful result marker or
+                # zero-P&L replacement trade. Preserve the offending raw marks.
+                target=path/'invalidated.json'
+                atomic_json(target,dict(run_id=run_id,status='invalidated_raw_basket_evidence',
+                    config=asdict(c),engine_version=ENGINE_VERSION,pricing_revision=revision,
+                    data_fingerprint=data.fingerprint,evidence=exc.evidence,
+                    eligibility=getattr(data,'eligibility',[]),warmup_eligibility=warmup_eligibility,
+                    indicator_initialization=getattr(data,'indicator_initialization',{}),
+                    net_pnl=None,metrics=None,market_matching='NOT VERIFIED'))
+                exc.invalidation_path=str(target)
+        raise
     trades=pd.DataFrame(records)
     if trades.empty:
         trades=pd.DataFrame(columns=['trade_id','date','side','strike','entry_strike','entry_time','exit_time','entry_price','exit_price','net_pnl','status','total_cost','expiry_day','used_modeled_prices','modeled_bars','verification_status'])
@@ -952,15 +1071,20 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         closed=trades[trades.status.eq('closed')]
         for col in ('side','expiry_day'):
             splits[col]=closed.groupby(col).agg(trades=('net_pnl','size'),net_pnl=('net_pnl','sum')).reset_index().to_dict('records')
-    result=dict(run_id=run_id,config=asdict(c),metrics=metrics,splits=splits,engine_version=ENGINE_VERSION,
+    result=dict(run_id=run_id,config=asdict(c),metrics=metrics,splits=splits,engine_version=ENGINE_VERSION,pricing_revision=revision,
                 data_fingerprint=data.fingerprint,eligible_sessions=len(data.days),excluded_sessions=len(data.exclusions),
                 eligibility=getattr(data,'eligibility',[]),
+                warmup_eligibility=warmup_eligibility,warmup_exclusions=getattr(data,'warmup_exclusions',[]),
+                indicator_initialization=getattr(data,'indicator_initialization',{}),
+                warmup_repaired_inputs=warmup_repairs,
+                warmup_context_used=uses_canonical_indicators,
+                indicator_warmup_dates_used=sorted(date for date in used_warmup if date not in data.days),
                 eligibility_scope='Run dependency windows, not whole-session historical health or verified options identity',
                 first_session=min(data.days,default=None),last_session=max(data.days,default=None),runtime_seconds=round(time.perf_counter()-began,3),
-                status='repaired_inputs' if any(d.get('repaired_inputs') for d in data.days.values()) else 'observed_candles_accounting_checked' if data.mcx else 'model_dependent' if metrics['modeled_trades'] else 'observed_strike_expiry_unverified',
-                repaired_inputs=[r for d in data.days.values() for r in d.get('repaired_inputs',[])],
+                status='repaired_inputs' if execution_repairs or warmup_repairs else 'observed_candles_accounting_checked' if data.mcx else 'model_dependent' if metrics['modeled_trades'] else 'observed_strike_expiry_unverified',
+                repaired_inputs=execution_repairs,
                 repair_disclosure='Zero-volume corrections and synthetic flat candles retain provenance; eligibility is not proof of observed prices or full historical coverage.',
-                verified_price_eligible=bool(data.mcx and not any(d.get('repaired_inputs') for d in data.days.values()) and metrics['unresolved_trades']==0 and len(trades)>0),
+                verified_price_eligible=bool(data.mcx and not execution_repairs and not warmup_repairs and metrics['unresolved_trades']==0 and len(trades)>0),
                 limitations=LIMITATIONS,expiry_calendar_available=data.has_calendar,
                 equity_basis='all entered trades closed; realized daily equity; modeled prices explicitly tagged',path=str(path.resolve()))
     underlying = pd.DataFrame()

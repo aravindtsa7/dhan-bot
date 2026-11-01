@@ -213,7 +213,8 @@ class BookTests(unittest.TestCase):
         day['rolling']['PE','ATM-1'][599]=80
         self.assertFalse(leg_specs(day,600,'IRON_BUTTERFLY',100))
         c,d,day=fixture();day['options'][600,'CE',110]=(7,7,7,7,100)
-        self.assertEqual(simulate_trade(d,c,DATE,(600,'BULL_CALL_SPREAD',100,None,1),'t'),(None,[]))
+        with self.assertRaisesRegex(MissingObservedPrice,'simulation invalidated'):
+            simulate_trade(d,c,DATE,(600,'BULL_CALL_SPREAD',100,None,1),'t')
 
     def test_outside_band_fallback_both_sides_no_iv_or_prior_needed(self):
         c,d,day=fixture()

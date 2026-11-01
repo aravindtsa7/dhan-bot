@@ -151,30 +151,24 @@ def discover_contracts(products, start):
 
 
 def _promote(root, stage, records, manifest):
-    """Rollback file promotions if the final manifest commit fails."""
+    """Recoverably publish files and manifest under the caller's writer lock."""
     from step2_build_data_lake import atomic_json
-    backup=stage/'backup';backup.mkdir(exist_ok=True);moves=[]
-    path=root/'ingestion_manifest.json';original=path.read_bytes() if path.exists() else None
-    try:
-        for record in records:
-            for field in ('path','quarantine_path'):
-                if not record.get(field):continue
-                target=safe_path(root,record[field]);source=safe_path(stage,record[field]);target.parent.mkdir(parents=True,exist_ok=True)
-                old=backup/str(len(moves))
-                if target.exists():shutil.copy2(target,old)
-                moves.append((target,old if old.exists() else None))
-                os.replace(source,target)
-        if original:
-            archive=root/'ingestion_history';archive.mkdir(exist_ok=True)
-            (archive/(hashlib.sha256(original).hexdigest()+'.json')).write_bytes(original)
-        atomic_json(path,manifest)
-    except Exception:
-        for target,old in reversed(moves):
-            if old:os.replace(old,target)
-            else:target.unlink(missing_ok=True)
-        if original is None:path.unlink(missing_ok=True)
-        else:path.write_bytes(original)
-        raise
+    from quant_publication import publish_files
+    root=Path(root);stage=Path(stage);files={}
+    for record in records:
+        for field in ('path','quarantine_path'):
+            if record.get(field):files[record[field]]=safe_path(stage,record[field])
+    path=root/'ingestion_manifest.json'
+    if path.exists():
+        original=path.read_bytes();archive=root/'ingestion_history';archive.mkdir(exist_ok=True)
+        archived=archive/(hashlib.sha256(original).hexdigest()+'.json')
+        if not archived.exists():
+            with archived.open('wb') as stream:
+                stream.write(original);stream.flush();os.fsync(stream.fileno())
+    # Match atomic_json's exact serialization, including platform text newlines.
+    payload=json.dumps(manifest,indent=2,default=str).replace('\n',os.linesep).encode('utf-8')
+    files['ingestion_manifest.json']=payload
+    return publish_files(root,'lake',files,final_writer=lambda target:atomic_json(target,manifest))
 
 
 def run_sync(root, selection, start=None, end=None, *, latest=False, skip=True, now=None, progress=None,

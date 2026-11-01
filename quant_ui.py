@@ -232,6 +232,13 @@ def configure_card():
         if instrument == 'BANKNIFTY':
             st.info('Spot data is available. BANKNIFTY option history and contract schedules must be added before simulation.')
         if submitted or saved:
+            if submitted:
+                # A new attempt supersedes the session result even if config
+                # validation or simulation rejects it. Historical saved runs
+                # remain available explicitly through Reports.
+                st.session_state.active_result = None
+                st.session_state.selected_run = None
+                st.session_state.pop('notice', None)
             try:
                 config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label,**expiry_settings)
                 if submitted:
@@ -412,7 +419,7 @@ if page not in ('Data Lake','Data Quality'):
     html('<div class="ticker-bar">'+''.join(tickers)+'<span class="ticker-pills"><i>DhanHQ</i><i>Parquet</i><i>IST</i><small>Historical close</small></span></div>')
 
 notice = st.session_state.pop('notice', None)
-if notice: st.success(notice)
+if notice and not st.session_state.get('run_backtest', False): st.success(notice)
 
 if search.strip():
     with st.container(border=True, key='search_results'):

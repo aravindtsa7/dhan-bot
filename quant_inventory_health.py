@@ -16,8 +16,8 @@ from quant_data_quality import (inventory, report_state, read_document, fingerpr
 from quant_run_data import required_windows, stream_check, rejected_evidence, select_contracts
 from quant_calendar import regular_session
 
-HEALTH_VERSION='2.0'
-REQUIRED_VERSION='1.2'  # Engine dependency measurements remain unchanged.
+HEALTH_VERSION='2.1'
+REQUIRED_VERSION='1.3'  # Positive underlying OHLC is required in dependency windows.
 ROW_LABELS=('NIFTY SPOT','NIFTY OPTIONS','SENSEX SPOT','SENSEX OPTIONS','BANKNIFTY SPOT','CRUDEOIL FUT','GOLDM FUT','NATURALGAS FUT')
 
 

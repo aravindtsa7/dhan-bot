@@ -84,7 +84,7 @@ class SpreadBoundTests(unittest.TestCase):
             simulate_trade(data,replace(c,price_policy='strict_observed'),DATE,(600,'BULL_CALL_SPREAD',base,None,1),'strict')
 
     def test_observed_prices_and_non_spread_baskets_are_unchanged(self):
-        rows=[(123,125,120,122,1),(1,2,.5,1,1)]
+        rows=[(23,25,20,22,1),(1,2,.5,1,1)]
         legs=[dict(side='CE',strike=24650,ratio=1),dict(side='CE',strike=24700,ratio=-1)]
         for side,sources in [('BULL_CALL_SPREAD',['observed']*2),('STRAP',['model_intrinsic_wing_fallback']*2),
                              ('EXPIRY_DAY',['model_intrinsic_wing_fallback']*2)]:

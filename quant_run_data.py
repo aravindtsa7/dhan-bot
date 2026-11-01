@@ -9,8 +9,9 @@ from quant_lake import IST
 
 
 def required_windows(mcx):
-    # Indicators are reset daily, but EMA/ATR/ADX/VWAP consume the morning
-    # history, including MCX's morning candles before the evening setup.
+    # Legacy indicators reset daily; public recursive indicators carry canonical
+    # eligible predecessor context. Each session still requires its whole
+    # dependency window, including MCX morning candles before evening setups.
     # Keep the loader's six option streams: fixed-strike confirmation and the
     # continuity model can use either side and neighboring ATM offsets.
     return dict(underlying=['09:00', '23:15'] if mcx else ['09:15', '15:20'],
@@ -94,13 +95,10 @@ def stream_check(frame, date, stream, window, legacy_flag=False):
     if len(frame):
         minutes = frame.timestamp.dt.hour*60+frame.timestamp.dt.minute
         required = frame[minutes.between(begin, finish)]
-        values = required[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric, errors='coerce')
-        bad = ~np.isfinite(values).all(axis=1) | values.lt(0).any(axis=1)
-        bad |= values.high.lt(values[['open','close','low']].max(axis=1)) | values.low.gt(values[['open','close','high']].min(axis=1))
-        for field in ('oi', 'iv', 'spot', 'strike'):
-            if field in required:
-                numeric = pd.to_numeric(required[field], errors='coerce')
-                bad |= ~np.isfinite(numeric) | numeric.lt(0)
+        from quant_candle_rules import invalid_candles
+        option_prices=('_CE_' in stream or '_PE_' in stream or
+                       ('option_type' in required and required.option_type.isin(['CE','PE']).any()))
+        bad = invalid_candles(required,option_prices=option_prices)
         if bad.any():
             reasons.append(dict(problem='Invalid required candles', stream=stream, count=int(bad.sum()),
                                 timestamps=[t.isoformat() for t in required.loc[bad, 'timestamp']]))

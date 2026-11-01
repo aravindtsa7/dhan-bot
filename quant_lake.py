@@ -6,6 +6,7 @@ import duckdb
 import pandas as pd
 import pyarrow.parquet as pq
 from quant_calendar import expiries
+from quant_publication import lake_consistent_read
 
 IST = 'Asia/Kolkata'
 ROOT = Path(__file__).resolve().parent / 'data_lake'
@@ -17,14 +18,17 @@ class QuantDataLake:
         self.db.execute("SET TimeZone='Asia/Kolkata'")
         self.refresh()
 
+    @lake_consistent_read
     def refresh(self):
         p = self.root / 'ingestion_manifest.json'
         self.manifest = json.loads(p.read_text()) if p.exists() else {'chunks': {}}
 
+    @lake_consistent_read
     def instruments(self):
         return sorted({(v['dataset'], v['instrument']) for v in self.manifest['chunks'].values()
                        if v['status'] == 'complete'})
 
+    @lake_consistent_read
     def catalog(self):
         """UI metadata, including requested instruments with no available bars."""
         groups={}
@@ -37,6 +41,7 @@ class QuantDataLake:
             if field in item:item[field]+=1
         return list(groups.values())
 
+    @lake_consistent_read
     def query(self, instrument, start='2025-01-01', end=None, timeframe='1m',
               dataset='spot_1m', csv=None):
         if timeframe not in ('1m','3m','5m','15m','1d'):
@@ -105,6 +110,7 @@ class QuantDataLake:
         defaults = ''.join(f', {value} AS {name}' for name, value in optional.items() if name not in names)
         return f'SELECT *, {expiry} AS expiry_date{defaults} FROM read_parquet(?, union_by_name=true)'
 
+    @lake_consistent_read
     def option_sessions(self, instrument, start='2025-01-01', end='2026-11-01'):
         """Observed trading dates and expiry identities, never calendar-inferred."""
         files = self._option_files(instrument, start, end)
@@ -117,6 +123,7 @@ class QuantDataLake:
                   ORDER BY 1, 2, 3, 4'''
         return self.db.sql(sql, params=[files, str(start), str(end)]).to_arrow_table().to_pandas()
 
+    @lake_consistent_read
     def option_minutes(self, instrument, trading_date, expiry_flag='WEEK', expiry_code=1,
                        expiry_date=None):
         """Observed numeric strikes across all ATM streams for one session/expiry.
@@ -145,6 +152,7 @@ class QuantDataLake:
         frame.loc[frame.quote_conflict, list(fields)] = float('nan')
         return frame
 
+    @lake_consistent_read
     def weekly_option_sessions(self, instrument, start='2025-01-01', end='2026-11-01'):
         """Resolve weekly groups, keeping recorded and calendar-derived dates separate.
 
@@ -179,6 +187,7 @@ class QuantDataLake:
         return pd.DataFrame(rows, columns=['trading_date', 'expiry_flag', 'expiry_code',
                                            'source_expiry', 'expiry_date', 'expiry_basis'])
 
+    @lake_consistent_read
     def option_expiries(self, instrument, start='2025-01-01', end='2026-11-01'):
         """Expiry choices with actual coverage and an explicit identity basis."""
         sessions = self.weekly_option_sessions(instrument, start, end)
@@ -188,6 +197,7 @@ class QuantDataLake:
                 .agg(first_session=('trading_date', 'min'), last_session=('trading_date', 'max'),
                      sessions=('trading_date', 'nunique')).sort_values(['expiry_date', 'expiry_basis']))
 
+    @lake_consistent_read
     def option_history(self, instrument, expiry_date, start, end, expiry_basis='recorded',
                        strike=None, option_type=None):
         """All observed strikes for one dated weekly group, across sessions.

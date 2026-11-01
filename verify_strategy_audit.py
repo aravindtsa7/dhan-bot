@@ -9,6 +9,45 @@ from quant_backtester import Config, ResearchData, STRATEGIES, run_backtest, ato
 from quant_terminal import strategy_defaults
 
 
+def validate_basket_evidence(trade, paths):
+    """Audit raw synchronized marks, independently of modeled/bounded flags.
+
+    Raw structural bounds deliberately exclude adverse execution prices and
+    fees. Old path schemas fall back to their pre-execution open/close marks.
+    No assertion verifies same-expiry identity from rolling strike labels.
+    """
+    from quant_book import validate_raw_basket_rows, RAW_BASKET_TOLERANCE
+    legs=json.loads(trade.legs)
+    side=trade.side
+    if side not in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY'):
+        return
+    width=abs(legs[0]['strike']-legs[2 if side=='IRON_BUTTERFLY' else 1]['strike'])
+    low,high=(-width,0.) if side=='IRON_BUTTERFLY' else (0.,width)
+    for phase in ('entry','exit'):
+        rows=[(leg[f'raw_{phase}_price'],)*4+(0,) for leg in legs]
+        sources=[leg.get(f'{phase}_price_source','observed') for leg in legs]
+        # The bounded/model mark itself is checked below even when it has no
+        # raw observed counterpart.
+        validate_raw_basket_rows(dict(timestamp=str(getattr(trade,f'{phase}_time'))),0,
+            side,legs,rows,sources,open_only=True,
+            context=dict(trade_id=trade.trade_id,phase=f'audit_{phase}'))
+    selected=paths[paths.trade_id.eq(trade.trade_id)]
+    assert len(selected)>0, 'Missing basket path evidence'
+    for row in selected.to_dict('records'):
+        for field in ('open','high','low','close','mark'):
+            # These are raw/model mark values, not execution fill prices.
+            assert low-RAW_BASKET_TOLERANCE<=float(row[field])<=high+RAW_BASKET_TOLERANCE, (trade.trade_id,row['timestamp'],field,row[field])
+        for field in ('raw_open','raw_close'):
+            if field in row and pd.notna(row[field]):
+                assert low-RAW_BASKET_TOLERANCE<=float(row[field])<=high+RAW_BASKET_TOLERANCE, (trade.trade_id,row['timestamp'],field,row[field])
+        if pd.notna(row.get('raw_legs')):
+            raw=json.loads(row['raw_legs'])
+            sources=[leg['price_source'] for leg in raw]
+            rows=[(leg['raw_open'] or 0,0,0,leg['raw_close'] or 0,0) for leg in raw]
+            validate_raw_basket_rows(dict(timestamp=str(row['timestamp'])),0,side,
+                raw,rows,sources,context=dict(trade_id=trade.trade_id,phase='audit_path'))
+
+
 def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES):
     output=Path(output);output.mkdir(parents=True,exist_ok=True);rows=[]
     summary=output/f'{instrument}_summary.csv'
@@ -50,10 +89,7 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
                                     legs=json.loads(trade.legs)
                                     assert abs(sum(l['total_cost'] for l in legs)-trade.total_cost)<1e-6
                                     if trade.side in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY'):
-                                        width=abs(legs[0]['strike']-legs[2 if trade.side=='IRON_BUTTERFLY' else 1]['strike'])
-                                        low,high=(-width,0) if trade.side=='IRON_BUTTERFLY' else (.05,width-.05)
-                                        modeled=paths[paths.trade_id.eq(trade.trade_id) & paths.spread_bounds_applied]
-                                        for field in ('open','high','low','close','mark'):assert modeled[field].between(low-1e-7,high+1e-7).all()
+                                        validate_basket_evidence(trade,paths)
                         assert result['metrics']['unresolved_trades']==0
                         row.update(status=result['status'],first_session=result['first_session'],last_session=result['last_session'],**result['metrics'])
                         name=f'{instrument}_{window}_{tf}_{strategy}'
@@ -62,7 +98,10 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
                         trades.to_parquet(output/f'{name}_trades.parquet',index=False)
                     except Exception as exc:
                         row.update(status='FAILED',reason=f'{type(exc).__name__}: {exc}')
-                        atomic_json(output/f'{instrument}_{window}_{tf}_{strategy}_failure.json',dict(row,config=asdict(c)))
+                        evidence=getattr(exc,'evidence',None)
+                        if evidence:row['simulation_invalidated']=bool(evidence.get('simulation_invalidated'))
+                        atomic_json(output/f'{instrument}_{window}_{tf}_{strategy}_failure.json',
+                            dict(row,config=asdict(c),invalidation_evidence=evidence))
                 rows.append(row)
                 pd.DataFrame(rows).to_csv(output/f'{instrument}_summary.csv',index=False)
                 print(json.dumps(row,default=str),flush=True)

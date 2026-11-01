@@ -142,7 +142,7 @@ class RepairTests(unittest.TestCase):
         data=ResearchData('NIFTY','2025-09-02','2025-09-03',self.root)
         result=run_backtest(Config(instrument='NIFTY',strategy=STRATEGIES[0],start='2025-09-02',end='2025-09-03'),data,persist=False)
         self.assertEqual(result['status'],'repaired_inputs');self.assertFalse(result['verified_price_eligible']);self.assertEqual(len(result['repaired_inputs']),1)
-        self.assertEqual(ENGINE_VERSION,'5.4.0')
+        self.assertEqual(ENGINE_VERSION,'5.5.0')
         config=Config(instrument='NIFTY',strategy=STRATEGIES[0],start='2025-09-02',end='2025-09-03')
         with self.assertRaisesRegex(MissingObservedPrice,'synthetic repaired inputs'):
             run_backtest(replace(config,price_policy='strict_observed'),data,persist=False)

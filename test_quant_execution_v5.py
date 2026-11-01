@@ -100,17 +100,17 @@ class ExecutionV5Tests(unittest.TestCase):
         self.assertEqual(profit_lock(c,100,123,110),115)
         self.assertEqual(profit_lock(replace(c,exit_mode='end_of_day'),100,123,80),80)
 
-    def test_four_observed_width_spikes_are_tagged_and_bounded(self):
+    def test_observed_width_spikes_reject_without_changing_raw_quotes(self):
+        from quant_option_model import MissingObservedPrice
         for width,noise,option in [(50,.30,'PE'),(50,.05,'PE'),(100,.75,'PE'),(100,.80,'CE'),(100,1.30,'PE')]:
             legs=[dict(side=s,strike=k) for s,k in [('CE',1000),('PE',1000),('CE',1000+width),('PE',1000-width)]]
             rows=[(10,)*4+(1,)]*4
             h=0 if option=='CE' else 1
             rows[h]=(10+width+noise,)*4+(1,)
             sources=['observed']*4
-            corrected,bounded=bounded_spread_rows(dict(prices={915:(1000,)*4+(0,)}),915,'IRON_BUTTERFLY',legs,rows,sources,{})
-            self.assertTrue(bounded)
-            self.assertAlmostEqual(corrected[h][0]-corrected[h+2][0],width-.05)
-            self.assertEqual(sources[h+2],'model_observed_spread_projection')
+            with self.assertRaises(MissingObservedPrice):
+                bounded_spread_rows(dict(prices={915:(1000,)*4+(0,)}),915,'IRON_BUTTERFLY',legs,rows,sources,{})
+            self.assertEqual(sources,['observed']*4)
             self.assertEqual(rows[h+2][0],10)  # stored quotes remain untouched
 
     def test_strategy_defaults_and_explicit_ui_overrides(self):
@@ -145,20 +145,15 @@ class ExecutionV5Tests(unittest.TestCase):
                 self.assertAlmostEqual(account.position['stop'],path[1]['stop'])
                 self.assertEqual(account.position['entry_atr'],2)
 
-    def test_quote_projection_is_disclosed_and_strict_policy_rejects_it(self):
+    def test_both_policies_reject_observed_quote_noise_without_projection(self):
         from test_quant_book import fixture, DATE
         from quant_option_model import MissingObservedPrice
         c,data,day=fixture(at=919)
         day['options'][920,'CE',100]=(12.05,)*4+(100,)
-        trade,path=simulate_trade(data,c,DATE,(919,'BULL_CALL_SPREAD',100,None,1),'noise')
-        self.assertAlmostEqual(trade['raw_exit_price'],9.95)
-        self.assertTrue(trade['spread_bounds_applied'])
-        self.assertTrue(path[-1]['spread_bounds_applied'])
-        leg=json.loads(trade['legs'])[1]
-        self.assertEqual(leg['exit_price_source'],'model_observed_spread_projection')
-        self.assertEqual(leg['last_projection_observed_open'],2)
-        with self.assertRaisesRegex(MissingObservedPrice,'quote-noise projection'):
-            simulate_trade(data,replace(c,price_policy='strict_observed'),DATE,(919,'BULL_CALL_SPREAD',100,None,1),'strict')
+        for policy in ('model_continuity','strict_observed'):
+            with self.subTest(policy=policy),self.assertRaisesRegex(MissingObservedPrice,'simulation invalidated'):
+                simulate_trade(data,replace(c,price_policy=policy),DATE,(919,'BULL_CALL_SPREAD',100,None,1),'noise')
+        self.assertEqual(day['options'][920,'CE',100][0],12.05)
 
     def test_entire_repaired_band_retains_prior_curve_without_calibrating_to_repairs(self):
         from test_quant_spread_continuity import sample
