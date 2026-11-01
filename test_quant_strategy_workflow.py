@@ -43,8 +43,9 @@ def signal_fixture(c, bearish=False):
             rsi=60.,trend=1,supertrend=90.,vwap=99.,vwap_proxy=False))
     bars=pd.DataFrame(rows)
     bars.loc[len(bars)-1,['open','high','low','close','volume']]=[100,112,99,110,200]
+    bars.loc[len(bars)-1,['adx','ema50']]=[31,97]
     if bearish:
-        bars.loc[len(bars)-1,['high','low','close','ema9','ema21','ema50','vwap','rsi','trend']]=[101,88,90,98,100,100,99,30,-1]
+        bars.loc[len(bars)-1,['high','low','close','ema9','ema21','ema50','vwap','rsi','trend']]=[101,88,90,98,100,101,99,30,-1]
         bars.loc[len(bars)-2,'trend']=-1
     day=dict(timestamp=stamp,contract='FIXED_TEST',
         prices={t:(100,105,95,100,100) for t in range(opening,1396 if mcx else 921)},
@@ -56,6 +57,7 @@ def signal_fixture(c, bearish=False):
         # Fixed contract, real costs and next-open fills exercised below.
         return (100,125,99,110,200 if at-n<=t<at else 100)
     data.price=price
+    day['options']={(t,s,24000):price(day,t,s,24000) for s in ('CE','PE') for t in range(opening,921)}
     data.events=lambda c,date:research_events(data,c,date)
     return data,bars,at
 
@@ -102,17 +104,17 @@ class StrategyTests(unittest.TestCase):
         bars['timestamp']-=pd.Timedelta(hours=4)
         self.assertFalse(research_events(data,c,DATE))
 
-    def test_zero_spot_volume_requires_observed_fixed_strike_history(self):
+    def test_zero_spot_volume_requires_observed_rolling_atm_activity(self):
         c=config(strategy='orb_volume_breakout')
         data,bars,at=signal_fixture(c)
         bars['volume']=0;bars['vwap_proxy']=True
         self.assertTrue(research_events(data,c,DATE))
         evidence=data.days[DATE]['signal_evidence'][c.strategy,c.timeframe,at,'CE',24000]
-        self.assertEqual(evidence['signal_volume_basis'],'fixed_strike_option')
-        original=data.price
-        data.price=lambda d,t,s,k: None if t==at-11*5 else original(d,t,s,k)
+        self.assertEqual(evidence['signal_volume_basis'],'rolling_atm_ce_pe')
+        day=data.days[DATE];original=dict(day['options'])
+        del day['options'][at-11*5,'CE',24000]
         self.assertFalse(research_events(data,c,DATE))
-        data.price=lambda d,t,s,k:(100,125,99,110,100)
+        day['options']={key:(100,125,99,110,100) for key in original}
         self.assertFalse(research_events(data,c,DATE))
 
     def test_causal_indicators_known_wilder_seed_and_no_future_leak(self):

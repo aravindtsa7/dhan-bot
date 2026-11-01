@@ -6,7 +6,8 @@ import math
 import pandas as pd
 
 from quant_calendar import expiries, regular_session
-from quant_option_model import MissingObservedPrice, continuation_candle
+from quant_option_model import MissingObservedPrice, continuation_candle, intrinsic
+from quant_strategy_models import basket_slippage
 
 LABEL = 'EXPIRY DAY (CE+PE)'
 
@@ -152,7 +153,7 @@ def expiry_steps(data,c,date,event,trade_id,budget=None,entry_equity=None,exit_d
     for leg in legs:
         quote=data.price(day,at,leg['side'],leg['strike'])
         if quote is None or quote[0]<=0 or quote[0]<c.minimum_premium: return None,[]
-        leg.update(raw_entry_price=quote[0],entry_price=adverse_tick(quote[0]+c.slippage,c,True),
+        leg.update(raw_entry_price=quote[0],entry_price=adverse_tick(quote[0]+basket_slippage(c,quote[0]),c,True),
                    previous=data.price(day,at-1,leg['side'],leg['strike']),modeled_bars=0,
                    modeled_wing_fallback=False,exit_price_source='observed')
     budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
@@ -178,6 +179,17 @@ def expiry_steps(data,c,date,event,trade_id,budget=None,entry_equity=None,exit_d
                 if c.price_policy=='strict_observed': raise MissingObservedPrice(f'{session} {current}: unpriceable fixed-strike Expiry Day {leg["side"]} {leg["strike"]}')
                 row,meta=continuation_candle(data,current_day,current,leg['side'],leg['strike'],leg['previous'])
                 source=meta['price_source']; modeled=True; wing=meta.get('modeled_wing_fallback',False)
+                if wing and session==exit_date:
+                    fraction=max(0.,(930-current)/375)
+                    spot=current_day['prices'][current]
+                    values=[]
+                    for field in range(4):
+                        sf=field if field in (0,3) or leg['side']=='CE' else 3-field
+                        value=intrinsic(spot[sf],leg['strike'],leg['side'])
+                        values.append(max(.05,value+max(0.,row[field]-value)*fraction))
+                    row=(values[0],max(values),min(values),values[3],0)
+                    source='model_intrinsic_wing_expiry_decay'
+
             leg.update(previous=row,exit_price_source=source)
             leg['modeled_bars']+=int(modeled);leg['modeled_wing_fallback'] |= wing
             rows.append(row);sources.append(source)
@@ -191,7 +203,7 @@ def expiry_steps(data,c,date,event,trade_id,budget=None,entry_equity=None,exit_d
             candle_basis='synchronized_open_close_envelope'))
         if force or (session==exit_date and current==finish):
             reason=force or 'square_off';exit_at=current;closed_date=session
-            for leg,row in zip(legs,rows): leg.update(raw_exit_price=row[0],exit_price=adverse_tick(row[0]-c.slippage,c,False))
+            for leg,row in zip(legs,rows): leg.update(raw_exit_price=row[0],exit_price=adverse_tick(row[0]-basket_slippage(c,row[0]),c,False))
             break
         if session==exit_date:
             # Never inspect a leg's own return, high, low, stop, or target.
@@ -201,7 +213,7 @@ def expiry_steps(data,c,date,event,trade_id,budget=None,entry_equity=None,exit_d
             if c.exit_mode in ('legacy','trailing_sl') and c.trail_pct>0:
                 jump=entry*c.trail_jump_pct/100; steps=math.floor(max(0,best-entry)/jump+1e-10)
                 if steps: stop=max(stop,entry*(1-c.trail_pct/100)+steps*jump)
-        liquidation=[adverse_tick(r[3]-c.slippage,c,False) for r in rows]
+        liquidation=[adverse_tick(r[3]-basket_slippage(c,r[3]),c,False) for r in rows]
         mtm=sum((p-l['entry_price'])*qty-fees(c,l['entry_price'],p,qty,session)['total_cost'] for l,p in zip(legs,liquidation))
         daily_force=yield dict(date=session,minute=current,net_mtm=mtm,reserved_capital=allocated+reserve)
         if daily_force: force=daily_force

@@ -214,8 +214,11 @@ class PaperAccount:
         signal_key=f'{date}:{self.asset.key}:{event[0]}'
         if self.session(now)['lock'] or signal_key in self.state['seen_signals']: return False
         count=sum(t['entry_time'][:10]==date for t in self.state['trades'])
-        cap=1 if self.c.strategy==HIGH_STRATEGIES[3] else self.c.max_trades_day
+        cap=1 if self.c.strategy in (HIGH_STRATEGIES[3],'mcx_evening_breakout') else self.c.max_trades_day
         if count>=cap: return False
+        today=[t for t in self.state['trades'] if t['entry_time'][:10]==date]
+        if self.c.strategy in ('vwap_ema_pullback','book_vertical_spread') and today and today[-1]['exit_reason'] in ('stop_loss','trailing_stop'):
+            if now-datetime.fromisoformat(today[-1]['exit_time']).timestamp()<3*int(self.c.timeframe[:-1])*60:return False
         self.state['seen_signals'].append(signal_key)
         side=event[1]; direction=-1 if side=='SHORT' else 1
         entry=self.price(tick,direction==1)

@@ -27,17 +27,23 @@ BASE=Path(__file__).resolve().parent
 
 
 def book_activity_confirmed(rows,c,event,now):
-    """Same fixed-contract activity filter as historical book signals."""
+    """Live resolved-contract activity check; historical lake uses rolling ATM.
+
+    Broker warmup supplies one resolved contract, not a historical ATM chain.
+    Keep this limitation explicit instead of inventing rolling chain activity.
+    """
     import pandas as pd
     from types import SimpleNamespace
     from quant_book import activity
     local=datetime.fromtimestamp(now,IST)
     candles={int((datetime.fromtimestamp(r['timestamp'],IST)-local.replace(hour=0,minute=0,second=0,microsecond=0)).total_seconds()/60):r
              for r in rows if datetime.fromtimestamp(r['timestamp'],IST).date()==local.date()}
-    day={'option_meta':{(k,'CE',0):(r.get('oi',float('nan')),) for k,r in candles.items()}}
+    day={'option_meta':{(k,'CE',0):(r.get('oi',float('nan')),) for k,r in candles.items()},
+         'rolling':{('CE','ATM'):{k:0 for k in candles}},
+         'options':{(k,'CE',0):tuple(r[v] for v in ('open','high','low','close','volume')) for k,r in candles.items()}}
     data=SimpleNamespace(mcx=False,price=lambda d,k,s,strike:tuple(candles[k][v] for v in ('open','high','low','close','volume')) if k in candles else None)
     a=activity(data,day,pd.DataFrame({'volume':[0]*(c.momentum_lookback+1)}),c.momentum_lookback,event[0],'CE',0,c)
-    return bool(a and a['signal_log_volume']>=math.log(c.volume_multiple) and
+    return bool(a and a['signal_log_volume']>math.log(max(1.4,c.volume_multiple) if c.strategy=='book_strap_strip' else c.volume_multiple) and
                 (c.strategy!='book_vol_oi_momentum' or not a['signal_oi_available'] or a['signal_log_oi']>0))
 
 

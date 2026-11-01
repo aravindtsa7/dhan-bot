@@ -124,13 +124,13 @@ class BookTests(unittest.TestCase):
     def test_short_leg_stt_is_on_entry_sale_and_slippage_on_every_leg(self):
         c,d,_=fixture();c=replace(c,lot_size=1000,slippage=.5)
         t,_=simulate_trade(d,c,DATE,(600,'BULL_CALL_SPREAD',100,None,1),'t')
-        # Buy 6.50, sell 5.50; short 1.50, cover 2.50. Two contracts,
+        # Buy 6.10, sell 5.90; short 1.95, cover 2.05. Two contracts,
         # 4 orders; STT after 2026-04-01 is rounded per sell at 0.15%.
         self.assertEqual(t['gross_before_slippage'],0)
-        self.assertEqual(t['gross_pnl'],-2000)
-        self.assertEqual(t['slippage_cost'],2000)
+        self.assertAlmostEqual(t['gross_pnl'],-300)
+        self.assertAlmostEqual(t['slippage_cost'],300)
         self.assertEqual(t['brokerage'],80)
-        self.assertEqual(t['stt_ctt'],10)
+        self.assertEqual(t['stt_ctt'],12)
 
     def test_basket_out_of_band_leg_fallback_and_strict_policy(self):
         c,d,day=fixture()
@@ -146,8 +146,8 @@ class BookTests(unittest.TestCase):
         self.assertFalse(legs[1]['modeled_wing_fallback'])
         with self.assertRaises(MissingObservedPrice): simulate_trade(d,replace(c,price_policy='strict_observed'),DATE,(600,'BULL_CALL_SPREAD',100,None,1),'t')
 
-    def test_credit_reserves_max_loss_and_debit_reserves_net_premium(self):
-        for strategy,side,expected in [('book_vertical_spread','BULL_CALL_SPREAD',40),('book_iron_butterfly','IRON_BUTTERFLY',20)]:
+    def test_credit_reserves_full_width_and_debit_reserves_net_premium(self):
+        for strategy,side,expected in [('book_vertical_spread','BULL_CALL_SPREAD',40),('book_iron_butterfly','IRON_BUTTERFLY',100)]:
             c,d,_=fixture(strategy,side)
             t,_=simulate_trade(d,c,DATE,(600,side,100,None,1),'t')
             self.assertEqual(t['capital_allocated'],expected)
@@ -206,7 +206,7 @@ class BookTests(unittest.TestCase):
         for mapping in day['rolling'].values(): mapping.update({k:999 for k in range(600,921)})
         t,_=simulate_trade(d,c,DATE,(600,'BULL_CALL_SPREAD',100,None,1),'t')
         self.assertEqual([l['strike'] for l in json.loads(t['legs'])],[100,110])
-        self.assertAlmostEqual(t['slippage_cost'],20)
+        self.assertAlmostEqual(t['slippage_cost'],3)
 
     def test_invalid_width_or_credit_rejected(self):
         c,d,day=fixture('book_iron_butterfly','IRON_BUTTERFLY')
@@ -260,16 +260,19 @@ class BookTests(unittest.TestCase):
 
     def test_vertical_and_sideways_signals_and_causal_next_open(self):
         c,d,day=fixture()
-        bars=pd.DataFrame([dict(timestamp=day['timestamp']+pd.Timedelta(minutes=595),close=101,vwap=100,
-                               ema9=101,ema21=100,adx=18,atr=1,atr14=1)])
+        bars=pd.DataFrame([dict(timestamp=day['timestamp']+pd.Timedelta(minutes=t),open=100,high=100.5,low=99.5,close=100,vwap=100,
+                               ema9=100,ema21=99,adx=18,atr=1,atr14=1) for t in (645,650)])
+        bars.loc[1,['close','ema9','adx']]=[101,101,19]
+        for t in range(650,655):
+            for s in ('CE','PE'):day['options'][t,s,100]=(6,6,6,6,300)
         d.features=lambda tf:{DATE:bars}
-        self.assertEqual(research_events(d,c,DATE)[0][:2],(600,'BULL_CALL_SPREAD'))
-        bars.loc[0,['close','ema9']]=[99,99]
+        self.assertEqual(research_events(d,c,DATE)[0][:2],(655,'BULL_CALL_SPREAD'))
+        bars.loc[1,['close','ema9','ema21']]=[99,99,100]
         self.assertEqual(research_events(d,c,DATE)[0][1],'BEAR_PUT_SPREAD')
-        bars.loc[0,'adx']=17;self.assertFalse(research_events(d,c,DATE))
-        c=replace(c,strategy='book_iron_butterfly');bars.loc[0,['close','adx']]=[100,21]
+        bars.loc[1,'adx']=17;self.assertFalse(research_events(d,c,DATE))
+        c=replace(c,strategy='book_iron_butterfly');bars.loc[1,['close','adx']]=[100,21]
         self.assertEqual(research_events(d,c,DATE)[0][1],'IRON_BUTTERFLY')
-        bars.loc[0,'timestamp']=day['timestamp']+pd.Timedelta(minutes=575)
+        bars['timestamp']=[day['timestamp']+pd.Timedelta(minutes=t) for t in (570,575)]
         self.assertFalse(research_events(d,c,DATE))
 
     def test_strap_strip_volume_breakout_and_momentum_both_directions(self):
@@ -280,11 +283,20 @@ class BookTests(unittest.TestCase):
             bars=pd.DataFrame(dict(timestamp=[day['timestamp']+pd.Timedelta(minutes=550+5*j) for j in range(40)],
                 close=close,high=close+.01,low=close-.01,volume=100,ema9=100,ema21=99,vwap=100,adx=30,atr=1,atr14=1))
             d.features=lambda tf:{DATE:bars}
+            for k in range(555,585):day['prices'][k]=(100,100.2,99.8,100,0)
+            trend=bars.close.copy()
+            bars['close']=100.;bars.loc[39,'close']=99.7 if bearish else 100.3
             for side in ('CE','PE'):
                 for k in range(745,750):
                     day['options'][k,side,100]=(6,6,6,6,300);day['option_meta'][k,side,100]=(2000,20,100)
             events=research_events(d,c,DATE)
             self.assertIn((750,'STRIP' if bearish else 'STRAP',100,None,1.),events)
+            bars.loc[39,'adx']=np.nan
+            self.assertFalse(research_events(d,c,DATE))
+            bars.loc[39,'adx']=30
+            for k in range(555,585):day['prices'][k]=(100,101,99,100,0)
+            self.assertFalse(research_events(d,c,DATE))
+            bars['close']=trend
             c=replace(c,strategy='book_vol_oi_momentum')
             self.assertIn((750,'PE' if bearish else 'CE',100,None,1.),research_events(d,c,DATE))
             for side in ('CE','PE'):day['option_meta'][749,side,100]=(500,20,100)
@@ -296,7 +308,7 @@ class BookTests(unittest.TestCase):
         day['option_meta']={}
         a=activity(d,day,bars,10,650,'CE',100,c)
         self.assertFalse(a['signal_oi_available']);self.assertIsNone(a['signal_log_oi'])
-        del day['options'][600,'CE',100]
+        del day['options'][615,'CE',100]
         self.assertIsNone(activity(d,day,bars,10,650,'CE',100,c))
 
     def test_mcx_support_and_atr_capped_directional_exits(self):

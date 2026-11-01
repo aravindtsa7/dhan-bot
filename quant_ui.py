@@ -280,7 +280,7 @@ def render_result(run_id=None, full=True, result=None):
             st.warning(f"Uses {len(result['repaired_inputs'])} repaired input candles. Synthetic bars can affect signals and fills; results are not verified observed-data performance.")
             with st.expander('Repaired input provenance'): st.dataframe(pd.DataFrame(result['repaired_inputs']), hide_index=True)
         if config['instrument'] not in ('CRUDEOIL','NATURALGAS','GOLDM'):
-            st.caption(f'Rolling option expiry identity is unverified; {metrics.get("modeled_trades",0)} trades use modeled execution prices. Zero-volume spot VWAP is a disclosed TWAP proxy.')
+            st.caption(f'Rolling option expiry identity is unverified; {metrics.get("modeled_trades",0)} trades use modeled execution prices. Index VWAP uses observed ATM CE+PE activity where spot volume is zero; unavailable activity falls back to tagged TWAP.')
             st.caption(f"Wing fallback: {metrics.get('modeled_wing_fallback_trades',0)} trades. Estimates use intrinsic plus bounded wing time value. Basket credits are signed negative values; rising combined value is profit.")
         if not trades.empty:
             default = trades.net_pnl.idxmax()

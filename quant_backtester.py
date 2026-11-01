@@ -41,10 +41,11 @@ INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
     'Out-of-band fixed strikes may use intrinsic plus bounded, distance-decayed wing time value; modeled_wing_fallback flags every affected trade. Strict-observed policy still rejects modeled fills.',
-    'Book structures use atomic per-leg fills. Missing spread legs use prior pair value plus signed 0.20 spot change and an adjacent-spread correction capped at 0.05 times absolute spot change. These are research delta assumptions. Vertical values stay in [0.05, width-0.05], without an intrinsic floor; butterfly liability stays within one wing width. Exact observed quotes are retained. Costs and slippage are applied after bounds and may exceed payoff limits. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
+    'Book spreads use an entry-anchored smooth moneyness curve with 0.28 to 0.42 delta and local observed extrinsic scale, not recovered market IV. A favorable intrinsic-aware floor applies to the curve; latest exact pair marks recalibrate the level for continuous next-open fills. Modeled vertical values stay in [0.05, width-0.05]; butterfly liability stays within one wing width. Exact observed quotes are retained. Per-leg proportional slippage and fees apply after bounds. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
     'PROVISIONAL: rolling WEEK1 options have no expiry/contract ID. Matching strike is necessary but cannot prove contract identity.',
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
-    'H1 uses stored fixed-strike option VWAP; zero-volume spot has a separate TWAP proxy. Repaired stored inputs may affect signals; all affected sessions are disclosed.',
+    'Research index VWAP weights zero-volume spot minutes by synchronized observed ATM CE+PE activity. If activity is unavailable, TWAP remains explicitly tagged. H1 retains fixed-strike option VWAP. Repaired inputs are disclosed. Live broker warmup supplies resolved-contract activity rather than historical rolling ATM chains.',
+    'Basket slippage per leg is min(configured, 0.50, max(0.05, tick-rounded 1.25% of premium)); butterfly capital reserves full wing width plus estimated round-trip fees. Expiry Day wing extrinsic is multiplied by the remaining-session fraction on expiry only.',
     'Synthetic flat zero-volume repair bars are modeled inputs, not provider quotes. Original partitions and quarantine evidence are retained; strict-observed runs reject synthetic inputs.',
     'MCX is a front-active-contract sample, not continuous history since 2025; daily contract choice uses prior-session volume.',
     'Expiry flags use dated exchange rules and holidays; EOD IV/extrinsic checks are retrospective diagnostics, never signal inputs or proof of expiry identity.',
@@ -112,7 +113,7 @@ class Config:
     option_side: str = 'both'  # both / CE / PE
     exit_mode: str = 'legacy'  # legacy / end_of_day / trailing_sl / target_eod
     risk_basis: str = 'legacy'  # legacy ATR futures stops, or percentage of entry
-    momentum_lookback: int = 10
+    momentum_lookback: int = 6
     momentum_threshold: float = 0.25
     expiry_entry_mode: str = 'btst'  # btst / expiry_intraday
     expiry_entry_signal: str = '15:25'
@@ -275,7 +276,9 @@ def make_bars(frame, timeframe):
     n = int(timeframe[:-1])
     f = frame.set_index('timestamp')
     r = f.resample(f'{n}min', origin='start_day')
-    bars = r.agg(dict(open='first', high='max', low='min', close='last', volume='sum'))
+    aggregation=dict(open='first', high='max', low='min', close='last', volume='sum')
+    if 'activity_proxy' in f:aggregation['activity_proxy']='max'
+    bars = r.agg(aggregation)
     bars = bars[r.size().eq(n)].dropna(subset=['open'])
     return indicators(bars).reset_index()
 
@@ -343,9 +346,8 @@ def research_indicators(bars):
 def research_events(data, c, date, confirm_volume=True):
     """Close-confirmed signals, executed at the next minute open, fixed ATM strike.
 
-    Spot index volume is usually zero. ORB then requires observed volume on
-    the candidate fixed-strike option, over ten complete prior bars. It never
-    invents spot volume or mixes rolling strikes to create a volume surge.
+    Zero-volume index minutes use synchronized rolling ATM CE+PE activity;
+    execution still resolves and retains a fixed strike at signal close.
     """
     if c.strategy=='expiry_day':
         from quant_expiry import expiry_events
@@ -353,6 +355,7 @@ def research_events(data, c, date, confirm_volume=True):
     if c.strategy in BOOK_STRATEGIES:
         from quant_book import book_events
         return book_events(data, c, date, confirm_volume=confirm_volume)
+    from quant_strategy_models import fresh_pullback, rolling_activity
     day = data.days[date]
     features = getattr(data, 'research_features', data.features)
     bars = features(c.timeframe)[date]
@@ -370,13 +373,12 @@ def research_events(data, c, date, confirm_volume=True):
             continue
         previous = bars.iloc[i-1]
         bullish = bearish = False
-        volume_basis = 'underlying'
+        volume_basis = 'rolling_atm_ce_pe' if getattr(row,'activity_proxy',False) else 'underlying'
         if c.strategy == 'vwap_ema_pullback':
             # Previous candle touches EMA9 from the trend side; current close
             # clears its high/low. A one-sided inequality isn't a pullback.
-            touch = previous.low <= previous.ema9 <= previous.high
-            bullish = touch and row.close>row.vwap and row.ema9>row.ema21 and row.adx>=18 and row.close>previous.high
-            bearish = touch and row.close<row.vwap and row.ema9<row.ema21 and row.adx>=18 and row.close<previous.low
+            bullish = row.close>row.vwap and row.ema9>row.ema21 and fresh_pullback(previous,row,True)
+            bearish = row.close<row.vwap and row.ema9<row.ema21 and fresh_pullback(previous,row,False)
         elif c.strategy == 'orb_volume_breakout':
             if at<=range_end: continue
             bullish = row.close>orb_high and 55<=row.rsi<=78
@@ -387,11 +389,11 @@ def research_events(data, c, date, confirm_volume=True):
             bullish = row.adx>22 and row.trend==1 and (previous.trend==-1 or row.close>previous.high)
             bearish = row.adx>22 and row.trend==-1 and (previous.trend==1 or row.close<previous.low)
         elif c.strategy == 'mcx_evening_breakout':
-            history = bars.iloc[max(0,i-12):i]
-            if len(history)<12 or not np.isfinite(row.ema50): continue
-            expanding = abs(row.close-row.open)>1.2*row.atr14
-            bullish = expanding and row.close>history.high.max() and row.close>row.ema50
-            bearish = expanding and row.close<history.low.min() and row.close<row.ema50
+            history = bars.iloc[max(0,i-10):i]
+            if len(history)<10 or not 1020<=at<=1320 or not np.isfinite(row.ema50): continue
+            expanding = abs(row.close-row.open)>=.6*row.atr14
+            bullish = expanding and row.close>history.high.max() and row.ema21>row.ema50
+            bearish = expanding and row.close<history.low.min() and row.ema21<row.ema50
         if not (bullish or bearish): continue
         side = ('LONG' if bullish else 'SHORT') if data.mcx else ('CE' if bullish else 'PE')
         strike = 0 if data.mcx else day['rolling'].get((side,'ATM'),{}).get(at-1)
@@ -400,16 +402,11 @@ def research_events(data, c, date, confirm_volume=True):
             volumes = bars.volume.iloc[max(0,i-10):i]
             current_volume = row.volume
             if not data.mcx and not (volumes.sum()>0):
-                volume_basis = 'fixed_strike_option'
-                # Only timestamps known at signal close; ten preceding full bars.
-                windows = []
-                for start in range(at-11*n, at, n):
-                    candles = [data.price(day,t,side,strike) for t in range(start,start+n)]
-                    if any(v is None for v in candles): break
-                    windows.append(sum(v[4] for v in candles))
-                if len(windows)!=11: continue
-                volumes, current_volume = pd.Series(windows[:-1]), windows[-1]
-            if len(volumes)!=10 or volumes.mean()<=0 or current_volume<=1.3*volumes.mean(): continue
+                volume_basis = 'rolling_atm_ce_pe'
+                history=rolling_activity(day,at,n,10)
+                if history is None:continue
+                volumes,current_volume=pd.Series(history[0][:-1]),history[0][-1]
+            if len(volumes)!=10 or volumes.mean()<=0 or current_volume<=c.volume_multiple*volumes.mean(): continue
         evidence = dict(signal_time=row.timestamp+pd.Timedelta(minutes=n),
                         signal_vwap_proxy=bool(row.vwap_proxy), signal_volume_basis=volume_basis)
         day.setdefault('signal_evidence', {})[c.strategy,c.timeframe,at,side,strike] = evidence
@@ -594,10 +591,14 @@ class ResearchData:
         if key not in self._features:
             # Carry causal indicator warm-up across sessions of the same contract.
             # VWAP still resets daily. Never join different MCX contracts.
-            groups = {}
-            for date, day in self.days.items():
+            from quant_strategy_models import activity_frame
+            from quant_expiry import previous_session
+            groups = {};segment=0;last_date=None;last_contract=None
+            for date, day in sorted(self.days.items()):
                 contract = day['contract'] if self.mcx else self.instrument
-                groups.setdefault(contract, []).append((date, day['spot']))
+                if last_contract!=contract or last_date!=previous_session(date,getattr(self,'available_days',[])):segment+=1
+                groups.setdefault((contract,segment), []).append((date, day['spot'] if self.mcx else activity_frame(day)))
+                last_date,last_contract=date,contract
             result = {}
             for sessions in groups.values():
                 bars = pd.concat([make_bars(f, timeframe) for _, f in sorted(sessions)], ignore_index=True)
@@ -900,7 +901,7 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         raise ValueError('Prepared data does not match configuration window')
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='book-spread-continuity-v3',data=data.fingerprint),sort_keys=True)
+    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='strategy-audit-v4',data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'

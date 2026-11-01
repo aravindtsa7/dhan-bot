@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
+from quant_strategy_models import basket_slippage, rolling_activity, fresh_pullback, spread_curve
 
 
 SIDE_LABELS = {'BULL_CALL_SPREAD':'BULL CALL SPREAD', 'BEAR_PUT_SPREAD':'BEAR PUT SPREAD',
@@ -44,15 +45,9 @@ def activity(data, day, bars, i, at, side, strike, c):
     volumes=bars.volume.iloc[i-t:i+1].to_numpy(dtype=float)
     basis='underlying'; oi=[]
     if not data.mcx:
-        # Index volume is normally zero. Always use ONE fixed option contract
-        # for activity, not stitched rolling strikes with artificial jumps.
-        volumes=[]; basis='fixed_strike_option'
-        for begin in range(at-(t+1)*n,at,n):
-            rows=[data.price(day,k,side,strike) for k in range(begin,begin+n)]
-            if any(r is None or day.get('price_sources',{}).get((k,side,strike))=='synthetic_ffill'
-                   for k,r in zip(range(begin,begin+n),rows)): return None
-            volumes.append(sum(r[4] for r in rows))
-            oi.append(day.get('option_meta',{}).get((begin+n-1,side,strike),(np.nan,))[0])
+        history=rolling_activity(day,at,n,t,side)
+        if history is None:return None
+        volumes,oi=history;basis='rolling_atm_option'
     else:
         oi=[day.get('oi',{}).get(k,np.nan) for k in range(at-t*n-1,at,n)]
     baseline=float(np.mean(volumes[:-1]))
@@ -73,9 +68,9 @@ def book_events(data,c,date,confirm_volume=True):
     n=int(c.timeframe[:-1]); t=c.momentum_lookback
     returns=np.log(bars.close/bars.close.shift())
     sigma=returns.rolling(t,min_periods=t).std(ddof=1).shift(1)
-    eta=np.tanh(returns/sigma.replace(0,np.nan)).rolling(t,min_periods=t).mean()
+    eta=np.tanh(returns/sigma.replace(0,np.nan)).rolling(t,min_periods=1).mean()
     opening=1020 if data.mcx else 555
-    end=opening+c.orb_minutes
+    end=opening+(30 if c.strategy=='book_strap_strip' else c.orb_minutes)
     opening_rows=[r for k,r in day['prices'].items() if opening<=k<end]
     high=max((r[1] for r in opening_rows),default=np.nan)
     low=min((r[2] for r in opening_rows),default=np.nan)
@@ -91,16 +86,21 @@ def book_events(data,c,date,confirm_volume=True):
         evidence=dict(signal_time=row.timestamp+pd.Timedelta(minutes=n),
                       signal_vwap_proxy=bool(getattr(row,'vwap_proxy',False)))
         if c.strategy=='book_vertical_spread':
-            if not row.adx>=18 or not (bull or bear): continue
+            if i<1 or not row.adx>=18 or not (bull or bear): continue
+            previous=bars.iloc[i-1]
+            if not fresh_pullback(previous,row,bull):continue
+            if confirm_volume:
+                history=rolling_activity(day,at,n,10) if not data.mcx else (list(bars.volume.iloc[max(0,i-10):i+1]),[])
+                if history is None or len(history[0])!=11 or np.mean(history[0][:-1])<=0 or history[0][-1]<=c.volume_multiple*np.mean(history[0][:-1]):continue
+                evidence['signal_volume_basis']='underlying' if data.mcx else 'rolling_atm_ce_pe'
             side=('LONG' if bull else 'SHORT') if data.mcx else ('BULL_CALL_SPREAD' if bull else 'BEAR_PUT_SPREAD')
         elif c.strategy=='book_iron_butterfly':
             if at<585 or not row.adx<22 or abs(row.close/row.vwap-1)>.0025: continue
             side='IRON_BUTTERFLY'; bull=True
         elif c.strategy=='book_strap_strip':
-            if at<end or i<t: continue
-            history=bars.iloc[i-t:i]
-            bull=row.close>high or row.close>history.high.max()
-            bear=row.close<low or row.close<history.low.min()
+            if at<end or at>=810 or i<t or not row.adx>=20 or (high-low)/row.close>=.0065: continue
+            bull=row.close>high and bars.iloc[i-1].close<=high
+            bear=row.close<low and bars.iloc[i-1].close>=low
             if not (bull or bear): continue
             side='STRAP' if bull else 'STRIP'
         else:
@@ -114,7 +114,7 @@ def book_events(data,c,date,confirm_volume=True):
         if strike is None: continue
         if c.strategy in ('book_strap_strip','book_vol_oi_momentum') and confirm_volume:
             a=activity(data,day,bars,i,at,option,strike,c)
-            if a is None or a['signal_log_volume']<math.log(c.volume_multiple): continue
+            if a is None or a['signal_log_volume']<=math.log(max(1.4,c.volume_multiple) if c.strategy=='book_strap_strip' else c.volume_multiple): continue
             if c.strategy=='book_vol_oi_momentum' and a['signal_oi_available'] and a['signal_log_oi']<=0: continue
             evidence.update(a)
         day.setdefault('signal_evidence',{})[c.strategy,c.timeframe,at,side,strike]=evidence
@@ -123,14 +123,14 @@ def book_events(data,c,date,confirm_volume=True):
 
 
 def basket_allocation(c,date,legs,budget):
-    """Reserve debit or credit max loss, plus all leg fees; credit is not cash."""
+    """Reserve net debit or the FULL butterfly wing width plus every leg fee."""
     from quant_backtester import quantity, fees
     debit=sum(l['ratio']*l['entry_price'] for l in legs)
     side_count=len(legs)
     if side_count==4:
         width=legs[2]['strike']-legs[0]['strike']
         if not -width<debit<0: return 0,0.,0.,debit
-        risk=width+debit
+        risk=width
     elif any(l['ratio']<0 for l in legs):
         width=abs(legs[1]['strike']-legs[0]['strike'])
         if not 0<debit<width: return 0,0.,0.,debit
@@ -151,12 +151,13 @@ def basket_allocation(c,date,legs,budget):
     return 0,0.,0.,debit
 
 
-def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
-    """Causal pair valuation: last mark + spot delta, with a bounded local anchor.
+def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_only=False):
+    """Causal pair valuation with an entry-anchored moneyness curve.
 
-    The .20 delta and .25 sensitivity ceiling are research assumptions, not
-    universal option Greek bounds. Observed quotes win; no intrinsic floor or
-    independent wing time-value decay is imposed on the spread.
+    The .28 to .42 moneyness delta range is a research assumption, not
+    universal option Greek bounds. The curve includes a favorable intrinsic
+    floor. Subsequent exact observations recalibrate its level; fill continuity
+    takes priority over returning abruptly to a stale entry calibration.
     State is trade-local and advances entry open -> close -> next open.
     """
     if side not in ('BULL_CALL_SPREAD','BEAR_PUT_SPREAD','IRON_BUTTERFLY'):
@@ -167,7 +168,8 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
         return rows, False
     pairs=[(0,2),(1,3)] if side=='IRON_BUTTERFLY' else [(0,1)]
     result=[list(r) for r in rows]
-    for field in (0,3):
+    if open_only:result=[[r[0],r[0],r[0],r[0],r[4]] for r in rows]
+    for field in ((0,) if open_only else (0,3)):
         spot=day['prices'][at][field]; intervals=[]; values=[]
         for h,l in pairs:
             width=abs(legs[h]['strike']-legs[l]['strike'])
@@ -196,21 +198,35 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
                     raise MissingObservedPrice(f'{day.get("timestamp", "")} {at//60:02d}:{at%60:02d} {option}: spread continuity requires observed adjacent strikes of matching width')
                 _,near,far,quotes=min(candidates,key=lambda item:item[:3])
             clip=lambda v,lo,hi:min(hi,max(lo,v))
-            adjacent=clip(quotes[0][field]-quotes[1][field],.05,width-.05)
-            anchor=clip(adjacent+direction*.20*(near-legs[h]['strike']),.05,width-.05)
             ds=spot-prior_spot
-            predicted=previous+direction*.20*ds
-            correction=clip(.25*(anchor-predicted),-.05*abs(ds),.05*abs(ds))
+            key=('curve',h,l)
+            if key not in state:
+                extrinsic=[max(.05,q[field]-intrinsic(spot,k,option)) for k,q in zip((near,far),quotes)]
+                state[key]=(prior_spot,previous,max(width/6,sum(extrinsic)/len(extrinsic)))
+            origin_spot,origin_value,scale=state[key]
+            local_scale=sum(max(.05,q[field]-intrinsic(spot,k,option)) for k,q in zip((near,far),quotes))/2
+            scale=(scale+local_scale)/2
+            curve=lambda s:spread_curve(s,origin_spot,origin_value,legs[h]['strike'],width,direction,scale)
+            # Calibrate to the latest observed pair rather than jumping back
+            # to an entry curve after an observed stop-triggering close.
+            predicted=previous+curve(spot)-curve(prior_spot)
             low,high=(0.,width) if side=='IRON_BUTTERFLY' else (.05,width-.05)
             if mutable[l] and not mutable[h]: high=min(high,result[h][field]-.05)
             if low>high+1e-8: raise MissingObservedPrice('Observed leg cannot support positive bounded spread premiums')
-            value=clip(predicted+correction,low,high)
+            value=clip(predicted,low,high)
             # Reject inconsistent exact quotes rather than manufacture a jump
             # to preserve positivity. Width clipping can only reduce a move.
             prior_bounded=clip(previous,0. if side=='IRON_BUTTERFLY' else .05,width if side=='IRON_BUTTERFLY' else width-.05)
-            radius=.25*abs(ds)
+            radius=.42*abs(ds)
+            feasible_low,feasible_high=low,high
             low=max(low,prior_bounded-radius);high=min(high,prior_bounded+radius)
-            if low>high+1e-8: raise MissingObservedPrice('Observed leg incompatible with spread delta continuity')
+            if low>high+1e-8:
+                if side!='IRON_BUTTERFLY':raise MissingObservedPrice('Observed leg incompatible with spread delta continuity')
+                # An observed short option can decay below the prior pair
+                # liability even at unchanged spot. Preserve that observation
+                # and a positive modeled wing; joint width/quote feasibility
+                # takes priority over an individual pair's spot-only delta.
+                low,high=feasible_low,feasible_high
             value=clip(value,low,high)
             if mutable[h] and mutable[l]:
                 # Allocate the pair value to positive legs without letting an
@@ -223,7 +239,7 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
         if side=='IRON_BUTTERFLY' and any(mutable):
             width=abs(legs[0]['strike']-legs[2]['strike'])
             if any(v<0 or v>width for v in values):
-                raise MissingObservedPrice('Observed butterfly pair violates its wing bound')
+                raise MissingObservedPrice(f'{day.get("timestamp", "")} minute {at}, field {field}: observed butterfly pair violates its wing bound: {values}, width={width}')
             excess=max(0.,sum(values)-width)
             capacity=sum(v-lo for v,(lo,_) in zip(values,intervals))
             if excess>capacity+1e-8:
@@ -234,6 +250,8 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None):
             if mutable[h]: result[h][field]=result[l][field]+value
             elif mutable[l]: result[l][field]=result[h][field]-value
             state[h,l]=(value,spot,result[l][field])
+    if open_only:
+        for r in result:r[1:4]=[r[0]]*3
     for i,changed in enumerate(mutable):
         if changed:
             result[i][1]=max(result[i][0],result[i][3])
@@ -253,7 +271,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         stored=day.get('price_sources',{}).get((at,leg['side'],leg['strike']))
         if stored=='synthetic_ffill' and c.price_policy=='strict_observed': raise MissingObservedPrice('Synthetic basket entry')
         direction=1 if leg['ratio']>0 else -1
-        leg.update(raw_entry_price=row[0],entry_price=adverse_tick(row[0]+direction*c.slippage,c,direction==1),
+        leg.update(raw_entry_price=row[0],entry_price=adverse_tick(row[0]+direction*basket_slippage(c,row[0]),c,direction==1),
                    previous=data.price(day,at-1,leg['side'],leg['strike']),modeled_bars=0,
                    modeled_wing_fallback=False,spread_bounds_applied=False,exit_price_source='observed')
     budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
@@ -264,6 +282,11 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
     pairs=[(0,2),(1,3)] if side=='IRON_BUTTERFLY' else [(0,1)]
     spread_state={(h,l):(legs[h]['raw_entry_price']-legs[l]['raw_entry_price'],day['prices'][at][0],legs[l]['raw_entry_price'])
                   for h,l in pairs} if spread else None
+    if spread:
+        for h,l in pairs:
+            width=abs(legs[h]['strike']-legs[l]['strike']);spot=day['prices'][at][0]
+            scale=sum(max(.05,legs[j]['raw_entry_price']-intrinsic(spot,legs[j]['strike'],legs[j]['side'])) for j in (h,l))/2
+            spread_state['curve',h,l]=(spot,legs[h]['raw_entry_price']-legs[l]['raw_entry_price'],scale)
     credit=side=='IRON_BUTTERFLY'; basis=abs(entry)
     stop=entry-basis*c.sl_pct/100; target=entry+basis*c.target_pct/100
     initial_stop=stop; best=entry; trace=[]; force=None; modeled_bars=0
@@ -297,7 +320,10 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
             leg['previous']=row; leg['modeled_bars']+=int(modeled)
             leg['modeled_wing_fallback'] |= wing; leg['exit_price_source']=source
             rows.append(row); sources.append(source)
-        rows,bounded=bounded_spread_rows(day,current,side,legs,rows,sources,spread_state)
+        # A pending close or scheduled square-off is filled at this OPEN.
+        # Later quotes/spot in the same candle cannot veto or price that fill.
+        rows,bounded=bounded_spread_rows(day,current,side,legs,rows,sources,spread_state,
+                                       open_only=bool(force or current==finish))
         for leg,row,source in zip(legs,rows,sources):
             leg['previous']=row
             leg['spread_bounds_applied'] |= bounded and source not in ('observed','observed_price_volume_corrected')
@@ -315,7 +341,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
             reason=force or 'square_off'; exit_at=current
             for leg,row in zip(legs,rows):
                 direction=1 if leg['ratio']>0 else -1
-                leg.update(raw_exit_price=row[0],exit_price=adverse_tick(row[0]-direction*c.slippage,c,direction==-1))
+                leg.update(raw_exit_price=row[0],exit_price=adverse_tick(row[0]-direction*basket_slippage(c,row[0]),c,direction==-1))
             break
         # Synchronized portfolio closes avoid imaginary simultaneous OHLC highs.
         if cl<=stop: force='trailing_stop' if stop!=initial_stop else 'stop_loss'
@@ -325,7 +351,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
             jump=basis*c.trail_jump_pct/100
             steps=math.floor(max(0,best-entry)/jump+1e-10)
             if steps: stop=max(stop,entry-basis*c.trail_pct/100+steps*jump)
-        liquidation=[adverse_tick(r[3]-(1 if l['ratio']>0 else -1)*c.slippage,c,l['ratio']<0) for l,r in zip(legs,rows)]
+        liquidation=[adverse_tick(r[3]-(1 if l['ratio']>0 else -1)*basket_slippage(c,r[3]),c,l['ratio']<0) for l,r in zip(legs,rows)]
         mtm=sum(l['ratio']*(p-l['entry_price'])*qty-fees(c,l['entry_price'],p,qty*abs(l['ratio']),date,
                     1 if l['ratio']>0 else -1)['total_cost'] for l,p in zip(legs,liquidation))
         daily_force=yield dict(minute=current,net_mtm=mtm,reserved_capital=allocated+reserve)
@@ -362,7 +388,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         is_expiry_day=is_expiry_day(c.instrument,date),inferred_expiry=next_expiry(c.instrument,date),
         instrument=c.instrument,strategy=c.strategy,capital_allocated=allocated,capital_reserved=allocated+reserve,
         allocation_budget=budget,capital_used_pct=100*allocated/entry_equity,entry_equity=entry_equity,
-        capital_basis='defined_risk_max_loss' if credit else 'net_option_debit',roi_pct=100*net/allocated,
-        theoretical_max_loss=allocated,**costs,
+        capital_basis='full_wing_width_margin' if credit else 'net_option_debit',roi_pct=100*net/allocated,
+        theoretical_max_loss=(legs[2]['strike']-legs[0]['strike']+entry)*qty if credit else allocated,**costs,
         **day.get('signal_evidence',{}).get((c.strategy,c.timeframe,at,side,strike),{}))
     return record,trace

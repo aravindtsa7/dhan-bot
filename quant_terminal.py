@@ -29,15 +29,15 @@ INTERVALS = {'1 minute': '1m', '3 minutes': '3m', '5 minutes': '5m', '15 minutes
 EXITS = {'End of day': 'end_of_day', 'Trailing SL': 'trailing_sl', 'Target / EOD': 'target_eod'}
 EXPIRY_EXITS = {'Target + SL':'target_eod','Trailing SL':'trailing_sl','EOD':'end_of_day'}
 STRATEGY_NOTES = {
-    list(STRATEGY_LABELS)[0]: 'EMA9 pullback, EMA9/21 alignment, session VWAP and ADX ≥18; next-open execution. Zero-volume spot uses a disclosed TWAP proxy.',
-    list(STRATEGY_LABELS)[1]: 'Index 09:15–09:30 / MCX 17:00–17:30 range, RSI and >1.3× prior 10-bar volume. Zero-volume indices require complete observed fixed-strike option volume. Maximum two entries per session.',
-    list(STRATEGY_LABELS)[2]: 'Wilder ATR(10) Supertrend ×3 and ADX >22; confirmed flip or continuation. Supports Trailing SL.',
-    list(STRATEGY_LABELS)[3]: 'NATURALGAS / CRUDEOIL only. 17:00–22:45; prior 12-bar Donchian channel, EMA50 and body >1.2× ATR14. Morning warm-up retained.',
-    list(STRATEGY_LABELS)[4]: 'ATM debit vertical on VWAP/EMA alignment and ADX(14) ≥18. MCX uses directional futures with ATR-capped risk. Per-leg fees and adverse fills.',
-    list(STRATEGY_LABELS)[5]: 'Index options only: sell ATM CE/PE, buy equidistant wings after 09:45, ADX <22 and within 0.25% of VWAP. Credit decay/expansion exits and 15:15 EOD; reserve max loss plus fees.',
-    list(STRATEGY_LABELS)[6]: 'Index options only: 2CE:1PE strap or 1CE:2PE strip on ORB/Donchian break with fixed-contract volume expansion. Combined portfolio exits.',
-    list(STRATEGY_LABELS)[7]: 'Mean tanh(return / lagged volatility), 10-bar lookback, threshold 0.25; log volume expansion and positive log OI activity where available. Missing OI is disclosed.',
-    'Expiry Day': 'NIFTY / SENSEX only. Balanced fixed CE+PE basket, pre-expiry 15:25 signal / 15:26 fill, held overnight. Only combined TP/SL/trailing exits on expiry; no individual leg stops. WEEK1 expiry identity remains unverified.',
+    list(STRATEGY_LABELS)[0]: 'Fresh EMA9 pullback/cross, directional body, EMA9/21 and VWAP alignment, rising ADX >=18. Max two entries; three-bar cooldown after stop. Historical index VWAP uses rolling ATM CE+PE activity.',
+    list(STRATEGY_LABELS)[1]: 'Index 09:15-09:30 / MCX 17:00-17:30 range, RSI and configured volume expansion over ten prior bars. Index activity uses observed rolling ATM CE+PE. Max two entries.',
+    list(STRATEGY_LABELS)[2]: 'Wilder ATR(10) Supertrend x3 and ADX >22; confirmed flip or continuation. Supports Trailing SL.',
+    list(STRATEGY_LABELS)[3]: 'NATURALGAS / CRUDEOIL only. 17:00-22:00; ten-bar Donchian breakout, EMA21/50 alignment and directional body >=0.6 ATR14. One entry per session.',
+    list(STRATEGY_LABELS)[4]: 'Fresh EMA9 pullback/cross, rising ADX >=18, directional body, VWAP alignment and activity expansion. Max two entries, three-bar stop cooldown. MCX uses ATR-capped directional futures.',
+    list(STRATEGY_LABELS)[5]: 'Index only: short ATM CE/PE, long equal wings after 09:45, ADX <22, within 0.25% VWAP. 15:15 EOD. Reserve FULL wing width plus fees, not credit-adjusted payoff loss.',
+    list(STRATEGY_LABELS)[6]: 'Index only: 2CE:1PE strap or 1CE:2PE strip on compressed (<0.65%) first 30-minute range breakout, ADX >=20, option volume >1.4x baseline. One entry before 13:30. Combined exits.',
+    list(STRATEGY_LABELS)[7]: 'Smoothed tanh(return / lagged volatility), default six-bar lookback and T+2 warm-up, threshold 0.25; active ATM volume/OI confirmation. Missing OI is disclosed.',
+    'Expiry Day': 'NIFTY / SENSEX: balanced fixed CE+PE basket, pre-expiry 15:25 signal / 15:26 fill. Combined expiry TP/SL/trail only. Modeled wing extrinsic decays with remaining expiry-session time. WEEK1 identity remains unverified.',
 }
 
 SAVED_STRATEGIES = Path(__file__).resolve().parent/'data'/'saved_strategies.json'

@@ -8,10 +8,17 @@ from paper_engine import PaperAccount, stamp
 from paper_feed import Asset, IST
 from quant_backtester import fees, minute
 from quant_book import basket_allocation, SIDE_LABELS
+from quant_strategy_models import basket_slippage
 SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
 
 
 class BasketPaperAccount(PaperAccount):
+    def price(self,tick,buy):
+        from quant_backtester import adverse_tick
+        depth=tick.ask if buy else tick.bid
+        base=depth if depth is not None else tick.price
+        return adverse_tick(base+(1 if buy else -1)*basket_slippage(self.c,tick.price),self.c,buy)
+
     def __init__(self,*args,**kwargs):
         self.quotes={}
         super().__init__(*args,**kwargs)
@@ -37,7 +44,11 @@ class BasketPaperAccount(PaperAccount):
         if self.session(now)['lock']: return False
         key=f'{date}:basket:{at}'
         if key in self.state['seen_signals']: return False
-        if sum(t['entry_time'][:10]==date for t in self.state['trades'])>=self.c.max_trades_day: return False
+        today=[t for t in self.state['trades'] if t['entry_time'][:10]==date]
+        cap=1 if self.c.strategy in ('book_strap_strip','expiry_day') else self.c.max_trades_day
+        if len(today)>=cap: return False
+        if self.c.strategy=='book_vertical_spread' and today and today[-1]['exit_reason'] in ('stop_loss','trailing_stop'):
+            if now-datetime.fromisoformat(today[-1]['exit_time']).timestamp()<3*int(self.c.timeframe[:-1])*60:return False
         assets=[asset for _,asset in resolved]
         if len({a.expiry for a in assets})!=1 or any(a.expiry<date for a in assets) or len({a.point_value for a in assets})!=1: return False
         if expiry_day:
