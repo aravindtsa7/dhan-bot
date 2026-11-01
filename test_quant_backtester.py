@@ -34,15 +34,15 @@ class EngineTests(unittest.TestCase):
         c=replace(self.config(),trail_pct=20,trail_jump_pct=5)
         t,path=simulate_trade(d,c,'2026-10-22',(600,'CE',24000,None,0),'t')
         self.assertEqual(t['exit_time'].minute,1)
-        self.assertEqual(t['exit_price'],110)
-        self.assertEqual([r['stop'] for r in path],[80,110])
+        self.assertEqual(t['exit_price'],120)
+        self.assertEqual([r['stop'] for r in path],[80,120])
 
     def test_trailing_overshoot_moves_only_whole_jumps(self):
         d=self.fake({(600,24000):(100,132,90,125,1),(601,24000):(120,124,109,112,1)})
         c=replace(self.config(),trail_pct=20,trail_jump_pct=5)
         t,path=simulate_trade(d,c,'2026-10-22',(600,'CE',24000,None,0),'t')
-        self.assertEqual([r['stop'] for r in path],[80,110])
-        self.assertEqual(t['exit_price'],110)
+        self.assertEqual([r['stop'] for r in path],[80,120])
+        self.assertEqual(t['exit_price'],120)
 
     def test_strict_strike_roll_fails_without_fabricating_exit(self):
         d=self.fake({(600,24000):(100,105,95,100,1),(601,24100):(200,250,195,240,1)})

@@ -17,8 +17,8 @@ class StrategyAuditTests(unittest.TestCase):
     def test_inconsistent_observed_butterfly_pair_fails_without_fabricating_quotes(self):
         from quant_option_model import MissingObservedPrice
         legs=[dict(side=s,strike=k) for s,k in [('CE',100),('PE',100),('CE',150),('PE',50)]]
-        # Observed PE liability 50.30 already exceeds the entire 50-point wing.
-        rows=[(.05,)*4+(0,),(60.3,)*4+(100,),(.05,)*4+(0,),(10,)*4+(100,)]
+        # A 51-point liability exceeds both the wing and the small-noise tolerance.
+        rows=[(.05,)*4+(0,),(61,)*4+(100,),(.05,)*4+(0,),(10,)*4+(100,)]
         day=dict(timestamp='2025-10-28',prices={914:(90,)*4+(0,)},
             rolling={('CE','ATM'):{914:50},('CE','ATM+1'):{914:100}},
             options={(914,'CE',50):(60,)*4+(100,),(914,'CE',100):(10,)*4+(100,)})
@@ -26,7 +26,7 @@ class StrategyAuditTests(unittest.TestCase):
             bounded_spread_rows(day,914,'IRON_BUTTERFLY',legs,rows,
                 ['model_spread_wing_continuity','observed','model_spread_wing_continuity','observed'],
                 {(0,2):(0,90,.05),(1,3):(49,90,10)})
-        self.assertEqual(rows[1][0],60.3);self.assertEqual(rows[3][0],10)
+        self.assertEqual(rows[1][0],61);self.assertEqual(rows[3][0],10)
 
     def test_butterfly_open_exit_does_not_inspect_later_incompatible_close(self):
         # NIFTY 2026-09-08 15:15: observed central CE later falls to 6,
@@ -186,12 +186,14 @@ class StrategyAuditTests(unittest.TestCase):
     def test_expiry_wing_time_value_decays_only_modeled_leg(self):
         c,d=expiry_fixture(exit_mode='end_of_day',sl_pct=99)
         del d.days[EXP]['options'][920,'PE',100]
-        with patch('quant_expiry.continuation_candle',return_value=((10,10,10,10,0),dict(price_source='model_intrinsic_wing_fallback',modeled_wing_fallback=True))):
+        with patch('quant_expiry.continuation_candle',return_value=((10,10,10,10,0),dict(price_source='model_stateful_wing_continuity',modeled_wing_fallback=True))) as model:
             result=run_backtest(c,d,persist=False)
         trade=result['_frames']['trades'].iloc[0];legs=json.loads(trade.legs)
-        self.assertAlmostEqual(trade.raw_exit_price,100+10*10/375)
+        self.assertAlmostEqual(trade.raw_exit_price,110)  # theta is applied once, inside the model
+        self.assertTrue(model.call_args.kwargs['expiry_decay'])
+        self.assertIn('state',model.call_args.kwargs)
         self.assertEqual(legs[0]['exit_price'],100)
-        self.assertEqual(legs[1]['exit_price_source'],'model_intrinsic_wing_expiry_decay')
+        self.assertEqual(legs[1]['exit_price_source'],'model_stateful_wing_continuity')
         self.assertEqual(trade.entry_time.strftime('%Y-%m-%d %H:%M'),PRE+' 15:26')
 
 

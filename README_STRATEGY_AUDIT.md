@@ -1,9 +1,9 @@
 # Strategy audit — Engine 5.4.0 (2026-11-01)
 
-This audit supersedes valuation and results in `cfd9d90`. Engine 5.4.0 data
+This audit supersedes the execution valuation and results in `38e6751` (and earlier `cfd9d90`). Engine 5.4.0 data
 eligibility/repair rules, Data Lab, Data Quality, dated lot/fee schedules, saved
 results, custom strategies, charts and ledgers are preserved. Run identities now
-use `strategy-audit-v4`; old saved results remain available without being reused.
+use `stateful-execution-v5`; old saved results remain available without being reused.
 
 ## Signals and warm-up
 
@@ -36,6 +36,30 @@ VWAP resets daily. Momentum uses intraday T+2 warm-up, removing the second full 
 smoothing window and the fixed-strike activity-history bottleneck. Required data
 dependency windows have not been relaxed. NaN ADX cannot qualify a strap/strip.
 
+## Stateful single-leg wing valuation
+
+Every open option leg retains its latest price, spot and timestamp. Exact fixed
+strike observations recalibrate that state. When the strike leaves the observed
+band, signed midpoint moneyness in strike steps sets delta to
+`clamp(0.50 + 0.38*tanh(0.65*m), 0.08, 0.92)`. The next price is the prior price
+plus signed delta times the spot move, less theta. Normal-day theta is 0.02% of
+prior extrinsic per elapsed trading minute. On expiry, theta is prior extrinsic
+times elapsed minutes divided by the session minutes remaining at the prior mark.
+Overnight elapsed wall-clock hours are not charged as intraday minutes.
+
+The intrinsic / 0.05 floor always applies. A wing-based target receives at most
+10% weight, further bounded by 10% of absolute delta movement plus 10% of theta.
+A rolling-band change at unchanged spot therefore cannot collapse time value.
+The old distance-decayed formula remains only an anchor/standalone diagnostic;
+open positions use persistent state. Exact quotes can still differ from estimates.
+The source is `model_stateful_wing_continuity`, with `modeled_wing_fallback=True`.
+These are explicit research assumptions, not measured option Greeks or market IV.
+
+Single-leg strategies, strap/strip and Expiry Day share this implementation.
+Expiry Day applies remaining-session decay once inside the model, never a second
+multiplication of the whole modeled extrinsic. Both basket legs still exit together.
+Modeled candles are open/close envelopes. Pending fills consume only the open.
+
 ## Coupled spread valuation
 
 Exact fixed-strike observations take priority. Missing spread legs are priced as
@@ -65,7 +89,20 @@ observations and positive leg prices constrain the projection. If an observed
 central option decays below the prior pair liability, a butterfly's individual
 spot-delta band yields to positive wing prices and the joint width constraint.
 An explicit regression covers this unchanged-spot decay; it is not applied to
-vertical stop fills. Impossible observed configurations still fail explicitly.
+vertical stop fills. Small observed pair overshoots of `width - 0.05`, within
+`max(0.05, 2% of width)`, are projected to that cap. This covers the four originally
+reported bars and the same SENSEX 2025-12-24 15:05 candle's 101.30 close liability.
+The adjusted wing is tagged `model_observed_spread_projection`; the trade/trace
+records `spread_bounds_applied=True`. Leg metadata retains the raw open and time
+of its most recent projection. Joint butterfly liability remains bounded by one
+wing width. Projection is an execution assumption and never edits lake quotes.
+Larger incompatible quotes still fail explicitly; strict-observed rejects projection.
+
+If all three stored strikes are explicitly tagged synthetic repairs, an already
+calibrated spread retains its prior curve scale through that minute, rather than
+calibrating to flat repairs. `retained_repair_calibration` discloses this case.
+No missing/synthetic quote becomes an observed anchor. This resolves the fully
+repaired NIFTY 2026-04-28 11:58 band without changing Engine 5.4.0 eligibility.
 
 Pending stop/target exits and scheduled square-offs price **only the fill open**.
 A candle's later close cannot price or veto that exit. A new regression covers the
@@ -91,8 +128,7 @@ Butterflies reserve **full width × quantity plus estimated round-trip fees**.
 Payoff max loss remains (width−credit) × quantity before fees, in a separate
 ledger field. Credit never increases buying power. The ₹25,000 / 100-point SENSEX
 fixture cannot open more than 12 twenty-unit lots; fees can reduce this further.
-Long baskets reserve net debit plus fees. Expiry wing extrinsic is additionally
-multiplied by remaining-session fraction on expiry, with exact quotes unchanged.
+Long baskets reserve net debit plus fees. Observed Expiry Day quotes remain unchanged.
 
 Save Result and named Save Strategy workflows remain supported for all nine
 strategies. Virtual paper uses fresh real quotes, never wing models; actual
@@ -102,6 +138,31 @@ currently provides resolved-contract activity, not a historical rolling ATM
 chain; historical/live signal parity is therefore not asserted. Historical risk
 is minute sampled; paper risk uses fresh ticks.
 
+## Futures risk and strategy defaults
+
+For the nine public strategies on MCX, UI TP/SL percentages represent an assumed
+5x margin return. Underlying target distance is
+`min(entry * TP% / 500, 2.5 * entry_ATR14)`; stop distance is
+`min(entry * SL% / 500, 1.5 * entry_ATR14)`. For a 220 entry, ATR 2 and TP25/SL15,
+the target is 5 points and stop 3 points. New UI futures configurations reserve
+20% assumed margin plus fees. This is a configurable research funding assumption,
+not a dated broker margin schedule. Legacy research aliases retain their old rules.
+
+At +1.2 entry ATR, futures lock +0.2 ATR and advance in 0.25 ATR steps. Directional
+options and verticals activate a +10% lock after +18% gain, then add one configured
+`trail_jump_pct` (default 5%) for each additional complete step. Explicit option
+EOD mode retains its protective stop without this automatic lock. Stops are
+monotonic and take effect on the next minute in backtests; paper uses subsequent
+fresh ticks. These levels exclude fees and do not guarantee net profit or gap fills.
+The activation levels were user-specified; lock offsets/steps are disclosed
+implementation choices. Paper and historical futures share the risk helpers.
+
+UI defaults for VWAP, ORB, Supertrend, vertical and momentum are TP30 / SL20.
+Expiry Day defaults to TP25 / SL60, minimum premium 70 per leg and allocation 50%.
+Butterfly and strap/strip retain TP25 / SL15. MCX evening defaults to TP25 / SL15.
+Changing strategy applies its defaults; user edits and loaded saved parameters
+remain explicit. Existing saved results are not rewritten.
+
 ## Verification settings and interpretation
 
 The full table covers nine strategies × three instruments × two intervals × two
@@ -109,14 +170,15 @@ windows: **108 combinations**, including unsupported cases. Recent means
 2026-08-01 through 2026-10-21 inclusive. Full requests 2025-01-01 through
 2026-10-31 inclusive; actual eligible coverage is reported below.
 
-Each run starts at **₹1,00,000**, fixed one dated lot, 100% allocation, no
-compounding, minimum premium zero, TP25% / SL25%, Target + SL, no trail, configured
-slippage 0.50, volume multiple 1.3 and T=6. Daily locks are disabled. Futures
-verification explicitly assumes **20% margin** to permit one NATURALGAS lot at
-this capital. This is not a broker margin quote; the application's 100% default
-is unchanged. Book futures retain ATR-capped stops. MCX uses observed prices;
-indices permit disclosed continuity models. Expiry uses calendar BTST and 15:20
-cutoff. Parameters were not tuned to improve these results.
+Each run starts at **INR 100,000**, fixed one dated lot, no compounding,
+Target + SL, configured slippage 0.50, volume multiple 1.3 and T=6. Daily account
+locks are disabled. Directional keys use TP30/SL20 and the +18% stepped lock.
+Butterfly, strap/strip and MCX evening use TP25/SL15. Expiry uses TP25/SL60,
+minimum premium 70, 50% allocation, calendar BTST and 15:20 cutoff. Other runs
+use 100% allocation and minimum premium zero for coverage (the index UI default
+is 50). Futures use 20% margin and the new 5x/ATR risk policy. MCX uses observed
+prices; indices permit disclosed continuity models. These fixed settings follow
+the requested defaults; results are not a parameter search.
 
 Net and profit factor include fees/slippage. Max drawdown is the existing **daily
 realized-equity peak-to-trough drawdown in rupees**, not worst intrabar loss.
@@ -140,18 +202,20 @@ ignored under `data/strategy_audit/`, without registering user-saved Reports.
 
 ## Audit results
 
-**342 offline tests passed, zero external network attempts.** All 327 prior tests remain, with 15 added audit regressions. HTTP root and health on port 8501 return 200.
+**358 offline tests passed, zero external network attempts.** All 342 prior tests remain, updated where requested exit semantics changed; 16 regressions cover continuity, expiry theta, futures/paper risk, projection, repairs and UI defaults. Streamlit root and health return HTTP 200 on port 8501.
 
-**84 runs completed, 20 combinations are unsupported, and four full-history butterfly runs failed on contradictory observed quotes.** Completed runs reconcile every fill, fee, allocation and P&L and have zero unresolved positions. The four failures publish no partial P&L and are not counted as passed backtests.
+**88 runs completed, 20 combinations are unsupported, zero failures.** Every completed run reconciles fill P&L, per-leg fees, slippage and allocation and has zero unresolved positions. All four previously failing full-history butterfly runs now complete. Data eligibility and exclusions remain unchanged.
 
-| Full butterfly run | First blocking observed pair | Strike width |
-| --- | --- | ---: |
-| NIFTY 5m | 2025-10-28 15:14 IST open: put pair 50.30 | 50 |
-| NIFTY 15m | 2025-02-13 15:15 IST open: put pair 50.05 | 50 |
-| SENSEX 5m | 2025-12-24 15:05 IST open: put pair 100.75 | 100 |
-| SENSEX 15m | 2025-12-18 15:06 IST open: call pair 100.80 | 100 |
+| Full butterfly instrument | Interval | Trades with quote projection | Trades retaining repair calibration | Net INR | Trades |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NIFTY | 5m | 0 | 1 | -53,286.44 | 412 |
+| NIFTY | 15m | 0 | 1 | -42,353.68 | 291 |
+| SENSEX | 5m | 1 | 0 | 8,472.25 | 504 |
+| SENSEX | 15m | 0 | 0 | 13,529.01 | 324 |
 
-These exact observed pairs exceed the entire wing-width budget before assigning a nonnegative value to the modeled companion pair. Preserving exact quotes and the requested bound is mathematically incompatible on those bars. No observed price is overwritten, session silently omitted, or data eligibility rule relaxed. Completing these four runs requires corrected source quotes or an explicitly different observed-price policy.
+Projection counts refer to trades, not modified lake records. Observed-only strict runs reject these adjustments. Repaired rows retain their provenance; neither those quotes nor WEEK1 identity become verified market data.
+
+The new strategy defaults change holding periods, so the matrix does not encounter every original failing bar while a position is open. Regression fixtures independently cover all four reported pair overshoots; the counts above include only projections reached by the new runs.
 
 | Window | Instrument | Dependency basis | Eligible | Excluded | Actual first / last eligible |
 | --- | --- | --- | ---: | ---: | --- |
@@ -166,115 +230,117 @@ These exact observed pairs exceed the entire wing-width budget before assigning 
 | full | SENSEX | expiry dependencies | 185 | 7 | 2025-01-02 / 2026-10-22 |
 | full | NATURALGAS | intraday | 64 | 37 | 2026-07-09 / 2026-10-29 |
 
-Expiry coverage counts entry/exit dependency sessions, not every selected calendar day. NATURALGAS has a shorter front-active futures sample. Repaired means repaired-input provenance; modeled means rolling options/model dependence, not verified expiry identity.
+Expiry coverage counts entry/exit dependency sessions. NATURALGAS has a shorter front-active futures sample. Repaired means repaired-input provenance; modeled means option model dependence, not verified expiry identity. Max DD below is realized daily equity drawdown, not worst intrabar loss.
 
 | Window | Instrument | Interval | Strategy | Net INR | Win % | Trades | Profit factor | Max DD INR | Status |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| recent | NIFTY | 5m | `vwap_ema_pullback` | -47,015.13 | 37.50 | 64 | 0.3588 | 47,015.13 | modeled |
-| recent | NIFTY | 5m | `orb_volume_breakout` | -38,797.99 | 40.00 | 65 | 0.4219 | 40,164.51 | modeled |
-| recent | NIFTY | 5m | `supertrend_adx_trend` | -89,260.30 | 42.86 | 98 | 0.3606 | 89,270.49 | modeled |
+| recent | NIFTY | 5m | `vwap_ema_pullback` | -17,200.12 | 43.08 | 65 | 0.6060 | 23,043.61 | modeled |
+| recent | NIFTY | 5m | `orb_volume_breakout` | -20,772.99 | 44.29 | 70 | 0.5798 | 22,158.79 | modeled |
+| recent | NIFTY | 5m | `supertrend_adx_trend` | -17,761.10 | 50.00 | 102 | 0.7388 | 32,069.77 | modeled |
 | recent | NIFTY | 5m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| recent | NIFTY | 5m | `book_vertical_spread` | -11,749.09 | 29.73 | 37 | 0.1787 | 11,996.60 | modeled |
-| recent | NIFTY | 5m | `book_iron_butterfly` | -9,703.24 | 19.51 | 41 | 0.1398 | 9,851.86 | modeled |
-| recent | NIFTY | 5m | `book_strap_strip` | -83,777.30 | 25.00 | 20 | 0.1220 | 83,777.30 | modeled |
-| recent | NIFTY | 5m | `book_vol_oi_momentum` | -54,351.23 | 42.05 | 88 | 0.4616 | 61,010.62 | modeled |
-| recent | NIFTY | 5m | `expiry_day` | -14,273.19 | 33.33 | 12 | 0.3599 | 14,273.19 | modeled |
-| recent | NIFTY | 15m | `vwap_ema_pullback` | -38,144.43 | 30.77 | 39 | 0.2652 | 38,144.43 | modeled |
-| recent | NIFTY | 15m | `orb_volume_breakout` | -27,990.36 | 22.22 | 27 | 0.1209 | 27,990.36 | modeled |
-| recent | NIFTY | 15m | `supertrend_adx_trend` | -71,890.91 | 36.84 | 76 | 0.3434 | 71,890.91 | modeled |
+| recent | NIFTY | 5m | `book_vertical_spread` | -9,894.31 | 27.78 | 36 | 0.1725 | 10,141.82 | modeled |
+| recent | NIFTY | 5m | `book_iron_butterfly` | -11,058.64 | 16.67 | 42 | 0.1219 | 11,207.26 | modeled |
+| recent | NIFTY | 5m | `book_strap_strip` | -2,044.43 | 40.00 | 20 | 0.9300 | 16,988.61 | modeled |
+| recent | NIFTY | 5m | `book_vol_oi_momentum` | -23,616.09 | 46.07 | 89 | 0.6221 | 33,634.36 | modeled |
+| recent | NIFTY | 5m | `expiry_day` | 9,197.93 | 77.78 | 9 | 2.7351 | 3,790.32 | modeled |
+| recent | NIFTY | 15m | `vwap_ema_pullback` | -4,649.15 | 45.00 | 40 | 0.7982 | 15,296.58 | modeled |
+| recent | NIFTY | 15m | `orb_volume_breakout` | -18,892.37 | 29.63 | 27 | 0.1741 | 19,112.06 | observed_strike_expiry_unverified |
+| recent | NIFTY | 15m | `supertrend_adx_trend` | -9,278.39 | 50.63 | 79 | 0.8096 | 18,602.72 | modeled |
 | recent | NIFTY | 15m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| recent | NIFTY | 15m | `book_vertical_spread` | -2,738.07 | 22.22 | 9 | 0.0905 | 2,951.33 | modeled |
-| recent | NIFTY | 15m | `book_iron_butterfly` | -6,261.16 | 32.14 | 28 | 0.1487 | 6,623.72 | modeled |
-| recent | NIFTY | 15m | `book_strap_strip` | -55,747.16 | 14.29 | 7 | 0.0259 | 55,747.16 | modeled |
-| recent | NIFTY | 15m | `book_vol_oi_momentum` | -41,196.05 | 33.33 | 33 | 0.1930 | 43,771.65 | modeled |
-| recent | NIFTY | 15m | `expiry_day` | -14,273.19 | 33.33 | 12 | 0.3599 | 14,273.19 | modeled |
-| recent | SENSEX | 5m | `vwap_ema_pullback` | -98,777.10 | 36.73 | 49 | 0.1232 | 98,777.10 | modeled |
-| recent | SENSEX | 5m | `orb_volume_breakout` | -96,345.63 | 37.10 | 62 | 0.1826 | 99,194.87 | modeled |
-| recent | SENSEX | 5m | `supertrend_adx_trend` | -98,339.46 | 30.19 | 53 | 0.1438 | 98,715.26 | modeled |
+| recent | NIFTY | 15m | `book_vertical_spread` | -3,278.00 | 0.00 | 9 | 0.0000 | 3,278.00 | modeled |
+| recent | NIFTY | 15m | `book_iron_butterfly` | -7,220.00 | 27.59 | 29 | 0.1271 | 7,582.56 | modeled |
+| recent | NIFTY | 15m | `book_strap_strip` | -6,703.07 | 28.57 | 7 | 0.5271 | 8,311.89 | modeled |
+| recent | NIFTY | 15m | `book_vol_oi_momentum` | -9,958.26 | 45.45 | 33 | 0.5576 | 13,859.82 | modeled |
+| recent | NIFTY | 15m | `expiry_day` | 9,197.93 | 77.78 | 9 | 2.7351 | 3,790.32 | modeled |
+| recent | SENSEX | 5m | `vwap_ema_pullback` | -10,007.39 | 50.67 | 75 | 0.7894 | 16,565.62 | modeled |
+| recent | SENSEX | 5m | `orb_volume_breakout` | 15,182.55 | 61.84 | 76 | 1.4935 | 8,644.68 | modeled |
+| recent | SENSEX | 5m | `supertrend_adx_trend` | 14,888.00 | 60.82 | 97 | 1.3093 | 9,212.03 | modeled |
 | recent | SENSEX | 5m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| recent | SENSEX | 5m | `book_vertical_spread` | -5,448.20 | 39.47 | 38 | 0.3015 | 6,171.98 | modeled |
+| recent | SENSEX | 5m | `book_vertical_spread` | -5,183.71 | 28.95 | 38 | 0.2493 | 5,522.87 | modeled |
 | recent | SENSEX | 5m | `book_iron_butterfly` | -512.42 | 52.08 | 48 | 0.8810 | 1,838.70 | modeled |
-| recent | SENSEX | 5m | `book_strap_strip` | -89,431.25 | 0.00 | 13 | 0.0000 | 89,431.25 | modeled |
-| recent | SENSEX | 5m | `book_vol_oi_momentum` | -97,737.34 | 33.33 | 54 | 0.1577 | 97,737.34 | modeled |
-| recent | SENSEX | 5m | `expiry_day` | -20,043.38 | 18.18 | 11 | 0.1821 | 20,043.38 | modeled |
-| recent | SENSEX | 15m | `vwap_ema_pullback` | -93,950.15 | 19.44 | 36 | 0.0610 | 93,950.15 | modeled |
-| recent | SENSEX | 15m | `orb_volume_breakout` | -53,624.72 | 41.03 | 39 | 0.2062 | 53,685.22 | modeled |
-| recent | SENSEX | 15m | `supertrend_adx_trend` | -98,085.77 | 24.14 | 58 | 0.1194 | 98,085.77 | modeled |
+| recent | SENSEX | 5m | `book_strap_strip` | -3,677.55 | 29.41 | 17 | 0.8708 | 23,107.98 | modeled |
+| recent | SENSEX | 5m | `book_vol_oi_momentum` | -6,031.09 | 48.86 | 88 | 0.8742 | 17,165.80 | modeled |
+| recent | SENSEX | 5m | `expiry_day` | 6,293.53 | 63.64 | 11 | 1.3188 | 10,223.01 | modeled |
+| recent | SENSEX | 15m | `vwap_ema_pullback` | -17,908.97 | 39.47 | 38 | 0.3431 | 22,190.76 | modeled |
+| recent | SENSEX | 15m | `orb_volume_breakout` | -417.92 | 61.54 | 39 | 0.9772 | 11,662.83 | modeled |
+| recent | SENSEX | 15m | `supertrend_adx_trend` | -12,330.57 | 49.38 | 81 | 0.7470 | 21,295.40 | modeled |
 | recent | SENSEX | 15m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| recent | SENSEX | 15m | `book_vertical_spread` | -1,721.91 | 25.00 | 8 | 0.2137 | 1,721.91 | modeled |
+| recent | SENSEX | 15m | `book_vertical_spread` | -1,526.90 | 25.00 | 8 | 0.2346 | 1,526.90 | modeled |
 | recent | SENSEX | 15m | `book_iron_butterfly` | 575.36 | 64.52 | 31 | 1.2334 | 631.52 | modeled |
-| recent | SENSEX | 15m | `book_strap_strip` | -21,534.00 | 20.00 | 5 | 0.1186 | 21,534.00 | modeled |
-| recent | SENSEX | 15m | `book_vol_oi_momentum` | -87,302.66 | 27.27 | 44 | 0.1417 | 92,526.74 | modeled |
-| recent | SENSEX | 15m | `expiry_day` | -20,043.38 | 18.18 | 11 | 0.1821 | 20,043.38 | modeled |
-| recent | NATURALGAS | 5m | `vwap_ema_pullback` | -29,090.34 | 38.89 | 18 | 0.3582 | 41,261.93 | observed |
-| recent | NATURALGAS | 5m | `orb_volume_breakout` | -27,992.81 | 25.00 | 16 | 0.2968 | 30,762.22 | observed |
-| recent | NATURALGAS | 5m | `supertrend_adx_trend` | -27,805.64 | 30.00 | 20 | 0.3263 | 31,325.03 | observed |
-| recent | NATURALGAS | 5m | `mcx_evening_breakout` | -34,392.98 | 34.78 | 23 | 0.3258 | 34,392.98 | observed |
-| recent | NATURALGAS | 5m | `book_vertical_spread` | -29,823.47 | 5.26 | 19 | 0.0408 | 29,823.47 | observed |
+| recent | SENSEX | 15m | `book_strap_strip` | -7,364.49 | 20.00 | 5 | 0.2739 | 7,364.49 | modeled |
+| recent | SENSEX | 15m | `book_vol_oi_momentum` | -1,610.67 | 40.91 | 44 | 0.9335 | 14,984.45 | modeled |
+| recent | SENSEX | 15m | `expiry_day` | 6,293.53 | 63.64 | 11 | 1.3188 | 10,223.01 | modeled |
+| recent | NATURALGAS | 5m | `vwap_ema_pullback` | -30,772.86 | 0.00 | 22 | 0.0000 | 30,772.86 | observed |
+| recent | NATURALGAS | 5m | `orb_volume_breakout` | -34,078.28 | 11.54 | 26 | 0.0664 | 34,078.28 | observed |
+| recent | NATURALGAS | 5m | `supertrend_adx_trend` | -33,633.08 | 4.35 | 23 | 0.0187 | 33,633.08 | observed |
+| recent | NATURALGAS | 5m | `mcx_evening_breakout` | -32,356.49 | 12.00 | 25 | 0.0421 | 32,356.49 | observed |
+| recent | NATURALGAS | 5m | `book_vertical_spread` | -29,558.72 | 10.00 | 20 | 0.0493 | 29,558.72 | observed |
 | recent | NATURALGAS | 5m | `book_iron_butterfly` | -- | -- | -- | -- | -- | unsupported |
 | recent | NATURALGAS | 5m | `book_strap_strip` | -- | -- | -- | -- | -- | unsupported |
-| recent | NATURALGAS | 5m | `book_vol_oi_momentum` | -30,649.82 | 4.55 | 22 | 0.0396 | 30,649.82 | observed |
+| recent | NATURALGAS | 5m | `book_vol_oi_momentum` | -30,492.51 | 8.33 | 24 | 0.0478 | 30,492.51 | observed |
 | recent | NATURALGAS | 5m | `expiry_day` | -- | -- | -- | -- | -- | unsupported |
-| recent | NATURALGAS | 15m | `vwap_ema_pullback` | -14,052.77 | 46.15 | 13 | 0.3862 | 16,269.59 | observed |
-| recent | NATURALGAS | 15m | `orb_volume_breakout` | -33,449.45 | 26.32 | 19 | 0.2337 | 33,449.45 | observed |
-| recent | NATURALGAS | 15m | `supertrend_adx_trend` | -28,006.65 | 33.33 | 15 | 0.1472 | 30,776.06 | observed |
-| recent | NATURALGAS | 15m | `mcx_evening_breakout` | -37,358.83 | 17.65 | 17 | 0.1292 | 37,358.83 | observed |
-| recent | NATURALGAS | 15m | `book_vertical_spread` | -29,107.02 | 11.76 | 17 | 0.0872 | 29,107.02 | observed |
+| recent | NATURALGAS | 15m | `vwap_ema_pullback` | -27,533.98 | 0.00 | 14 | 0.0000 | 27,533.98 | observed |
+| recent | NATURALGAS | 15m | `orb_volume_breakout` | -35,552.02 | 10.00 | 20 | 0.0078 | 35,552.02 | observed |
+| recent | NATURALGAS | 15m | `supertrend_adx_trend` | -34,477.45 | 0.00 | 17 | 0.0000 | 34,477.45 | observed |
+| recent | NATURALGAS | 15m | `mcx_evening_breakout` | -30,326.26 | 15.79 | 19 | 0.0523 | 30,326.26 | observed |
+| recent | NATURALGAS | 15m | `book_vertical_spread` | -28,591.05 | 5.56 | 18 | 0.0006 | 28,591.05 | observed |
 | recent | NATURALGAS | 15m | `book_iron_butterfly` | -- | -- | -- | -- | -- | unsupported |
 | recent | NATURALGAS | 15m | `book_strap_strip` | -- | -- | -- | -- | -- | unsupported |
-| recent | NATURALGAS | 15m | `book_vol_oi_momentum` | -30,182.71 | 15.00 | 20 | 0.1433 | 30,182.71 | observed |
+| recent | NATURALGAS | 15m | `book_vol_oi_momentum` | -29,807.66 | 15.00 | 20 | 0.0531 | 29,807.66 | observed |
 | recent | NATURALGAS | 15m | `expiry_day` | -- | -- | -- | -- | -- | unsupported |
-| full | NIFTY | 5m | `vwap_ema_pullback` | -99,028.49 | 36.96 | 46 | 0.1932 | 99,622.17 | repaired |
-| full | NIFTY | 5m | `orb_volume_breakout` | -99,710.94 | 28.85 | 52 | 0.1379 | 99,710.94 | repaired |
-| full | NIFTY | 5m | `supertrend_adx_trend` | -99,227.24 | 38.98 | 59 | 0.1623 | 99,227.24 | repaired |
+| full | NIFTY | 5m | `vwap_ema_pullback` | -85,854.95 | 48.42 | 568 | 0.7956 | 91,836.99 | repaired |
+| full | NIFTY | 5m | `orb_volume_breakout` | -96,986.30 | 47.45 | 548 | 0.7551 | 105,635.73 | repaired |
+| full | NIFTY | 5m | `supertrend_adx_trend` | -98,711.25 | 49.54 | 652 | 0.8261 | 98,711.25 | repaired |
 | full | NIFTY | 5m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| full | NIFTY | 5m | `book_vertical_spread` | -91,213.84 | 29.12 | 285 | 0.1996 | 91,213.84 | repaired |
-| full | NIFTY | 5m | `book_iron_butterfly` | -- | -- | -- | -- | -- | FAILED (quotes) |
-| full | NIFTY | 5m | `book_strap_strip` | -92,905.75 | 26.09 | 23 | 0.1237 | 92,905.75 | repaired |
-| full | NIFTY | 5m | `book_vol_oi_momentum` | -99,540.54 | 19.44 | 36 | 0.1040 | 99,540.54 | repaired |
-| full | NIFTY | 5m | `expiry_day` | -96,614.31 | 14.63 | 41 | 0.1287 | 96,614.31 | repaired |
-| full | NIFTY | 15m | `vwap_ema_pullback` | -98,910.87 | 40.00 | 95 | 0.2748 | 98,910.87 | repaired |
-| full | NIFTY | 15m | `orb_volume_breakout` | -97,865.01 | 39.90 | 203 | 0.4418 | 98,209.69 | repaired |
-| full | NIFTY | 15m | `supertrend_adx_trend` | -99,139.00 | 31.58 | 38 | 0.1219 | 102,364.49 | repaired |
+| full | NIFTY | 5m | `book_vertical_spread` | -84,481.73 | 25.78 | 287 | 0.1707 | 84,481.73 | repaired |
+| full | NIFTY | 5m | `book_iron_butterfly` | -53,286.44 | 41.99 | 412 | 0.4637 | 53,751.79 | repaired |
+| full | NIFTY | 5m | `book_strap_strip` | -87,749.34 | 20.75 | 53 | 0.2589 | 92,162.80 | repaired |
+| full | NIFTY | 5m | `book_vol_oi_momentum` | -97,722.52 | 47.49 | 577 | 0.7707 | 98,156.64 | repaired |
+| full | NIFTY | 5m | `expiry_day` | 36,670.76 | 56.58 | 76 | 1.2003 | 57,164.84 | repaired |
+| full | NIFTY | 15m | `vwap_ema_pullback` | -27,535.11 | 48.78 | 246 | 0.8252 | 48,967.66 | repaired |
+| full | NIFTY | 15m | `orb_volume_breakout` | -90,814.18 | 39.69 | 257 | 0.4882 | 90,814.18 | repaired |
+| full | NIFTY | 15m | `supertrend_adx_trend` | -97,679.46 | 49.74 | 587 | 0.7939 | 100,466.51 | repaired |
 | full | NIFTY | 15m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| full | NIFTY | 15m | `book_vertical_spread` | -23,939.59 | 20.00 | 65 | 0.1003 | 24,152.85 | repaired |
-| full | NIFTY | 15m | `book_iron_butterfly` | -- | -- | -- | -- | -- | FAILED (quotes) |
-| full | NIFTY | 15m | `book_strap_strip` | -93,481.83 | 14.29 | 21 | 0.0822 | 93,481.83 | repaired |
-| full | NIFTY | 15m | `book_vol_oi_momentum` | -98,777.20 | 43.48 | 138 | 0.3628 | 100,296.63 | repaired |
-| full | NIFTY | 15m | `expiry_day` | -96,614.31 | 14.63 | 41 | 0.1287 | 96,614.31 | repaired |
-| full | SENSEX | 5m | `vwap_ema_pullback` | -99,444.80 | 14.71 | 34 | 0.0468 | 99,444.80 | modeled |
-| full | SENSEX | 5m | `orb_volume_breakout` | -99,466.23 | 21.43 | 28 | 0.0603 | 99,466.23 | modeled |
-| full | SENSEX | 5m | `supertrend_adx_trend` | -99,443.94 | 22.58 | 31 | 0.0140 | 99,443.94 | modeled |
+| full | NIFTY | 15m | `book_vertical_spread` | -22,287.62 | 12.31 | 65 | 0.0902 | 22,287.62 | repaired |
+| full | NIFTY | 15m | `book_iron_butterfly` | -42,353.68 | 41.58 | 291 | 0.4327 | 43,352.94 | repaired |
+| full | NIFTY | 15m | `book_strap_strip` | -59,940.63 | 20.83 | 48 | 0.3618 | 59,940.63 | repaired |
+| full | NIFTY | 15m | `book_vol_oi_momentum` | -20,743.92 | 49.39 | 328 | 0.8961 | 25,876.14 | repaired |
+| full | NIFTY | 15m | `expiry_day` | 36,670.76 | 56.58 | 76 | 1.2003 | 57,164.84 | repaired |
+| full | SENSEX | 5m | `vwap_ema_pullback` | -7,837.86 | 51.15 | 565 | 0.9768 | 28,197.10 | modeled |
+| full | SENSEX | 5m | `orb_volume_breakout` | 22,811.10 | 54.59 | 621 | 1.0644 | 52,707.21 | modeled |
+| full | SENSEX | 5m | `supertrend_adx_trend` | -24,372.20 | 52.77 | 775 | 0.9541 | 62,091.51 | modeled |
 | full | SENSEX | 5m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| full | SENSEX | 5m | `book_vertical_spread` | -64,066.44 | 29.12 | 285 | 0.1782 | 64,790.22 | modeled |
-| full | SENSEX | 5m | `book_iron_butterfly` | -- | -- | -- | -- | -- | FAILED (quotes) |
-| full | SENSEX | 5m | `book_strap_strip` | -95,712.59 | 27.27 | 22 | 0.0934 | 95,712.59 | modeled |
-| full | SENSEX | 5m | `book_vol_oi_momentum` | -99,517.12 | 31.82 | 44 | 0.0875 | 99,517.12 | modeled |
-| full | SENSEX | 5m | `expiry_day` | -96,362.56 | 7.41 | 27 | 0.1070 | 96,362.56 | modeled |
-| full | SENSEX | 15m | `vwap_ema_pullback` | -98,991.89 | 30.61 | 49 | 0.0840 | 98,991.89 | modeled |
-| full | SENSEX | 15m | `orb_volume_breakout` | -99,403.93 | 30.91 | 55 | 0.1583 | 99,403.93 | modeled |
-| full | SENSEX | 15m | `supertrend_adx_trend` | -99,374.76 | 22.22 | 36 | 0.0705 | 99,374.76 | modeled |
+| full | SENSEX | 5m | `book_vertical_spread` | -57,136.75 | 21.68 | 286 | 0.1733 | 57,475.91 | modeled |
+| full | SENSEX | 5m | `book_iron_butterfly` | 8,472.25 | 63.69 | 504 | 1.1776 | 4,368.05 | modeled |
+| full | SENSEX | 5m | `book_strap_strip` | -95,219.00 | 25.74 | 101 | 0.4698 | 95,219.00 | modeled |
+| full | SENSEX | 5m | `book_vol_oi_momentum` | -75,675.98 | 48.27 | 723 | 0.8428 | 92,108.48 | modeled |
+| full | SENSEX | 5m | `expiry_day` | 68,735.89 | 62.92 | 89 | 1.3628 | 56,927.40 | modeled |
+| full | SENSEX | 15m | `vwap_ema_pullback` | -26,682.72 | 47.52 | 242 | 0.8237 | 33,676.53 | modeled |
+| full | SENSEX | 15m | `orb_volume_breakout` | -17,659.49 | 49.84 | 309 | 0.8934 | 35,411.82 | modeled |
+| full | SENSEX | 15m | `supertrend_adx_trend` | -17,074.61 | 52.61 | 595 | 0.9558 | 43,805.83 | modeled |
 | full | SENSEX | 15m | `mcx_evening_breakout` | -- | -- | -- | -- | -- | unsupported |
-| full | SENSEX | 15m | `book_vertical_spread` | -17,097.48 | 21.33 | 75 | 0.1361 | 17,137.27 | modeled |
-| full | SENSEX | 15m | `book_iron_butterfly` | -- | -- | -- | -- | -- | FAILED (quotes) |
-| full | SENSEX | 15m | `book_strap_strip` | -96,246.57 | 17.65 | 17 | 0.0317 | 96,246.57 | modeled |
-| full | SENSEX | 15m | `book_vol_oi_momentum` | -99,389.78 | 26.67 | 45 | 0.0555 | 99,389.78 | modeled |
-| full | SENSEX | 15m | `expiry_day` | -96,362.56 | 7.41 | 27 | 0.1070 | 96,362.56 | modeled |
-| full | NATURALGAS | 5m | `vwap_ema_pullback` | -27,891.44 | 47.83 | 23 | 0.4415 | 41,261.93 | observed |
-| full | NATURALGAS | 5m | `orb_volume_breakout` | -35,585.41 | 30.00 | 20 | 0.3706 | 45,594.74 | observed |
-| full | NATURALGAS | 5m | `supertrend_adx_trend` | -35,946.11 | 38.10 | 21 | 0.3334 | 35,946.11 | observed |
-| full | NATURALGAS | 5m | `mcx_evening_breakout` | -38,990.93 | 41.18 | 34 | 0.4753 | 51,899.37 | observed |
-| full | NATURALGAS | 5m | `book_vertical_spread` | -35,804.86 | 9.09 | 22 | 0.0505 | 35,804.86 | observed |
+| full | SENSEX | 15m | `book_vertical_spread` | -16,416.60 | 11.84 | 76 | 0.1031 | 16,456.39 | modeled |
+| full | SENSEX | 15m | `book_iron_butterfly` | 13,529.01 | 69.75 | 324 | 1.4900 | 2,330.58 | modeled |
+| full | SENSEX | 15m | `book_strap_strip` | -5,150.95 | 33.93 | 56 | 0.9289 | 15,950.64 | modeled |
+| full | SENSEX | 15m | `book_vol_oi_momentum` | -32,141.50 | 43.71 | 334 | 0.8381 | 39,548.22 | modeled |
+| full | SENSEX | 15m | `expiry_day` | 68,735.89 | 62.92 | 89 | 1.3628 | 56,927.40 | modeled |
+| full | NATURALGAS | 5m | `vwap_ema_pullback` | -32,131.01 | 4.17 | 24 | 0.0158 | 32,131.01 | observed |
+| full | NATURALGAS | 5m | `orb_volume_breakout` | -34,232.31 | 5.00 | 20 | 0.0075 | 34,232.31 | observed |
+| full | NATURALGAS | 5m | `supertrend_adx_trend` | -36,095.61 | 0.00 | 21 | 0.0000 | 36,095.61 | observed |
+| full | NATURALGAS | 5m | `mcx_evening_breakout` | -36,269.06 | 4.17 | 24 | 0.0174 | 36,269.06 | observed |
+| full | NATURALGAS | 5m | `book_vertical_spread` | -35,539.09 | 13.04 | 23 | 0.0512 | 35,539.09 | observed |
 | full | NATURALGAS | 5m | `book_iron_butterfly` | -- | -- | -- | -- | -- | unsupported |
 | full | NATURALGAS | 5m | `book_strap_strip` | -- | -- | -- | -- | -- | unsupported |
-| full | NATURALGAS | 5m | `book_vol_oi_momentum` | -33,114.79 | 14.81 | 27 | 0.0998 | 34,633.19 | observed |
+| full | NATURALGAS | 5m | `book_vol_oi_momentum` | -32,537.61 | 12.50 | 24 | 0.0381 | 33,555.99 | observed |
 | full | NATURALGAS | 5m | `expiry_day` | -- | -- | -- | -- | -- | unsupported |
-| full | NATURALGAS | 15m | `vwap_ema_pullback` | -30,995.52 | 41.18 | 17 | 0.2222 | 30,995.52 | observed |
-| full | NATURALGAS | 15m | `orb_volume_breakout` | -30,925.56 | 31.82 | 22 | 0.4263 | 45,854.63 | observed |
-| full | NATURALGAS | 15m | `supertrend_adx_trend` | -38,228.83 | 30.00 | 10 | 0.1414 | 38,228.83 | observed |
-| full | NATURALGAS | 15m | `mcx_evening_breakout` | -35,360.47 | 23.53 | 17 | 0.1514 | 36,997.43 | observed |
-| full | NATURALGAS | 15m | `book_vertical_spread` | -33,575.61 | 15.00 | 20 | 0.1104 | 34,959.84 | observed |
+| full | NATURALGAS | 15m | `vwap_ema_pullback` | -28,535.72 | 0.00 | 14 | 0.0000 | 28,535.72 | observed |
+| full | NATURALGAS | 15m | `orb_volume_breakout` | -35,360.72 | 10.00 | 20 | 0.0476 | 37,129.05 | observed |
+| full | NATURALGAS | 15m | `supertrend_adx_trend` | -37,828.13 | 9.52 | 21 | 0.0568 | 37,828.13 | observed |
+| full | NATURALGAS | 15m | `mcx_evening_breakout` | -32,392.48 | 26.09 | 23 | 0.0998 | 33,418.80 | observed |
+| full | NATURALGAS | 15m | `book_vertical_spread` | -33,805.02 | 9.52 | 21 | 0.0294 | 34,814.24 | observed |
 | full | NATURALGAS | 15m | `book_iron_butterfly` | -- | -- | -- | -- | -- | unsupported |
 | full | NATURALGAS | 15m | `book_strap_strip` | -- | -- | -- | -- | -- | unsupported |
-| full | NATURALGAS | 15m | `book_vol_oi_momentum` | -34,074.60 | 19.05 | 21 | 0.1482 | 34,074.60 | observed |
+| full | NATURALGAS | 15m | `book_vol_oi_momentum` | -33,889.03 | 11.76 | 17 | 0.0463 | 33,889.03 | observed |
 | full | NATURALGAS | 15m | `expiry_day` | -- | -- | -- | -- | -- | unsupported |
+
+The requested Expiry Day configuration is positive in both recent and full samples under these assumptions, with substantial full-window drawdowns. Many directional and butterfly runs remain negative after costs. The execution fixes do not establish a profitable live strategy, and these descriptive samples are not untouched out-of-sample tests.

@@ -54,6 +54,17 @@ def instrument_defaults(instrument):
                 minimum_premium=0. if instrument in POINT_VALUE else 50.)
 
 
+def strategy_defaults(instrument,strategy):
+    from quant_strategy_models import DIRECTIONAL_OPTIONS
+    values=instrument_defaults(instrument)
+    if strategy=='expiry_day':
+        values.update(take_profit='25%',stop_loss='60%',minimum_premium=70.,allocation='50%')
+    elif strategy in DIRECTIONAL_OPTIONS:
+        values.update(take_profit='30%',stop_loss='20%')
+    elif instrument in POINT_VALUE:values.update(take_profit='25%',stop_loss='15%')
+    return values
+
+
 def build_config(instrument, strategy, period, capital, allocation, interval,
                  take_profit, stop_loss, minimum_premium, exit_label, **expiry_settings):
     """Every visible form setting is preserved in the engine's hashed config."""
@@ -70,6 +81,7 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
         instrument=code, strategy=engine_strategy, option_side=side,
         start=begin.isoformat(), end=(end + timedelta(days=1)).isoformat(),
         capital=float(capital), capital_usage_pct=float(str(allocation).rstrip('%')),
+        futures_margin_pct=20 if mcx else 100,
         timeframe=INTERVALS[interval], sl_pct=sl, target_pct=tp,
         minimum_premium=float(minimum_premium), exit_mode={**EXITS,**EXPIRY_EXITS}[exit_label],
         trail_pct=sl if exit_label == 'Trailing SL' else 0, risk_basis='legacy' if mcx and engine_strategy in BOOK_STRATEGIES else 'percentage',

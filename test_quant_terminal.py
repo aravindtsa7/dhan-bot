@@ -109,14 +109,16 @@ class TerminalParameterTests(unittest.TestCase):
         trade,_ = simulate_trade(data,c,c.start,(919,'CE',24000,None,1),'stop')
         self.assertEqual(trade['exit_reason'],'stop_loss')
 
-    def test_trailing_exit_updates_next_minute_and_fixed_exit_does_not(self):
+    def test_profit_lock_updates_next_minute_and_explicit_eod_keeps_fixed_stop(self):
         c = replace(self.config(exit_mode='trailing_sl',target_pct=100),trail_pct=20,trail_jump_pct=5)
         data = prepared(c)
         data.price = lambda day,at,*args:(100,130,95,125,100) if at==600 else (115,120,105,110,100)
         trade, trace = simulate_trade(data,c,c.start,(600,'CE',24000,None,1),'trail')
         self.assertEqual(trade['exit_reason'],'trailing_stop')
-        self.assertEqual([p['stop'] for p in trace],[75,110])
+        self.assertEqual([p['stop'] for p in trace],[75,120])
         trade,_ = simulate_trade(data,replace(c,exit_mode='target_eod'),c.start,(600,'CE',24000,None,1),'fixed')
+        self.assertEqual(trade['exit_reason'],'trailing_stop')
+        trade,_ = simulate_trade(data,replace(c,exit_mode='end_of_day'),c.start,(600,'CE',24000,None,1),'eod')
         self.assertEqual(trade['exit_reason'],'square_off')
 
     def test_short_futures_percentage_risk_obeys_ui_stop(self):

@@ -19,7 +19,8 @@ import pandas as pd
 
 from quant_lake import QuantDataLake, ROOT, IST
 from quant_calendar import CALENDAR_HASH, expiries, next_expiry, is_expiry_day, regular_session
-from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
+from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic, option_mark_state
+from quant_strategy_models import futures_risk, profit_lock
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
 from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
 from quant_data_quality import require_current_audit
@@ -40,12 +41,13 @@ STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day']
 INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
-    'Out-of-band fixed strikes may use intrinsic plus bounded, distance-decayed wing time value; modeled_wing_fallback flags every affected trade. Strict-observed policy still rejects modeled fills.',
-    'Book spreads use an entry-anchored smooth moneyness curve with 0.28 to 0.42 delta and local observed extrinsic scale, not recovered market IV. A favorable intrinsic-aware floor applies to the curve; latest exact pair marks recalibrate the level for continuous next-open fills. Modeled vertical values stay in [0.05, width-0.05]; butterfly liability stays within one wing width. Exact observed quotes are retained. Per-leg proportional slippage and fees apply after bounds. Combined candles show synchronized open/close envelopes, not executable intrabar extrema.',
+    'Out-of-band single legs retain their latest observed/modeled price and spot, using a smooth moneyness delta, 0.02% extrinsic decay per trading minute (remaining-session linear decay on expiry), intrinsic floor and at most 10% bounded wing-anchor correction. These are research estimates; modeled_wing_fallback flags every affected trade. Strict-observed rejects modeled fills.',
+    'Book spreads use an entry-anchored smooth moneyness curve with 0.28 to 0.42 delta and local observed extrinsic scale, not recovered market IV. Latest exact pair marks recalibrate continuous fills; entirely repair-tagged bands retain prior calibration. Modeled vertical values stay in [0.05, width-0.05]; butterfly liability stays within one wing width. Observed pair overshoots of width-0.05 within max(0.05, 2% of width) are projected and tagged spread_bounds_applied under model_continuity; raw lake quotes remain unchanged. Slippage and fees apply after bounds. Basket candles are synchronized open/close envelopes.',
     'PROVISIONAL: rolling WEEK1 options have no expiry/contract ID. Matching strike is necessary but cannot prove contract identity.',
     'Missing option candles may use explicitly tagged delta/gamma continuity estimates. Zero unresolved positions does not verify modeled fills.',
     'Research index VWAP weights zero-volume spot minutes by synchronized observed ATM CE+PE activity. If activity is unavailable, TWAP remains explicitly tagged. H1 retains fixed-strike option VWAP. Repaired inputs are disclosed. Live broker warmup supplies resolved-contract activity rather than historical rolling ATM chains.',
-    'Basket slippage per leg is min(configured, 0.50, max(0.05, tick-rounded 1.25% of premium)); butterfly capital reserves full wing width plus estimated round-trip fees. Expiry Day wing extrinsic is multiplied by the remaining-session fraction on expiry only.',
+    'Basket slippage per leg is min(configured, 0.50, max(0.05, tick-rounded 1.25% of premium)); butterfly capital reserves full wing width plus estimated round-trip fees. Expiry Day uses stateful remaining-session theta once on modeled expiry legs; observed quotes remain unchanged.',
+    'Public MCX strategies interpret UI TP/SL as returns at assumed 5x leverage, capped at 2.5/1.5 entry ATR. At 1.2 ATR profit, lock 0.2 ATR and advance in 0.25 ATR steps. Directional options/spreads lock 10% after 18% gain, advancing by trail_jump_pct, except explicit EOD mode. These locks are gross-price thresholds, not net profit guarantees.',
     'Synthetic flat zero-volume repair bars are modeled inputs, not provider quotes. Original partitions and quarantine evidence are retained; strict-observed runs reject synthetic inputs.',
     'MCX is a front-active-contract sample, not continuous history since 2025; daily contract choice uses prior-session volume.',
     'Expiry flags use dated exchange rules and holidays; EOD IV/extrinsic checks are retrospective diagnostics, never signal inputs or proof of expiry identity.',
@@ -729,11 +731,13 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     qty,allocated,reserve=order_allocation(c,date,entry,budget,direction)
     if not qty: return None, []
     atr_risk = data.mcx and (c.risk_basis == 'legacy' or c.strategy in BOOK_STRATEGIES)
+    modern_futures=data.mcx and c.strategy in STRATEGIES
     stop_distance = atr*c.atr_sl if atr_risk else entry*c.sl_pct/100
     if data.mcx and c.strategy in BOOK_STRATEGIES:
         stop_distance=min(stop_distance,entry*c.sl_pct/100)
     if stop_distance<=0: return None, []
     target_distance = stop_distance*c.reward_risk if atr_risk else entry*c.target_pct/100
+    if modern_futures:stop_distance,target_distance=futures_risk(c,entry,atr)
     stop, target = entry-direction*stop_distance, entry+direction*target_distance
     initial_stop = stop
     best = entry
@@ -741,6 +745,8 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
     modeled_bars=0
     modeled_wing_fallback=False
     previous=data.price(day,at-1,side,strike)
+    pricing_state={}
+    if not data.mcx:option_mark_state(day,at,first,pricing_state,open_only=True)
     final_source='observed'
     finish = 1395 if data.mcx else 920
     exit_price, exit_at, reason = None, at, 'unresolved'
@@ -758,12 +764,14 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
             if data.mcx or c.price_policy=='strict_observed':
                 raise MissingObservedPrice(f'{date} {side} strike {strike} missing at minute {current}; strict run is not rankable')
             try:
-                row,source=continuation_candle(data,day,current,side,strike,previous)
+                row,source=continuation_candle(data,day,current,side,strike,previous,state=pricing_state,
+                                               open_only=bool(force_exit or current==finish))
             except MissingObservedPrice as exc:
                 raise MissingObservedPrice(f'{date} {current//60:02d}:{current%60:02d} {side} {strike:g}: {exc}') from exc
             modeled_bars+=1
         modeled_wing_fallback |= bool(source.get('modeled_wing_fallback',False))
         previous=row
+        if not data.mcx:option_mark_state(day,current,row,pricing_state,open_only=bool(force_exit or current==finish))
         final_source=source['price_source']
         op,hi,lo,cl,_ = row
         trace.append(dict(trade_id=trade_id,timestamp=day['timestamp']+pd.Timedelta(minutes=current),stop=stop,target=target,mark=cl,
@@ -786,13 +794,15 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
         if c.exit_mode=='legacy' and c.strategy==HIGH_STRATEGIES[2] and best>=entry*(1+c.breakeven_trigger_pct/100):
             stop=max(stop,entry)  # premium breakeven, not net-of-cost breakeven; next minute
         jump = stop_distance*c.atr_trail_jump if atr_risk else entry*c.trail_jump_pct/100
-        if c.exit_mode in ('legacy', 'trailing_sl') and c.trail_pct>0 and direction*(best-entry)>=jump:
+        if not modern_futures and c.exit_mode in ('legacy', 'trailing_sl') and c.trail_pct>0 and direction*(best-entry)>=jump:
             distance = stop_distance if atr_risk else entry*c.trail_pct/100
             steps=math.floor((direction*(best-entry)+1e-10)/jump)
             # Price can leap through several jumps in one minute; only complete
             # increments advance the trail. Overshoot is retained for next time.
             proposed = entry-direction*distance+direction*steps*jump
             stop = max(stop,proposed) if direction==1 else min(stop,proposed)
+        if modern_futures:stop=profit_lock(c,entry,best,stop,direction,atr)
+        elif not data.mcx:stop=profit_lock(c,entry,best,stop,direction)
         liquidation=adverse_tick(cl-direction*c.slippage,c,direction==-1)
         mtm=direction*(liquidation-entry)*qty-fees(c,entry,liquidation,qty,date,direction)['total_cost']
         force_exit=yield dict(minute=current,net_mtm=mtm,reserved_capital=allocated+reserve)
@@ -901,7 +911,7 @@ def run_backtest(c, data=None, output=OUT, persist=True):
         raise ValueError('Prepared data does not match configuration window')
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for d in data.days.values() for e in d.get('repaired_inputs',[])):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
-    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='strategy-audit-v4',data=data.fingerprint),sort_keys=True)
+    identity=json.dumps(dict(config=asdict(c),engine=ENGINE_VERSION,pricing_revision='stateful-execution-v5',data=data.fingerprint),sort_keys=True)
     run_id=hashlib.sha256(identity.encode()).hexdigest()[:16]
     path=Path(output)/'runs'/run_id
     marker=path/'result.json'

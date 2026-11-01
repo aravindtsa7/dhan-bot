@@ -230,6 +230,10 @@ class PaperAccount:
         distance=event[4]*self.c.atr_sl if atr_risk else entry*self.c.sl_pct/100
         if self.c.instrument in POINT_VALUE and self.c.strategy in BOOK_STRATEGIES: distance=min(distance,entry*self.c.sl_pct/100)
         target_distance=distance*self.c.reward_risk if atr_risk else entry*self.c.target_pct/100
+        modern_futures=self.c.instrument in POINT_VALUE and self.c.strategy in STRATEGIES
+        if modern_futures:
+            from quant_strategy_models import futures_risk
+            distance,target_distance=futures_risk(self.c,entry,event[4])
         if qty<=0 or not math.isfinite(distance) or distance<=0:
             self.emit('PAPER SKIP insufficient allocation or invalid ATR'); self.save(); return False
         p=dict(trade_id='paper_'+uuid.uuid4().hex[:16],instrument=self.asset.name,strategy=self.c.strategy,
@@ -239,7 +243,8 @@ class PaperAccount:
             capital_used_pct=100*allocated/self.equity,stop=entry-direction*distance,initial_stop=entry-direction*distance,
             stop_distance=distance,target=entry+direction*target_distance,best=entry,
             net_pnl=None,exit_reason='',pending_exit='',last_ltp=tick.price,last_quote_time=stamp(tick.exchange_time),last_epoch=tick.exchange_time,
-            entry_fill_basis='best_quote_plus_slippage' if tick.bid is not None else 'ltp_plus_slippage',paper=True)
+            entry_fill_basis='best_quote_plus_slippage' if tick.bid is not None else 'ltp_plus_slippage',paper=True,
+            entry_atr=event[4])
         self.state['trades'].append(p); self.save()
         self.emit(f'PAPER OPEN {side} {self.asset.name} {self.asset.security_id} | {p["lots"]:g} lot(s) @ {entry:.2f} | SL {p["stop"]:.2f} target {p["target"]:.2f}')
         # Entry slippage/cost alone can cross the daily cutoff.
@@ -287,9 +292,20 @@ class PaperAccount:
         distance=p['stop_distance'] if atr_risk else p['entry_price']*self.c.trail_pct/100
         proposed=p['entry_price']-direction*distance+direction*steps*jump
         stop=max(p['stop'],proposed) if direction==1 else min(p['stop'],proposed)
-        if self.c.exit_mode in ('legacy','trailing_sl') and self.c.trail_pct>0 and stop!=p['stop']:
+        modern_futures=self.c.instrument in POINT_VALUE and self.c.strategy in STRATEGIES
+        if modern_futures:stop=p['stop']
+        if not modern_futures and self.c.exit_mode in ('legacy','trailing_sl') and self.c.trail_pct>0 and stop!=p['stop']:
             p['stop']=stop; self.save()
             self.emit(f'PAPER TRAIL {p["instrument"]} SL -> {stop:.2f}')
+        from quant_strategy_models import profit_lock
+        prior_stop=p['stop']
+        if modern_futures and p.get('entry_atr'):
+            p['stop']=profit_lock(self.c,p['entry_price'],p['best'],p['stop'],direction,p['entry_atr'])
+        elif self.c.instrument not in POINT_VALUE:
+            p['stop']=profit_lock(self.c,p['entry_price'],p['best'],p['stop'],direction)
+        if p['stop']!=prior_stop:
+            self.save()
+            self.emit(f'PAPER PROFIT LOCK {p["instrument"]} SL -> {p["stop"]:.2f}')
     def heartbeat(self,now):
         p=self.position
         if p:

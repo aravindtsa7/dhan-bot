@@ -15,7 +15,7 @@ from quant_data_ui import render_data_lake, render_data_quality, checked_label
 from quant_data_quality import read_document, fingerprint, file_fingerprint
 from quant_terminal import (PAGES, INSTRUMENT_LABELS, STRATEGY_LABELS, STRATEGY_NOTES,
                             INTERVALS, EXITS, build_config, lake_snapshot, load_registry,
-                            save_result, save_strategy, form_values, read_json, load_saved_strategies, saved_strategy_path, instrument_defaults)
+                            save_result, save_strategy, form_values, read_json, load_saved_strategies, saved_strategy_path, instrument_defaults, strategy_defaults)
 from quant_results import trade_ledger, ledger_html, trade_chart
 from quant_terminal import EXPIRY_EXITS
 from quant_deployment import render_strategy_deployment
@@ -131,12 +131,13 @@ def recent_card(runs, search=''):
 def configure_card():
     defaults = st.session_state.get('form_defaults', dict(instrument='NIFTY 50', strategy=next(iter(STRATEGY_LABELS)),
         period=(date(2025, 1, 1), date(2026, 10, 22)), capital=100000, allocation='25%', interval='5 minutes',
-        take_profit='25%', stop_loss='15%', minimum_premium=50., exit_label='Target / EOD'))
+        take_profit='30%', stop_loss='20%', minimum_premium=50., exit_label='Target / EOD'))
     pending = st.session_state.pop('pending_strategy', None)
     if pending:
         defaults = form_values(pending['config'], pending['name'])
         st.session_state.form_defaults = defaults
         st.session_state.defaults_instrument = defaults['instrument']
+        st.session_state.defaults_strategy = defaults['strategy']
         for key in defaults:
             st.session_state.pop('bt_'+key, None)
         for key in ('bt_expiry_tp','bt_expiry_sl','bt_expiry_exit_label'):
@@ -147,11 +148,15 @@ def configure_card():
         with a: instrument = st.selectbox('Instrument', list(INSTRUMENT_LABELS), index=list(INSTRUMENT_LABELS).index(defaults['instrument']), key='bt_instrument')
         with b: strategy = st.selectbox('Strategy', list(STRATEGY_LABELS), index=list(STRATEGY_LABELS).index(defaults['strategy']), key='bt_strategy')
         prior_instrument = st.session_state.get('defaults_instrument', instrument)
-        if prior_instrument != instrument:
-            values = instrument_defaults(INSTRUMENT_LABELS[instrument])
+        prior_strategy = st.session_state.get('defaults_strategy',defaults['strategy'])
+        if prior_instrument != instrument or prior_strategy != strategy:
+            values = strategy_defaults(INSTRUMENT_LABELS[instrument],STRATEGY_LABELS[strategy][0])
+            if prior_instrument==instrument:values.pop('capital',None)
             defaults.update(values)
             for key in values: st.session_state.pop('bt_'+key, None)
+            for key in ('bt_expiry_tp','bt_expiry_sl'):st.session_state.pop(key,None)
         st.session_state.defaults_instrument = instrument
+        st.session_state.defaults_strategy = strategy
         a, b = st.columns(2)
         with a:
             period = st.date_input('Period', defaults['period'], min_value=date(2025, 1, 1),
@@ -167,7 +172,7 @@ def configure_card():
             with a: take_profit = f"{st.number_input('Take Profit %',min_value=0.1,value=float(defaults['take_profit'].rstrip('%')),step=5.,key='bt_expiry_tp'):g}%"
             with b: stop_loss = f"{st.number_input('Stop Loss %',min_value=0.1,max_value=99.9,value=float(defaults['stop_loss'].rstrip('%')),step=5.,key='bt_expiry_sl'):g}%"
         else:
-            targets=list(dict.fromkeys(['5%', '10%', '15%', '25%', '50%', '100%',defaults['take_profit']]))
+            targets=list(dict.fromkeys(['5%', '10%', '15%', '25%', '30%', '50%', '100%',defaults['take_profit']]))
             stops=list(dict.fromkeys(['50%', '30%', '25%', '20%', '15%', '10%', '5%',defaults['stop_loss']]))
             with a: take_profit = st.selectbox('Take profit', targets, index=targets.index(defaults['take_profit']), key='bt_take_profit')
             with b: stop_loss = st.selectbox('Stop loss', stops, index=stops.index(defaults['stop_loss']), key='bt_stop_loss')
@@ -181,7 +186,11 @@ def configure_card():
             prior_mode={**EXITS,**EXPIRY_EXITS}.get(defaults['exit_label'],'target_eod')
             default_exit=next(k for k,v in choices.items() if v==prior_mode)
             exit_label = st.selectbox('Exit', list(choices), index=list(choices).index(default_exit), key='bt_expiry_exit_label' if strategy=='Expiry Day' else 'bt_exit_label',
-                help='End of day: protective stop, no target. Trailing SL: target plus a trail at the selected stop percentage. Target / EOD: fixed stop and target. Every mode closes by session end.')
+                help='End of day: protective stop, no target. Other modes use target and stop, with a stepped profit lock for directional strategies. Every mode closes by session end; Expiry Day closes on its expiry session.')
+        if instrument in ('CRUDEOIL','NATURALGAS','GOLDM'):
+            st.caption('Futures: 20% assumed margin. TP/SL percentages divide by 5, capped at 2.5/1.5 entry ATR. Profit lock starts at +1.2 ATR.')
+        elif STRATEGY_LABELS[strategy][0] in ('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend','book_vertical_spread','book_vol_oi_momentum'):
+            st.caption('Directional profit lock: after +18%, protect +10%, then advance in 5% steps. Explicit EOD mode keeps its protective stop. Fees and fill gaps affect net returns.')
         expiry_settings={}
         if strategy=='Expiry Day':
             with st.expander('Expiry Day timing and date window',expanded=True):
@@ -281,7 +290,7 @@ def render_result(run_id=None, full=True, result=None):
             with st.expander('Repaired input provenance'): st.dataframe(pd.DataFrame(result['repaired_inputs']), hide_index=True)
         if config['instrument'] not in ('CRUDEOIL','NATURALGAS','GOLDM'):
             st.caption(f'Rolling option expiry identity is unverified; {metrics.get("modeled_trades",0)} trades use modeled execution prices. Index VWAP uses observed ATM CE+PE activity where spot volume is zero; unavailable activity falls back to tagged TWAP.')
-            st.caption(f"Wing fallback: {metrics.get('modeled_wing_fallback_trades',0)} trades. Estimates use intrinsic plus bounded wing time value. Basket credits are signed negative values; rising combined value is profit.")
+            st.caption(f"Wing fallback: {metrics.get('modeled_wing_fallback_trades',0)} trades. Estimates preserve the last mark with moneyness-based delta; single legs include time decay and intrinsic floors. Basket credits are signed negative values; rising combined value is profit.")
         if not trades.empty:
             default = trades.net_pnl.idxmax()
             ids = trades.trade_id.tolist()

@@ -2,6 +2,28 @@
 import math
 import numpy as np
 
+DIRECTIONAL_OPTIONS=('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend',
+                     'book_vertical_spread','book_vol_oi_momentum')
+
+
+def futures_risk(c,entry,atr):
+    """UI return percentages use explicit 5x risk leverage, with ATR caps."""
+    return min(entry*c.sl_pct/500,1.5*atr),min(entry*c.target_pct/500,2.5*atr)
+
+
+def profit_lock(c,entry,best,stop,direction=1,atr=None):
+    gain=direction*(best-entry)
+    if atr is not None:
+        if gain<1.2*atr:return stop
+        jump=.25*atr
+        locked=.2*atr+math.floor((gain-1.2*atr+1e-10)/jump)*jump
+    else:
+        if c.strategy not in DIRECTIONAL_OPTIONS or c.exit_mode=='end_of_day' or gain<.18*entry:return stop
+        jump=entry*c.trail_jump_pct/100
+        locked=.10*entry+math.floor((gain-.18*entry+1e-10)/jump)*jump
+    proposed=entry+direction*locked
+    return max(stop,proposed) if direction==1 else min(stop,proposed)
+
 
 def basket_slippage(c, raw):
     tick=c.tick_size or .05

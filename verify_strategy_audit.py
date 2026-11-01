@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import pandas as pd
 from quant_backtester import Config, ResearchData, STRATEGIES, run_backtest, atomic_json
+from quant_terminal import strategy_defaults
 
 
 def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES):
@@ -18,9 +19,11 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
         print(f'{instrument} {window}: {len(data.days)} eligible, {len(data.exclusions)} excluded',flush=True)
         for tf in ('5m','15m'):
             for strategy in strategies:
+                defaults=strategy_defaults(instrument,strategy)
                 c=Config(instrument=instrument,strategy=strategy,timeframe=tf,start=start,end=end,
-                    capital=100000,capital_usage_pct=100,sizing_mode='fixed_lots',lots=1,
-                    futures_margin_pct=20,minimum_premium=0,target_pct=25,sl_pct=25,
+                    capital=100000,capital_usage_pct=50 if strategy=='expiry_day' else 100,sizing_mode='fixed_lots',lots=1,
+                    futures_margin_pct=20,minimum_premium=70 if strategy=='expiry_day' else 0,
+                    target_pct=float(defaults['take_profit'].rstrip('%')),sl_pct=float(defaults['stop_loss'].rstrip('%')),
                     trail_pct=0,exit_mode='target_eod',risk_basis='percentage',volume_multiple=1.3,
                     entry_start='17:00' if data.mcx and strategy!='vwap_ema_pullback' else '09:30',
                     entry_end='22:00' if data.mcx and strategy!='vwap_ema_pullback' else '14:30',
@@ -55,6 +58,7 @@ def verify(instrument, output=Path('data/strategy_audit'), strategies=STRATEGIES
                         row.update(status=result['status'],first_session=result['first_session'],last_session=result['last_session'],**result['metrics'])
                         name=f'{instrument}_{window}_{tf}_{strategy}'
                         atomic_json(output/f'{name}.json',{k:v for k,v in result.items() if k!='_frames'})
+                        (output/f'{name}_failure.json').unlink(missing_ok=True)
                         trades.to_parquet(output/f'{name}_trades.parquet',index=False)
                     except Exception as exc:
                         row.update(status='FAILED',reason=f'{type(exc).__name__}: {exc}')

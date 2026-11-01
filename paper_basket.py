@@ -8,7 +8,7 @@ from paper_engine import PaperAccount, stamp
 from paper_feed import Asset, IST
 from quant_backtester import fees, minute
 from quant_book import basket_allocation, SIDE_LABELS
-from quant_strategy_models import basket_slippage
+from quant_strategy_models import basket_slippage, profit_lock
 SIDE_LABELS['EXPIRY_DAY']='EXPIRY DAY (CE+PE)'
 
 
@@ -154,6 +154,7 @@ class BasketPaperAccount(PaperAccount):
         if not reason and (p['side']=='IRON_BUTTERFLY' or self.c.exit_mode!='end_of_day') and value>=p['target']: reason='target'
         if reason: self.close(tick,now,reason); return
         p['best']=max(p['best'],value)
+        p['stop']=profit_lock(self.c,p['entry_price'],p['best'],p['stop'])
         if self.c.exit_mode in ('legacy','trailing_sl') and self.c.trail_pct>0:
             basis=abs(p['entry_price']); jump=basis*self.c.trail_jump_pct/100
             steps=math.floor(max(0,p['best']-p['entry_price'])/jump+1e-10)

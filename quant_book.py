@@ -8,8 +8,8 @@ import math
 import numpy as np
 import pandas as pd
 
-from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic
-from quant_strategy_models import basket_slippage, rolling_activity, fresh_pullback, spread_curve
+from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic, option_mark_state
+from quant_strategy_models import basket_slippage, rolling_activity, fresh_pullback, spread_curve, profit_lock
 
 
 SIDE_LABELS = {'BULL_CALL_SPREAD':'BULL CALL SPREAD', 'BEAR_PUT_SPREAD':'BEAR PUT SPREAD',
@@ -168,6 +168,7 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
         return rows, False
     pairs=[(0,2),(1,3)] if side=='IRON_BUTTERFLY' else [(0,1)]
     result=[list(r) for r in rows]
+    adjusted=set()
     if open_only:result=[[r[0],r[0],r[0],r[0],r[4]] for r in rows]
     for field in ((0,) if open_only else (0,3)):
         spot=day['prices'][at][field]; intervals=[]; values=[]
@@ -176,6 +177,12 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
             option=legs[h]['side']; direction=1 if option=='CE' else -1
             if not (mutable[h] or mutable[l]):
                 value=result[h][field]-result[l][field]
+                cap=width-.05
+                if cap<value<=cap+max(.05,.02*width)+1e-8:
+                    value=cap;result[l][field]=result[h][field]-value
+                    adjusted.add(l)
+                    intervals.append((0.,value) if side=='IRON_BUTTERFLY' else (value,value))
+                    values.append(value);continue
                 intervals.append((value,value));values.append(value);continue
             previous,prior_spot,prior_low=state[h,l]
             near=day.get('rolling',{}).get((option,'ATM'),{}).get(at)
@@ -194,9 +201,16 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
                 strikes={day.get('rolling',{}).get((option,m),{}).get(at) for m in ('ATM-1','ATM','ATM+1')}-{None}
                 candidates=[(abs(a-legs[h]['strike']),a,b,q) for a in strikes for b in strikes
                             if (q:=observed_pair(a,b)) is not None]
-                if not candidates:
-                    raise MissingObservedPrice(f'{day.get("timestamp", "")} {at//60:02d}:{at%60:02d} {option}: spread continuity requires observed adjacent strikes of matching width')
-                _,near,far,quotes=min(candidates,key=lambda item:item[:3])
+                if candidates:
+                    _,near,far,quotes=min(candidates,key=lambda item:item[:3])
+                else:
+                    # Engine-eligible repaired minutes may contain an entirely
+                    # synthetic band. Retain the prior calibration; never use
+                    # those flat repairs as observed extrinsic/IV evidence.
+                    repaired=(len(strikes)==3 and all(day.get('price_sources',{}).get((at,option,k))=='synthetic_ffill' for k in strikes))
+                    if not repaired or ('curve',h,l) not in state:
+                        raise MissingObservedPrice(f'{day.get("timestamp", "")} {at//60:02d}:{at%60:02d} {option}: spread continuity requires observed adjacent strikes of matching width')
+                    state['retained_repair_calibration']=True
             clip=lambda v,lo,hi:min(hi,max(lo,v))
             ds=spot-prior_spot
             key=('curve',h,l)
@@ -204,7 +218,7 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
                 extrinsic=[max(.05,q[field]-intrinsic(spot,k,option)) for k,q in zip((near,far),quotes)]
                 state[key]=(prior_spot,previous,max(width/6,sum(extrinsic)/len(extrinsic)))
             origin_spot,origin_value,scale=state[key]
-            local_scale=sum(max(.05,q[field]-intrinsic(spot,k,option)) for k,q in zip((near,far),quotes))/2
+            local_scale=scale if quotes is None else sum(max(.05,q[field]-intrinsic(spot,k,option)) for k,q in zip((near,far),quotes))/2
             scale=(scale+local_scale)/2
             curve=lambda s:spread_curve(s,origin_spot,origin_value,legs[h]['strike'],width,direction,scale)
             # Calibrate to the latest observed pair rather than jumping back
@@ -236,7 +250,7 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
             # pair can consume that budget, requiring its modeled companion to
             # shrink further than the standalone delta band (even to zero).
             intervals.append((0. if side=='IRON_BUTTERFLY' else low,high));values.append(value)
-        if side=='IRON_BUTTERFLY' and any(mutable):
+        if side=='IRON_BUTTERFLY' and (any(mutable) or adjusted):
             width=abs(legs[0]['strike']-legs[2]['strike'])
             if any(v<0 or v>width for v in values):
                 raise MissingObservedPrice(f'{day.get("timestamp", "")} minute {at}, field {field}: observed butterfly pair violates its wing bound: {values}, width={width}')
@@ -248,15 +262,16 @@ def bounded_spread_rows(day, at, side, legs, rows, sources, state=None, open_onl
                 values=[v-excess*(v-lo)/capacity for v,(lo,_) in zip(values,intervals)]
         for (h,l),value in zip(pairs,values):
             if mutable[h]: result[h][field]=result[l][field]+value
-            elif mutable[l]: result[l][field]=result[h][field]-value
+            elif mutable[l] or l in adjusted: result[l][field]=result[h][field]-value
             state[h,l]=(value,spot,result[l][field])
     if open_only:
         for r in result:r[1:4]=[r[0]]*3
     for i,changed in enumerate(mutable):
-        if changed:
+        if changed or i in adjusted:
             result[i][1]=max(result[i][0],result[i][3])
             result[i][2]=min(result[i][0],result[i][3])
-    return [tuple(r) for r in result], any(mutable)
+    for i in adjusted:sources[i]='model_observed_spread_projection'
+    return [tuple(r) for r in result], bool(any(mutable) or adjusted)
 
 
 def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
@@ -274,6 +289,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         leg.update(raw_entry_price=row[0],entry_price=adverse_tick(row[0]+direction*basket_slippage(c,row[0]),c,direction==1),
                    previous=data.price(day,at-1,leg['side'],leg['strike']),modeled_bars=0,
                    modeled_wing_fallback=False,spread_bounds_applied=False,exit_price_source='observed')
+        leg['pricing_state']={};option_mark_state(day,at,row,leg['pricing_state'],open_only=True)
     budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
     entry_equity=c.capital if entry_equity is None else entry_equity
     qty,allocated,reserve,entry=basket_allocation(c,date,legs,budget)
@@ -312,7 +328,8 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
                     row=(.05,.05,.05,.05,0)  # replaced jointly before any valuation
                 else:
                     try:
-                        row,meta=continuation_candle(data,day,current,leg['side'],leg['strike'],leg['previous'])
+                        row,meta=continuation_candle(data,day,current,leg['side'],leg['strike'],leg['previous'],
+                            state=leg['pricing_state'],open_only=bool(force or current==finish))
                     except MissingObservedPrice as exc:
                         raise MissingObservedPrice(f'{date} {current//60:02d}:{current%60:02d} {side} {leg["side"]} {leg["strike"]:g}: {exc}') from exc
                     source=meta['price_source']; wing=meta.get('modeled_wing_fallback',False)
@@ -322,11 +339,21 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
             rows.append(row); sources.append(source)
         # A pending close or scheduled square-off is filled at this OPEN.
         # Later quotes/spot in the same candle cannot veto or price that fill.
+        quoted_rows=rows[:]
         rows,bounded=bounded_spread_rows(day,current,side,legs,rows,sources,spread_state,
                                        open_only=bool(force or current==finish))
-        for leg,row,source in zip(legs,rows,sources):
+        if c.price_policy=='strict_observed' and 'model_observed_spread_projection' in sources:
+            raise MissingObservedPrice('Strict-observed basket rejects observed quote-noise projection')
+        for leg,row,source,quoted in zip(legs,rows,sources,quoted_rows):
             leg['previous']=row
+            option_mark_state(day,current,row,leg['pricing_state'],open_only=bool(force or current==finish))
             leg['spread_bounds_applied'] |= bounded and source not in ('observed','observed_price_volume_corrected')
+            leg['exit_price_source']=source
+            if source=='model_observed_spread_projection':
+                leg['quote_projection_applied']=True
+                leg['last_projection_observed_open']=quoted[0]
+                leg['last_projection_time']=str(day['timestamp']+pd.Timedelta(minutes=current))
+                leg['modeled_bars']+=1
         modeled=any(s not in ('observed','observed_price_volume_corrected') for s in sources)
         modeled_bars+=int(modeled)
         op=sum(l['ratio']*r[0] for l,r in zip(legs,rows))
@@ -347,6 +374,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         if cl<=stop: force='trailing_stop' if stop!=initial_stop else 'stop_loss'
         elif (credit or c.exit_mode!='end_of_day') and cl>=target: force='target'
         best=max(best,cl)
+        stop=profit_lock(c,entry,best,stop)
         if c.exit_mode in ('legacy','trailing_sl') and c.trail_pct>0:
             jump=basis*c.trail_jump_pct/100
             steps=math.floor(max(0,best-entry)/jump+1e-10)
@@ -367,6 +395,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         leg.update(leg_cost)
         for k,v in leg_cost.items(): costs[k]+=v
         leg.pop('previous')
+        leg.pop('pricing_state')
     exit_value=sum(l['ratio']*l['exit_price'] for l in legs)
     net=gross-costs['total_cost']
     contract=' / '.join(f'{l["ratio"]:+g}x{l["strike"]:g}{l["side"]}' for l in legs)
@@ -381,6 +410,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
         modeled_bars=modeled_bars,used_modeled_prices=modeled_bars>0,
         modeled_wing_fallback=any(l['modeled_wing_fallback'] for l in legs),
         spread_bounds_applied=any(l['spread_bounds_applied'] for l in legs),
+        retained_repair_calibration=bool(spread_state and spread_state.get('retained_repair_calibration')),
         exit_price_source='model_basket' if any(l['exit_price_source'].startswith(('model','synthetic')) for l in legs) else 'observed',
         verification_status='repaired_inputs' if day.get('repaired_inputs') else 'model_dependent' if modeled_bars else 'observed_strike_expiry_unverified',
         contract_identity_verified=False,

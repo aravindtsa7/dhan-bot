@@ -26,8 +26,52 @@ def greeks(spot,strike,sigma,years,side):
     return delta,gamma,vega
 
 
-def continuation_candle(data,day,at,side,strike,previous):
-    """Exact intrinsic change plus delta/gamma extrinsic and near-strike drift.
+def option_mark_state(day,at,row,state,open_only=False):
+    """Recalibrate from an exact or modeled mark, including overnight baskets."""
+    if at not in day.get('prices',{}):return  # observed-only providers need no model state
+    field=0 if open_only else 3
+    state.update(price=row[field],spot=day['prices'][at][field],
+                 time=day['timestamp']+pd.Timedelta(minutes=at+(0 if open_only else 1)))
+
+
+def continuous_wing(data,day,at,side,strike,state,target,expiry_decay=None,open_only=False):
+    from quant_calendar import is_expiry_day
+    if not state:raise MissingObservedPrice('Wing continuity requires a previous option mark and spot')
+    band=sorted({k for mon in ('ATM-1','ATM','ATM+1')
+                 if (k:=day.get('rolling',{}).get((side,mon),{}).get(at)) is not None})
+    spacing=min(b-a for a,b in zip(band,band[1:]))
+    direction=1 if side=='CE' else -1
+    expiry=is_expiry_day(data.instrument,str(day['timestamp'].date())) if expiry_decay is None else expiry_decay
+    session_open=day['timestamp']+pd.Timedelta(minutes=555)
+    session_end=day['timestamp']+pd.Timedelta(minutes=930)
+    def advance(spot,anchor,when):
+        prior_spot=state['spot'];price=state['price']
+        elapsed=max(0.,(when-max(state['time'],session_open)).total_seconds()/60)
+        extrinsic=max(0.,price-intrinsic(prior_spot,strike,side))
+        remaining=max(1.,(session_end-max(state['time'],session_open)).total_seconds()/60)
+        theta=extrinsic*min(1.,elapsed/remaining) if expiry else extrinsic*.0002*elapsed
+        midpoint=direction*((spot+prior_spot)/2-strike)/spacing
+        delta=min(.92,max(.08,.50+.38*math.tanh(.65*midpoint)))
+        move=direction*delta*(spot-prior_spot)
+        predicted=price+move-theta
+        # At most 10% anchor weight, further bounded by this bar's movement
+        # and theta. A rolling-band change alone cannot destroy time value.
+        budget=.1*abs(move)+theta*.1
+        correction=min(budget,max(-budget,.1*(anchor-predicted)))
+        value=max(.05,intrinsic(spot,strike,side),predicted+correction)
+        state.update(price=value,spot=spot,time=when)
+        return value
+    spot=day['prices'][at];when=day['timestamp']+pd.Timedelta(minutes=at)
+    op=advance(spot[0],target[0],when)
+    cl=op if open_only else advance(spot[3],target[3],when+pd.Timedelta(minutes=1))
+    return (op,max(op,cl),min(op,cl),cl,0),dict(price_source='model_stateful_wing_continuity',
+        modeled_wing_fallback=True,model_neighbor_strike=None,model_iv_pct=None,
+        model_expiry_assumption='session_linear_decay' if expiry else 'normal_intraday_theta',
+        candle_basis='modeled_open_close_envelope')
+
+
+def continuation_candle(data,day,at,side,strike,previous,state=None,expiry_decay=None,open_only=False):
+    """Stateful out-of-band marks, or in-band delta/gamma near-strike drift.
 
     previous = previous minute's observed/model OHLCV. Volatility is taken from
     the *previous* minute. Current near-strike OHLC informs model OHLC, with
@@ -35,6 +79,9 @@ def continuation_candle(data,day,at,side,strike,previous):
     """
     wing = wing_fallback(day, at, side, strike)
     if wing is not None:
+        if state is None and previous is not None and at-1 in day['prices']:
+            state={};option_mark_state(day,at-1,previous,state)
+        if state is not None:return continuous_wing(data,day,at,side,strike,state,wing[0],expiry_decay,open_only)
         return wing
     spot_prev=day['prices'].get(at-1)
     spot_now=day['prices'].get(at)
@@ -77,11 +124,12 @@ def continuation_candle(data,day,at,side,strike,previous):
 
 
 def wing_fallback(day, at, side, strike):
-    """Outside the observed rolling band only: intrinsic + bounded wing TV.
+    """Out-of-band wing anchor/diagnostic, not an open position's direct fill.
 
     No lagged IV, previous option mark, future quote or calendar expiry is
     needed. Time value is capped by one observed wing spacing and attenuated
     with distance. This is a deterministic research estimate, never a quote.
+    Open position callers use continuous_wing with persistent mark/spot state.
     Exact observed candles always win (including a strike in another offset).
     """
     if (at, side, strike) in day.get('options', {}): return None

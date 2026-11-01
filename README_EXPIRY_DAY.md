@@ -51,12 +51,16 @@ fills times quantity. Combined return is `(combined value / D0 − 1) × 100`.
 
 No strategy TP/SL/trail is applied during the pre-expiry session. On expiry,
 every minute is priced from 09:15 to the chosen cutoff. Exact fixed-strike quotes
-take priority; missing out-of-band strikes use the existing tagged wing model
-under `model_continuity`. On the expiry session only, its extrinsic component
-is multiplied by `max(0, (15:30 - bar_time) / 375 minutes)`: at 15:20 this
-factor is 10/375. Intrinsic value is retained, modeled premiums stay positive,
-and exact observed quotes are never decayed. The leg source is tagged
-`model_intrinsic_wing_expiry_decay`. Strict-observed policy still rejects modeled or
+take priority. Each leg retains its latest price, spot and timestamp, including
+the overnight transition. Missing out-of-band strikes use smooth moneyness delta
+to update the last mark, retaining an intrinsic floor and a gently bounded wing
+anchor. Normal pre-expiry decay is 0.02% of extrinsic per trading minute. On expiry,
+theta is prior extrinsic times elapsed minutes divided by session minutes remaining
+at the prior mark. Overnight wall-clock minutes are not treated as intraday theta.
+There is no second multiplication by the remaining-session fraction. Exact observed
+quotes recalibrate state and are never decayed. The leg source is
+`model_stateful_wing_continuity`, with `modeled_wing_fallback=True`.
+Strict-observed policy still rejects modeled or
 synthetic fills. A combined close crossing TP/SL/trail triggers an atomic exit
 of both legs at the next minute open. No individual option OHLC high/low is used
 to invent a basket trigger. Gaps can exceed thresholds.
@@ -101,12 +105,13 @@ new expiry settings when running any of the previous strategies.
 
 ## Updated offline validation and lake results
 
-The 2026-11-01 audit supersedes the original flat-slippage/undecayed-wing results.
+The 2026-11-01 execution audit supersedes the results in `38e6751`.
 [The complete audit](README_STRATEGY_AUDIT.md) reports all nine strategies and
 all 108 instrument/interval/window combinations, including unsupported cases.
 
-Expiry settings: INR 100,000, fixed one dated lot, 100% allocation, TP25/SL25,
-no trail, minimum premium zero, configured slippage 0.50 with proportional cap,
+Expiry UI defaults: TP25 / SL60, minimum premium 70 per leg, allocation 50%.
+Verification uses these settings with INR 100,000 and fixed one dated lot,
+no trail, configured slippage 0.50 with proportional cap,
 calendar BTST, 15:25 signal / 15:26 fill, and 15:20 exit cutoff. Both 5m and
 15m are verified; these scheduled minute-based entries and exits intentionally
 produce the same results at both chart intervals. Full requests 2025-01-01
@@ -127,20 +132,13 @@ The runners block external sockets. Local JSON/CSV/Parquet stays ignored under
 
 | Window | Instrument | Interval | Strategy | Net INR | Win % | Trades | Profit factor | Max DD INR | Status |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| recent | NIFTY | 5m | `expiry_day` | -14,273.19 | 33.33 | 12 | 0.3599 | 14,273.19 | modeled |
-| recent | NIFTY | 15m | `expiry_day` | -14,273.19 | 33.33 | 12 | 0.3599 | 14,273.19 | modeled |
-| recent | SENSEX | 5m | `expiry_day` | -20,043.38 | 18.18 | 11 | 0.1821 | 20,043.38 | modeled |
-| recent | SENSEX | 15m | `expiry_day` | -20,043.38 | 18.18 | 11 | 0.1821 | 20,043.38 | modeled |
-| full | NIFTY | 5m | `expiry_day` | -96,614.31 | 14.63 | 41 | 0.1287 | 96,614.31 | repaired |
-| full | NIFTY | 15m | `expiry_day` | -96,614.31 | 14.63 | 41 | 0.1287 | 96,614.31 | repaired |
-| full | SENSEX | 5m | `expiry_day` | -96,362.56 | 7.41 | 27 | 0.1070 | 96,362.56 | modeled |
-| full | SENSEX | 15m | `expiry_day` | -96,362.56 | 7.41 | 27 | 0.1070 | 96,362.56 | modeled |
+| recent | NIFTY | 5m | `expiry_day` | 9,197.93 | 77.78 | 9 | 2.7351 | 3,790.32 | modeled |
+| recent | NIFTY | 15m | `expiry_day` | 9,197.93 | 77.78 | 9 | 2.7351 | 3,790.32 | modeled |
+| recent | SENSEX | 5m | `expiry_day` | 6,293.53 | 63.64 | 11 | 1.3188 | 10,223.01 | modeled |
+| recent | SENSEX | 15m | `expiry_day` | 6,293.53 | 63.64 | 11 | 1.3188 | 10,223.01 | modeled |
+| full | NIFTY | 5m | `expiry_day` | 36,670.76 | 56.58 | 76 | 1.2003 | 57,164.84 | repaired |
+| full | NIFTY | 15m | `expiry_day` | 36,670.76 | 56.58 | 76 | 1.2003 | 57,164.84 | repaired |
+| full | SENSEX | 5m | `expiry_day` | 68,735.89 | 62.92 | 89 | 1.3628 | 56,927.40 | modeled |
+| full | SENSEX | 15m | `expiry_day` | 68,735.89 | 62.92 | 89 | 1.3628 | 56,927.40 | modeled |
 
-All eight Expiry Day runs completed with zero unresolved baskets. Full-window
-NIFTY/SENSEX had 55/69 skipped pairs respectively, including unaffordable entries
-and missing/ineligible dependency sessions. Recent windows
-had no skipped pairs. Both full-window accounts depleted enough in 2025 to
-prevent further affordable entries, which explains fewer trades than a
-higher-capital historical run. All 342 offline tests pass with zero external
-network attempts, including the retained 20 Expiry Day regressions and the new
-expiry extrinsic-decay regression.
+Both intervals agree because entry and combined risk use the same minute schedule. The 358-test suite passes with zero external connections. Returns remain model-dependent and full-history drawdowns are substantial.

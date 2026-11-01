@@ -76,7 +76,7 @@ class BookTests(unittest.TestCase):
                 app=AppTest.from_file(str(Path(__file__).with_name('quant_ui.py')),default_timeout=60).run()
                 for label,(key,_) in STRATEGY_LABELS.items():
                     if key not in BOOK_STRATEGIES: continue
-                    app.selectbox(key='bt_strategy').select(label)
+                    app.selectbox(key='bt_strategy').select(label).run()
                     app.date_input(key='bt_period').set_value((pd.Timestamp(DATE).date(),pd.Timestamp(DATE).date()))
                     app.number_input(key='bt_minimum_premium').set_value(0.)
                     app.button(key='run_backtest').click().run()
@@ -247,7 +247,7 @@ class BookTests(unittest.TestCase):
         t,path=simulate_trade(d,c,DATE,(600,'CE',100,None,1),'t')
         self.assertTrue(t['modeled_wing_fallback']);self.assertEqual(t['exit_reason'],'square_off')
         self.assertEqual(t['entry_strike'],100)
-        self.assertEqual(path[-1]['price_source'],'model_intrinsic_wing_fallback')
+        self.assertEqual(path[-1]['price_source'],'model_stateful_wing_continuity')
         with self.assertRaises(MissingObservedPrice): simulate_trade(d,replace(c,price_policy='strict_observed'),DATE,(600,'CE',100,None,1),'t')
 
     def test_ledger_chart_structure_and_credit_are_explicit(self):
@@ -320,7 +320,7 @@ class BookTests(unittest.TestCase):
         c,d,day=fixture();c=replace(c,instrument='NATURALGAS',risk_basis='percentage')
         d.mcx=True;d.price=lambda *args:(100,100,100,100,100)
         t,_=simulate_trade(d,c,DATE,(1394,'LONG',0,None,2),'t')
-        self.assertEqual(t['initial_stop'],97);self.assertEqual(t['target'],106)
+        self.assertEqual(t['initial_stop'],97);self.assertEqual(t['target'],105)
 
     def test_paper_atomic_fresh_quotes_recovery_and_per_leg_fees(self):
         c,d,day=fixture();now=datetime(2026,10,22,10,tzinfo=IST).timestamp()
