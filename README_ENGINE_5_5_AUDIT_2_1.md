@@ -51,7 +51,7 @@ versions are `2.1`, `2.1` and `1.3`; canonical initialization policy is
 `canonical-validated-segment-v2`. Earlier cached results cannot be reused as
 corrected results under these identities.
 
-The intentionally tracked [quality report](data_lake/quality_report.json) was
+The locally generated audit report (`data_lake/quality_report.json`) was
 regenerated locally on 2026-11-01 at 20:31 IST using existing data only. It covers
 60 streams with a stable snapshot, zero hard integrity issues and 711 retained
 findings. Overall status remains **Review needed**. Its SHA-256 is
@@ -62,8 +62,9 @@ Data Quality UI read the refreshed report successfully.
 
 The report is a fingerprint-bound local snapshot, not a substitute for the
 excluded lake. A different local manifest, partition state or calendar requires
-its own local audit. Only this explicit report is tracked under `data_lake/`;
-partitions, manifest, caches, locks, archives and review evidence remain local.
+its own local audit. The generated report and all other files under `data_lake/`
+remain local and excluded from Git, including partitions, manifest, caches,
+locks and archives. Detailed review evidence also remains local and excluded.
 
 ## Validation and limits
 
