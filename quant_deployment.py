@@ -10,6 +10,9 @@ from quant_backtester import Config, STRATEGIES
 
 def account_path(root, record):
     policy = {k:v for k,v in record['config'].items() if k not in ('start','end')}
+    from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+    if policy.get('strategy') not in TRADEMIND_STRATEGIES:
+        policy={k:v for k,v in policy.items() if not k.startswith('trademind_')}
     if policy.get('strategy')!='expiry_intraday':
         policy={k:v for k,v in policy.items() if not k.startswith('intraday_')}
     if policy.get('strategy')!='expiry_day':
@@ -19,6 +22,9 @@ def account_path(root, record):
 
 
 def launch_strategy(record, root, strategies_file):
+    from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+    if record['config'].get('strategy') in TRADEMIND_STRATEGIES:
+        raise ValueError('TradeMind strategies are backtest-only; Paper/Live activation is not authorized')
     config = Config(**record['config'])
     config.validate()
     if config.strategy not in STRATEGIES: raise ValueError('Unsupported saved strategy')
@@ -50,6 +56,10 @@ def render_strategy_deployment(root, strategies_file):
                             format_func=lambda key:by_id[key]['name'])
     record = by_id[selected]
     c = record['config']
+    from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+    if c.get('strategy') in TRADEMIND_STRATEGIES:
+        st.warning('TradeMind is backtest-only. Paper/Live deployment and account controls are disabled.')
+        return Path(root)
     st.caption(f'{c["instrument"]} · {c["timeframe"]} · Capital ₹{c["capital"]:,.0f} · Allocation {c["capital_usage_pct"]:g}% · {c["exit_mode"]}')
     a,b = st.columns(2)
     if a.button('▶ Deploy to Paper',key='deploy_paper',type='primary',width='stretch'):

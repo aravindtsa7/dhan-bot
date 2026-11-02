@@ -120,11 +120,11 @@ def recent_card(runs, search=''):
         rows = ''
         for row in visible[:5]:
             metric = row['metrics']
-            color = 'positive' if metric['net_pnl'] >= 0 else 'negative'
+            color = '' if metric['net_pnl'] is None else 'positive' if metric['net_pnl'] >= 0 else 'negative'
             dd = metric.get('max_drawdown_pct')
             drawdown = f'{abs(dd):.1f}%' if dd is not None else '—'
             rows += (f'<tr><td class="run-id">{escape(row["display_id"])}</td><td>{escape(row["strategy_label"])}</td>'
-                     f'<td class="{color} nowrap">{money(metric["net_pnl"], True)}</td><td>{drawdown}</td><td class="positive nowrap">● Complete</td></tr>')
+                     f'<td class="{color} nowrap">{money(metric["net_pnl"], True)}</td><td>{drawdown}</td><td class="nowrap">{escape(row.get("status","Complete"))}</td></tr>')
         if rows:
             html('<div class="table-scroll"><table class="terminal-table runs-table"><thead><tr><th>Run</th><th>Strategy</th>'
                  '<th>Net P&amp;L</th><th>Max drawdown</th><th>Status</th></tr></thead><tbody>'+rows+'</tbody></table></div>')
@@ -139,6 +139,10 @@ def configure_card():
     pending = st.session_state.pop('pending_strategy', None)
     if pending:
         defaults = form_values(pending['config'], pending['name'])
+        if 'trademind_provider' in pending['config']:
+            st.session_state.tm_provider=pending['config']['trademind_provider']
+            st.session_state.tm_scenario=pending['config']['trademind_scenario']
+            st.session_state.tm_year=int(pending['config']['start'][:4])
         st.session_state.form_defaults = defaults
         st.session_state.defaults_instrument = defaults['instrument']
         st.session_state.defaults_strategy = defaults['strategy']
@@ -161,6 +165,14 @@ def configure_card():
             for key in ('bt_expiry_tp','bt_expiry_sl'):st.session_state.pop(key,None)
         st.session_state.defaults_instrument = instrument
         st.session_state.defaults_strategy = strategy
+        from trademind_backtest import LABELS as TRADEMIND_LABELS
+        if STRATEGY_LABELS[strategy][0] in TRADEMIND_LABELS:
+            from trademind_ui import render_form
+            render_form(STRATEGY_LABELS[strategy][0],instrument,OUT)
+            return
+        if defaults.get('interval') not in INTERVALS:
+            defaults['interval']='5 minutes'
+            st.session_state.pop('bt_interval',None)
         a, b = st.columns(2)
         with a:
             period = st.date_input('Period', defaults['period'], min_value=date(2025, 1, 1),
@@ -263,6 +275,11 @@ def render_result(run_id=None, full=True, result=None):
         result = read_json(path)
     run_id = result['run_id']
     config, metrics = result['config'], result['metrics']
+    from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+    if config['strategy'] in TRADEMIND_STRATEGIES:
+        from trademind_ui import render_result as render_trademind_result
+        render_trademind_result(result,OUT)
+        return
     frames = result.get('_frames')
     def table(name):
         return frames.get(name, pd.DataFrame()) if frames is not None else artifact(str(OUT), run_id, name)

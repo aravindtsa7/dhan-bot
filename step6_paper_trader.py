@@ -65,6 +65,9 @@ def configuration(args):
         record=next((r for r in records if args.saved_strategy in (r['strategy_id'],r['name'])),None)
         if record is None: raise ValueError('Saved strategy was not found')
         c=Config(**record['config'])
+        from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+        if c.strategy in TRADEMIND_STRATEGIES:
+            raise ValueError('TradeMind strategies are backtest-only; Paper/Live disabled')
         if c.strategy not in STRATEGIES: raise ValueError('Saved strategy logic is unsupported')
         today=datetime.now(IST).date()
         c=replace(c,start=str(today),end=str(today+timedelta(days=1)))

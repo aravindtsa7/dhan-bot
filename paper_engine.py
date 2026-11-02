@@ -142,9 +142,13 @@ class MinuteBook:
 class PaperAccount:
     """One virtual position, fixed-contract identity and account-level daily locks."""
     def __init__(self,root,c,asset,emit=print):
+        from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
+        if c.strategy in TRADEMIND_STRATEGIES:
+            raise ValueError('TradeMind strategies are backtest-only; Paper/Live disabled')
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
         self.c=c; c.validate(); self.asset=asset; self.emit=emit
         policy=asdict(c); policy.pop('start'); policy.pop('end')
+        policy={k:v for k,v in policy.items() if not k.startswith('trademind_')}
         if c.strategy!='expiry_intraday':
             policy={k:v for k,v in policy.items() if not k.startswith('intraday_')}
         if c.strategy!='expiry_day':
