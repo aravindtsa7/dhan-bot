@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from quant_backtester import (Config, ResearchData, HIGH_STRATEGIES, OUT, ENGINE_VERSION,
-                              run_backtest, atomic_json, adverse_tick, fees)
+                              run_backtest, atomic_json, adverse_tick, fees, config_from_saved)
 
 TUNING_VERSION='1.0'
 DEFINITIONS={
@@ -106,7 +106,7 @@ def audit_run(result):
 
 def independent_drawdown_check(result):
     """Rebuild selected-run liquidation paths from raw stop paths and trade fills."""
-    folder=Path(result['path']); c=Config(**result['config'])
+    folder=Path(result['path']); c=config_from_saved(result['config'])
     trades=pd.read_parquet(folder/'trades.parquet'); paths=pd.read_parquet(folder/'stop_paths.parquet')
     daily=pd.read_parquet(folder/'daily_risk.parquet').set_index('date')
     for date,group in trades.groupby('date'):

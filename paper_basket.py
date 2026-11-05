@@ -24,8 +24,9 @@ class BasketPaperAccount(PaperAccount):
         base=depth if depth is not None else tick.price
         return adverse_tick(base+(1 if buy else -1)*basket_slippage(self.c,tick.price),self.c,buy)
 
-    def __init__(self,*args,**kwargs):
+    def __init__(self,*args,allow_async_skew=False,**kwargs):
         self.quotes={}
+        self.allow_async_skew=allow_async_skew
         root=Path(args[0] if args else kwargs['root'])
         self._frozen_evidence=None
         # An immutable invalidation intent is a durable fail-closed barrier,
@@ -112,7 +113,10 @@ class BasketPaperAccount(PaperAccount):
         rows=[(q.price,)*4+(0,) for q in quotes]
         try:validate_raw_basket_rows(dict(timestamp=local.replace(hour=0,minute=0,second=0,microsecond=0)),
             at,side,legs,rows,['observed']*len(legs),open_only=True,context=context)
-        except InvalidBasketObservation as exc:self._invalidate(exc.evidence)
+        except InvalidBasketObservation as exc:
+            if (self.allow_async_skew or any(q.wire_epoch is not None for q in quotes)) and phase in ('paper_on_tick','paper_mark') and len(set(times))>1:
+                return False
+            self._invalidate(exc.evidence)
         return context
 
     def enter(self,*args,**kwargs):
@@ -140,13 +144,14 @@ class BasketPaperAccount(PaperAccount):
         self._ensure_valid_simulation()
         if self.position or not resolved: return False
         local=datetime.fromtimestamp(now,IST); date=local.date().isoformat(); at=local.hour*60+local.minute
+        minute_start=int(now)//60*60
         expiry_day=self.c.strategy=='expiry_day'
         if expiry_day:
             from quant_expiry import live_event
-            if event!=live_event(self.c,now) or event[1]!='EXPIRY_DAY': return False
+            if event!=live_event(self.c,minute_start) or event[1]!='EXPIRY_DAY': return False
         elif self.c.strategy=='expiry_intraday':
             from quant_expiry_intraday import live_event
-            if event!=live_event(self.c,now):return False
+            if event!=live_event(self.c,minute_start):return False
         elif event[0]!=at or local.weekday()>=5 or not minute(self.c.entry_start)<=at<=minute(self.c.entry_end): return False
         if event[1]=='IRON_BUTTERFLY' and not 585<=at<915: return False
         if self.session(now)['lock']: return False
@@ -205,7 +210,7 @@ class BasketPaperAccount(PaperAccount):
         if not p or not p.get('legs'): return super().mark(tick)
         quotes=self.fresh_legs(tick.received_time)
         if quotes is None: return None
-        self._validate_snapshot(p['side'],p['legs'],quotes,tick.received_time,'paper_mark')
+        if self._validate_snapshot(p['side'],p['legs'],quotes,tick.received_time,'paper_mark') is False: return None
         return sum(l['ratio']*(self.price(q,l['ratio']<0)-l['entry_price'])*p['quantity']-
             fees(self.c,l['entry_price'],self.price(q,l['ratio']<0),p['quantity']*abs(l['ratio']),stamp(tick.received_time)[:10],
                  1 if l['ratio']>0 else -1)['total_cost'] for l,q in zip(p['legs'],quotes))
@@ -248,7 +253,7 @@ class BasketPaperAccount(PaperAccount):
         leg['last_epoch']=tick.exchange_time; self.quotes[tick.key]=tick
         snapshot=self.fresh_legs(now)
         if snapshot is None: return
-        self._validate_snapshot(p['side'],p['legs'],snapshot,now,'paper_on_tick')
+        if self._validate_snapshot(p['side'],p['legs'],snapshot,now,'paper_on_tick') is False: return
         local=datetime.fromtimestamp(now,IST)
         if p['side']=='EXPIRY_DAY':
             date=local.date().isoformat();expiry=p['expiry_exit_session']

@@ -65,9 +65,8 @@ def signal_fixture(c, bearish=False):
 class StrategyTests(unittest.TestCase):
     def test_public_strategy_catalog_preserves_four_research_keys_and_adds_four_book_keys(self):
         self.assertEqual(STRATEGIES[:4],RESEARCH_STRATEGIES)
-        from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
-        self.assertEqual(STRATEGIES[10:],list(TRADEMIND_STRATEGIES))
-        self.assertEqual(len(STRATEGIES),16)
+        self.assertEqual(STRATEGIES[8:],['expiry_day','expiry_intraday'])
+        self.assertEqual(len(STRATEGIES),10)
         self.assertIn(Config().strategy,RESEARCH_STRATEGIES)
 
     def test_all_four_keys_instrument_matrix_and_both_intervals(self):

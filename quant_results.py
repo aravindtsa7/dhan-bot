@@ -15,8 +15,8 @@ REASONS = {'target':'Target', 'stop_loss':'Stop Loss', 'trailing_stop':'Trailing
 
 def trade_ledger(trades, config):
     if trades.empty: return pd.DataFrame()
-    from quant_backtester import Config, quantity
-    c = Config(**config)
+    from quant_backtester import config_from_saved, quantity
+    c = config_from_saved(config)
     f = trades.sort_values(['exit_time','entry_time','trade_id']).reset_index(drop=True)
     labels = f.side.map(SIDE_LABELS).fillna(f.side)
     fees = f.total_cost + f.get('slippage_cost', pd.Series(0.,index=f.index))

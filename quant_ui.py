@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from quant_backtester import OUT, run_backtest
+from quant_backtester import OUT, run_backtest, REMOVED_STRATEGIES
 from quant_lake import ROOT, IST, QuantDataLake
 from quant_paper_ui import render_live_paper_room
 from quant_data_ui import render_data_lake, render_data_quality, checked_label
@@ -133,16 +133,26 @@ def recent_card(runs, search=''):
 
 
 def configure_card():
-    defaults = st.session_state.get('form_defaults', dict(instrument='NIFTY 50', strategy=next(iter(STRATEGY_LABELS)),
+    initial_defaults = dict(instrument='NIFTY 50', strategy=next(iter(STRATEGY_LABELS)),
         period=(date(2025, 1, 1), date(2026, 10, 22)), capital=100000, allocation='25%', interval='5 minutes',
-        take_profit='30%', stop_loss='20%', minimum_premium=50., exit_label='Target / EOD'))
+        take_profit='30%', stop_loss='20%', minimum_premium=50., exit_label='Target / EOD',
+        daily_profit_target=0., daily_loss_limit=0.)
+    defaults = st.session_state.get('form_defaults', initial_defaults)
+    if defaults.get('strategy') not in STRATEGY_LABELS:
+        st.warning('Strategy removed: the previous configuration cannot be run. Select a remaining strategy.')
+        defaults = initial_defaults
+        st.session_state.form_defaults = defaults
+        st.session_state.pop('bt_strategy', None)
+        st.session_state.active_result = None
+    removed_notice = st.session_state.pop('removed_strategy_notice', None)
+    if removed_notice: st.warning(removed_notice)
     pending = st.session_state.pop('pending_strategy', None)
+    if pending and pending['config'].get('strategy') in REMOVED_STRATEGIES:
+        st.warning('Strategy removed: '+pending['config']['strategy']+'. Saved configuration preserved; new runs disabled.')
+        st.session_state.active_result = None
+        pending = None
     if pending:
         defaults = form_values(pending['config'], pending['name'])
-        if 'trademind_provider' in pending['config']:
-            st.session_state.tm_provider=pending['config']['trademind_provider']
-            st.session_state.tm_scenario=pending['config']['trademind_scenario']
-            st.session_state.tm_year=int(pending['config']['start'][:4])
         st.session_state.form_defaults = defaults
         st.session_state.defaults_instrument = defaults['instrument']
         st.session_state.defaults_strategy = defaults['strategy']
@@ -165,11 +175,6 @@ def configure_card():
             for key in ('bt_expiry_tp','bt_expiry_sl'):st.session_state.pop(key,None)
         st.session_state.defaults_instrument = instrument
         st.session_state.defaults_strategy = strategy
-        from trademind_backtest import LABELS as TRADEMIND_LABELS
-        if STRATEGY_LABELS[strategy][0] in TRADEMIND_LABELS:
-            from trademind_ui import render_form
-            render_form(STRATEGY_LABELS[strategy][0],instrument,OUT)
-            return
         if defaults.get('interval') not in INTERVALS:
             defaults['interval']='5 minutes'
             st.session_state.pop('bt_interval',None)
@@ -203,6 +208,13 @@ def configure_card():
             default_exit=next(k for k,v in choices.items() if v==prior_mode)
             exit_label = st.selectbox('Exit', list(choices), index=list(choices).index(default_exit), key='bt_expiry_exit_label' if strategy in ('Expiry Day','Expiry Intraday') else 'bt_exit_label',
                 help='End of day: protective stop, no target. Target + SL / Target / EOD use fixed target and stop. Only Trailing SL activates a stepped profit lock. Every mode closes by session end; Expiry Day closes on its expiry session.')
+        a, b = st.columns(2)
+        with a:
+            daily_profit_target = st.number_input('Daily profit target (₹, 0 = off)', min_value=0., value=float(defaults.get('daily_profit_target', 0.)), step=500., format='%.0f', key='bt_daily_profit_target',
+                help='Account-level daily net profit lock in ₹ (0 disables).')
+        with b:
+            daily_loss_limit = st.number_input('Daily loss limit (₹, 0 = off)', min_value=0., value=float(defaults.get('daily_loss_limit', 0.)), step=500., format='%.0f', key='bt_daily_loss_limit',
+                help='Account-level daily net loss cutoff in ₹ (0 disables).')
         if instrument in ('CRUDEOIL','NATURALGAS','GOLDM'):
             st.caption('Futures: 20% assumed margin. TP30/SL15 scales to 2.2 ATR target / 1.2 ATR stop. Only Trailing SL activates the +1.2 ATR profit lock.')
         elif STRATEGY_LABELS[strategy][0] in ('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend','book_vertical_spread','book_vol_oi_momentum'):
@@ -230,7 +242,8 @@ def configure_card():
                 st.caption('Expiry sessions only. Both legs fill one minute after the signal and exit together that day. No overnight hold.')
         st.session_state.form_defaults = dict(instrument=instrument, strategy=strategy, period=period, capital=capital,
             allocation=allocation, interval=interval, take_profit=take_profit, stop_loss=stop_loss,
-            minimum_premium=premium, exit_label=exit_label,**expiry_settings)
+            minimum_premium=premium, exit_label=exit_label, daily_profit_target=daily_profit_target,
+            daily_loss_limit=daily_loss_limit, **expiry_settings)
         html('<div class="cost-bar">ⓘ &nbsp; Costs: Brokerage + taxes + slippage</div>')
         st.caption('Allocation caps committed capital, not maximum loss. Default allocation is 25%; entries require whole lots plus fees.')
         a, b = st.columns(2)
@@ -252,7 +265,8 @@ def configure_card():
                 st.session_state.selected_run = None
                 st.session_state.pop('notice', None)
             try:
-                config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label,**expiry_settings)
+                config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label,
+                                      daily_profit_target=daily_profit_target, daily_loss_limit=daily_loss_limit, **expiry_settings)
                 if submitted:
                     with st.spinner('Simulating eligible historical candles…'):
                         result = run_backtest(config, output=OUT, persist=False)
@@ -275,10 +289,21 @@ def render_result(run_id=None, full=True, result=None):
         result = read_json(path)
     run_id = result['run_id']
     config, metrics = result['config'], result['metrics']
-    from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
-    if config['strategy'] in TRADEMIND_STRATEGIES:
-        from trademind_ui import render_result as render_trademind_result
-        render_trademind_result(result,OUT)
+    if config.get('strategy') in REMOVED_STRATEGIES:
+        st.warning('Strategy removed: '+config['strategy']+'. Historical snapshot only; Backtest/Paper/Live execution is disabled.')
+        st.subheader('Historical result · '+run_id)
+        st.write(metrics)
+        st.caption('Stored simulation values are shown without recalculation. Independent market matching NOT VERIFIED.')
+        st.json(config)
+        frames = result.get('_frames', {})
+        for name in ('trades','equity','gross_equity','stop_paths','skipped_entries','legs'):
+            path = Path(OUT)/'runs'/run_id/(name+'.parquet')
+            frame = frames.get(name)
+            if frame is None and path.exists(): frame = pd.read_parquet(path)
+            if frame is not None:
+                st.write(name.replace('_',' ').title())
+                st.dataframe(frame,hide_index=True)
+                st.download_button('Download stored '+name,frame.to_csv(index=False),run_id+'_'+name+'.csv',key='historical_removed_'+name)
         return
     frames = result.get('_frames')
     def table(name):
@@ -367,6 +392,10 @@ def render_result(run_id=None, full=True, result=None):
 
 
 def load_saved(record):
+    if record['config'].get('strategy') in REMOVED_STRATEGIES:
+        st.session_state.removed_strategy_notice = 'Strategy removed: '+record['config']['strategy']+'. Saved configuration preserved; new runs disabled.'
+        st.session_state.active_result = None
+        return
     st.session_state.pending_strategy = record
     st.session_state.page = 'Backtests'
 
@@ -377,11 +406,13 @@ def render_saved(records, search):
         matched = [r for r in records if search.lower() in (r['name']+' '+r['config']['instrument']).lower()]
         if not matched: st.info('Save a configuration to reuse its exact parameters here.')
         for record in reversed(matched):
+            removed = record['config'].get('strategy') in REMOVED_STRATEGIES
             a, b = st.columns([3, 1], vertical_alignment='center')
             with a:
                 st.markdown(f'**{record["name"]}** · {record["config"]["instrument"]}')
                 st.caption(f'{record["config"]["timeframe"]} · {money(record["config"]["capital"])} · {record["last_run"] or "Not run yet"}')
-            b.button('Load', key='load_'+record['strategy_id'], width='stretch', on_click=load_saved, args=(record,))
+                if removed: st.warning('Strategy removed: '+record['config']['strategy']+'. Saved record preserved; execution disabled.')
+            b.button('Load', key='load_'+record['strategy_id'], width='stretch', on_click=load_saved, args=(record,), disabled=removed)
 
 
 try:

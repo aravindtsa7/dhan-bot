@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant_backtester import Config, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE, atomic_json, persist_result
+from quant_backtester import (Config, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE,
+    atomic_json, persist_result, REMOVED_STRATEGIES, assert_strategy_available, config_from_saved)
 from quant_lake import QuantDataLake, IST
 from step2_build_data_lake import writer_lock
-from trademind_backtest import LABELS as TRADEMIND_LABELS
 
 PAGES = ['Overview', 'Data Lake', 'Data Quality', 'Backtests', 'Reports', 'Live Paper Trading']
 INSTRUMENT_LABELS = {'NIFTY 50': 'NIFTY', 'SENSEX': 'SENSEX', 'BANKNIFTY': 'BANKNIFTY',
@@ -27,7 +27,6 @@ STRATEGY_LABELS = {
     'Expiry Day': ('expiry_day','both'),
     'Expiry Intraday': ('expiry_intraday','both'),
 }
-STRATEGY_LABELS.update({label:(key,'both') for key,label in TRADEMIND_LABELS.items()})
 INTERVALS = {'1 minute': '1m', '3 minutes': '3m', '5 minutes': '5m', '15 minutes': '15m'}
 EXITS = {'End of day': 'end_of_day', 'Trailing SL': 'trailing_sl', 'Target / EOD': 'target_eod'}
 EXPIRY_EXITS = {'Target + SL':'target_eod','Trailing SL':'trailing_sl','EOD':'end_of_day'}
@@ -43,7 +42,6 @@ STRATEGY_NOTES = {
     list(STRATEGY_LABELS)[7]: 'Smoothed tanh(return / lagged volatility), default six-bar lookback and T+2 warm-up, threshold 0.25; active ATM volume/OI confirmation. Missing OI is disclosed.',
     'Expiry Day': 'NIFTY / SENSEX: balanced fixed CE+PE basket, pre-expiry 15:25 signal / 15:26 fill. Combined expiry TP/SL/trail only. Modeled wing extrinsic decays with remaining expiry-session time. WEEK1 identity remains unverified.',
 }
-STRATEGY_NOTES.update({label:'Frozen TradeMind research only. Dated contracts and strict observed paths required; Paper/Live disabled. See README_TRADEMIND_STRATEGIES.md.' for label in TRADEMIND_LABELS.values()})
 
 SAVED_STRATEGIES = Path(__file__).resolve().parent/'data'/'saved_strategies.json'
 
@@ -66,7 +64,8 @@ def strategy_defaults(instrument,strategy):
 
 
 def build_config(instrument, strategy, period, capital, allocation, interval,
-                 take_profit, stop_loss, minimum_premium, exit_label, **expiry_settings):
+                 take_profit, stop_loss, minimum_premium, exit_label,
+                 daily_profit_target=0., daily_loss_limit=0., **expiry_settings):
     """Every visible form setting is preserved in the engine's hashed config."""
     if len(period) != 2:
         raise ValueError('Choose both the start and end of the Period.')
@@ -74,13 +73,9 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
     if end < begin:
         raise ValueError('The Period end must be on or after its start.')
     code = INSTRUMENT_LABELS[instrument]
+    assert_strategy_available(strategy)
+    if strategy not in STRATEGY_LABELS: raise ValueError('Unknown or removed strategy')
     engine_strategy, side = STRATEGY_LABELS[strategy]
-    if engine_strategy in TRADEMIND_LABELS:
-        from trademind_backtest import frozen_config
-        config = frozen_config(Config(instrument=code,strategy=engine_strategy,capital=float(capital),
-            start=begin.isoformat(),end=(end+timedelta(days=1)).isoformat()), **expiry_settings)
-        config.validate()
-        return config
     mcx = code in POINT_VALUE
     sl, tp = float(str(stop_loss).rstrip('%')), float(str(take_profit).rstrip('%'))
     config = Config(
@@ -94,6 +89,7 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
         sizing_mode='allocation', slippage=.5 if code=='NATURALGAS' or not mcx else 1.0,
         entry_start='17:00' if mcx and engine_strategy!='vwap_ema_pullback' else '09:25', volume_multiple=1.3,
         entry_end='22:45' if mcx and engine_strategy!='vwap_ema_pullback' else '14:30', price_policy='strict_observed' if mcx else 'model_continuity',
+        daily_profit_target=float(daily_profit_target), daily_loss_limit=float(daily_loss_limit),
         **expiry_settings,
     )
     config.validate()
@@ -101,6 +97,8 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
 
 
 def strategy_label(config):
+    if config.get('strategy') in REMOVED_STRATEGIES:
+        return 'Strategy removed: '+config['strategy']
     for label, (strategy, side) in STRATEGY_LABELS.items():
         if config.get('strategy') == strategy and config.get('option_side', 'both') == side:
             return label
@@ -172,7 +170,7 @@ def _entry(result, display_id, created_at):
     return dict(display_id=display_id, run_id=result['run_id'], created_at=created_at,
                 config=result['config'], metrics=result['metrics'],
                 strategy_label=strategy_label(result['config']), engine_version=result['engine_version'],
-                price_status=result['status'], status=result['status'] if result['config']['strategy'] in TRADEMIND_LABELS else 'Complete')
+                price_status=result['status'], status='Strategy removed' if result['config']['strategy'] in REMOVED_STRATEGIES else 'Complete')
 
 
 def load_registry(output):
@@ -238,8 +236,10 @@ def load_saved_strategies(path=None):
             raise ValueError('Invalid saved strategy record')
         if record['strategy_id'] in seen: raise ValueError('Duplicate saved strategy ID')
         seen.add(record['strategy_id'])
+        if record['config'].get('strategy') in REMOVED_STRATEGIES:
+            continue  # Preserve the record; UI and every execution entry point block it.
         try:
-            config = Config(**record['config'])
+            config = config_from_saved(record['config'])
         except TypeError as exc:
             raise ValueError('Invalid parameters in saved_strategies.json') from exc
         config.validate()
@@ -277,11 +277,14 @@ def save_strategy(output, config, label):
 
 def form_values(config, label):
     """Restore a saved terminal configuration without silently changing defaults."""
+    assert_strategy_available(config.get('strategy'))
     return dict(instrument=next(k for k, v in INSTRUMENT_LABELS.items() if v == config['instrument']),
                 strategy=strategy_label(config), period=(date.fromisoformat(config['start']), date.fromisoformat(config['end'])-timedelta(days=1)),
                 capital=int(config['capital']), allocation=f"{config['capital_usage_pct']:g}%",
-                interval=next(k for k, v in {**INTERVALS,'2 minutes':'2m'}.items() if v == config['timeframe']),
+                interval=next(k for k, v in INTERVALS.items() if v == config['timeframe']),
                 take_profit=f"{config['target_pct']:g}%", stop_loss=f"{config['sl_pct']:g}%",
                 minimum_premium=float(config['minimum_premium']),
                 exit_label=next(k for k, v in (EXPIRY_EXITS if config['strategy'] in ('expiry_day','expiry_intraday') else EXITS).items() if v == config['exit_mode']),
-                **{k:v for k,v in config.items() if k.startswith(('expiry_','intraday_','trademind_'))})
+                daily_profit_target=float(config.get('daily_profit_target', 0.)),
+                daily_loss_limit=float(config.get('daily_loss_limit', 0.)),
+                **{k:v for k,v in config.items() if k.startswith(('expiry_','intraday_'))})

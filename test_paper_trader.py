@@ -1,6 +1,6 @@
 """Offline fixtures: packet layout, causality, virtual risk and restart recovery."""
-from dataclasses import replace
-from datetime import datetime
+from dataclasses import asdict, replace
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch, Mock
@@ -12,7 +12,16 @@ import unittest
 import pandas as pd
 from paper_feed import Asset, Tick, IST, FeedError, FEED_IST_OFFSET, decode_packets, warmup
 from paper_engine import PaperAccount, AccountLock, MinuteBook
+from paper_basket import BasketPaperAccount
 from quant_backtester import Config, HIGH_STRATEGIES
+from quant_terminal import STRATEGY_LABELS, build_config, form_values
+from step6_paper_trader import (
+    book_activity_confirmed,
+    build_status_quotes,
+    pending_deadline,
+    quote_label,
+    warmup_candidates,
+)
 
 
 NOW=datetime(2026,10,23,17,35,tzinfo=IST).timestamp()
@@ -227,6 +236,144 @@ class CandleTests(unittest.TestCase):
             self.assertIsNone(b.signal(config(),at+1))  # one signal decision/bar
             b=MinuteBook(); b.seed(rows[:-1],at)
             self.assertIsNone(b.signal(config(),at))
+
+
+class LivePaperGapTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pending_deadline_and_parallel_warmup_candidates(self):
+        minute_base = int(NOW) // 60 * 60
+        self.assertEqual(pending_deadline(minute_base + 2), minute_base + 47)
+        self.assertEqual(pending_deadline(minute_base + 14), minute_base + 55)
+        candidates = [
+            (f'CAND_{i}', Asset('NIFTY', 2, 41000 + i, '2026-10-29', 65, 24000 + i * 50, 'CE'))
+            for i in range(6)
+        ]
+        with patch('step6_paper_trader.warmup', side_effect=lambda cid, tok, a, now: [{'security_id': a.security_id}]) as mocked:
+            hist = warmup_candidates('cid', 'tok', candidates, NOW)
+        self.assertEqual(mocked.call_count, 6)
+        self.assertEqual(set(hist), {a.key for _, a in candidates})
+
+    def test_book_activity_confirmed_maps_pe_and_strip_sides(self):
+        captured = {}
+        def fake_activity(data, day, bars, lookback, at, side, strike, c):
+            captured['side'] = side
+            return dict(signal_log_volume=1.0, signal_oi_available=False, signal_log_oi=0.0)
+        rows = [
+            dict(timestamp=NOW - 300 * (10 - i), open=100, high=102, low=99, close=101, volume=500, oi=1000 + i * 10)
+            for i in range(10)
+        ]
+        c = config(instrument='NIFTY', strategy='book_vertical_spread', timeframe='5m')
+        with patch('quant_book.activity', side_effect=fake_activity):
+            self.assertTrue(book_activity_confirmed(rows, c, (615, 'PE', 0, None, 10), NOW))
+            self.assertEqual(captured['side'], 'PE')
+            self.assertTrue(book_activity_confirmed(rows, c, (615, 'STRIP', 0, None, 10), NOW))
+            self.assertEqual(captured['side'], 'PE')
+            self.assertTrue(book_activity_confirmed(rows, c, (615, 'CE', 0, None, 10), NOW))
+            self.assertEqual(captured['side'], 'CE')
+
+    def test_build_status_quotes_keeps_spot_and_option_legs_distinct(self):
+        spot = Asset('NIFTY', 0, 13, '2099-12-31', 65)
+        ce = Asset('NIFTY', 2, 51001, '2026-10-29', 65, 24000.0, 'CE')
+        pe = Asset('NIFTY', 2, 51002, '2026-10-29', 65, 23800.0, 'PE')
+        latest = {
+            spot.key: Tick(spot.key, 24012.5, NOW, NOW),
+            ce.key: Tick(ce.key, 145.25, NOW, NOW, 1000, 5000, 145.0, 145.5),
+            pe.key: Tick(pe.key, 82.75, NOW, NOW, 900, 4200, 82.5, 83.0),
+        }
+        quotes, option_quotes, _ = build_status_quotes((spot, ce, pe), latest, NOW)
+        self.assertEqual(quotes['NIFTY']['ltp'], 24012.5)
+        self.assertEqual(quote_label(ce), 'NIFTY:51001')
+        self.assertEqual(quotes['NIFTY:51001']['ltp'], 145.25)
+        self.assertEqual(option_quotes['NIFTY:51002']['option_type'], 'PE')
+        self.assertEqual(option_quotes['NIFTY:51002']['strike'], 23800.0)
+
+    def test_async_leg_skew_skips_transient_violation_until_synchronized(self):
+        legs = [
+            Asset('NIFTY', 2, 61001, '2026-10-29', 65, 24000, 'CE'),
+            Asset('NIFTY', 2, 61002, '2026-10-29', 65, 24100, 'CE'),
+        ]
+        c = replace(
+            Config(
+                instrument='NIFTY',
+                strategy='book_vertical_spread',
+                timeframe='5m',
+                capital=500000,
+                sizing_mode='fixed_lots',
+                lots=1,
+                slippage=0,
+                entry_start='09:20',
+                entry_end='15:10',
+            )
+        )
+        at = datetime(2026, 10, 23, 10, 15, 28, tzinfo=IST).timestamp()
+        local = datetime.fromtimestamp(at, IST)
+        ev = (local.hour * 60 + local.minute, 'BULL_CALL_SPREAD', 0, None, 20)
+        a = BasketPaperAccount(self.root, c, legs[0], lambda _: None, allow_async_skew=True)
+        quotes = {
+            legs[0].key: Tick(legs[0].key, 120.0, at, at, wire_epoch=at + FEED_IST_OFFSET),
+            legs[1].key: Tick(legs[1].key, 60.0, at, at, wire_epoch=at + FEED_IST_OFFSET),
+        }
+        resolved = [
+            (dict(side='CE', strike=24000, ratio=1), legs[0]),
+            (dict(side='CE', strike=24100, ratio=-1), legs[1]),
+        ]
+        # Pending basket fill at :28s succeeds and enters cleanly
+        self.assertTrue(a.enter_basket(ev, resolved, quotes, at))
+        # Asynchronous tick where short leg briefly jumps above long leg across different timestamps does not freeze account
+        a.on_tick(Tick(legs[1].key, 130.0, at + 1, at + 1, wire_epoch=at + 1 + FEED_IST_OFFSET), at + 1)
+        self.assertEqual(a.state.get('account_status', 'ACTIVE'), 'ACTIVE')
+        self.assertIsNotNone(a.position)
+        # Once the long leg catches up at at + 1, MTM resumes cleanly
+        a.on_tick(Tick(legs[0].key, 195.0, at + 1, at + 1, wire_epoch=at + 1 + FEED_IST_OFFSET), at + 1)
+        self.assertEqual(a.state.get('account_status', 'ACTIVE'), 'ACTIVE')
+
+    def test_quiet_minute_resilience_and_ui_daily_limits_wiring(self):
+        at = datetime(2026, 10, 23, 17, 30, tzinfo=IST).timestamp()
+        start = at - 3600
+        # Drop one interior minute (i == 25) to simulate a quiet zero-tick minute
+        rows = [
+            dict(timestamp=start + i * 60, open=100, high=110 if i < 30 else 105, low=90 if i < 30 else 95, close=100, volume=100)
+            for i in range(60)
+            if i != 25
+        ]
+        bars = pd.DataFrame([
+            dict(timestamp=pd.Timestamp(start + i * 300, unit='s', tz='UTC').tz_convert(IST), open=105, close=110, high=111, low=104, volume=100, adx=30, atr=10)
+            for i in range(12)
+        ])
+        b = MinuteBook(allow_quiet_minutes=True)
+        b.seed(rows, at)
+        self.assertIn(int(start + 25 * 60), b.rows)
+        self.assertEqual(b.rows[int(start + 25 * 60)]['volume'], 0.0)
+        # Also drop a minute after seed to verify live signal backfill when allow_quiet_minutes=True
+        del b.rows[int(start + 40 * 60)]
+        with patch('paper_engine.make_bars', return_value=bars):
+            self.assertEqual(b.signal(config(), at)[:2], (1050, 'LONG'))
+
+        cfg = build_config(
+            'NIFTY 50',
+            next(iter(STRATEGY_LABELS)),
+            (date(2026, 10, 19), date(2026, 10, 21)),
+            100000,
+            '25%',
+            '5 minutes',
+            '25%',
+            '15%',
+            50,
+            'Target / EOD',
+            daily_profit_target=4500.0,
+            daily_loss_limit=2500.0,
+        )
+        self.assertEqual(cfg.daily_profit_target, 4500.0)
+        self.assertEqual(cfg.daily_loss_limit, 2500.0)
+        restored = form_values(asdict(cfg), 'Saved Test Strategy')
+        self.assertEqual(restored['daily_profit_target'], 4500.0)
+        self.assertEqual(restored['daily_loss_limit'], 2500.0)
 
 
 if __name__=='__main__': unittest.main()

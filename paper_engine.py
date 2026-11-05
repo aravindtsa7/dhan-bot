@@ -57,8 +57,8 @@ class AccountLock:
 
 class MinuteBook:
     """No forward-filled gap candles. REST warmup never creates retroactive trades."""
-    def __init__(self,history_days=0):
-        self.history_days=history_days
+    def __init__(self,history_days=0,allow_quiet_minutes=False):
+        self.history_days=history_days; self.allow_quiet_minutes=allow_quiet_minutes
         self.rows={}; self.current=None; self.cumulative=None; self.last_epoch=None; self.last_received=None
         self.last_signal_minute=None; self.day=None
     def seed(self,rows,now):
@@ -68,6 +68,12 @@ class MinuteBook:
             age=(day-datetime.fromtimestamp(row['timestamp'],IST).date()).days
             if 0<=age<=self.history_days and row['timestamp']+60<=now:
                 self.rows[int(row['timestamp'])]=dict(row)
+        today_stamps=sorted(t for t in self.rows if datetime.fromtimestamp(t,IST).date()==day)
+        if self.allow_quiet_minutes and len(today_stamps)>=2:
+            for t in range(today_stamps[0],today_stamps[-1],60):
+                if t not in self.rows and t-60 in self.rows:
+                    prev=self.rows[t-60]; price=prev['close']
+                    self.rows[t]=dict(timestamp=t,open=price,high=price,low=price,close=price,volume=0,oi=prev.get('oi',float('nan')))
     def disconnect(self):
         if self.current: self.current['valid']=False
         self.last_received=None; self.cumulative=None
@@ -117,6 +123,11 @@ class MinuteBook:
         hour, mins = (9,0) if c.instrument in POINT_VALUE else (9,15)
         begin=int(local.replace(hour=hour if research else 16,minute=mins if research else 30,second=0,microsecond=0).timestamp())
         required=range(begin,minute_epoch,60)
+        if self.allow_quiet_minutes and len(required)>=60 and len(self.rows)>=55 and begin in self.rows and minute_epoch-60 in self.rows:
+            for t in required:
+                if t not in self.rows and t-60 in self.rows:
+                    prev=self.rows[t-60]; price=prev['close']
+                    self.rows[t]=dict(timestamp=t,open=price,high=price,low=price,close=price,volume=0,oi=prev.get('oi',float('nan')))
         if any(t not in self.rows for t in required): return None
         rows=[r for t,r in sorted(self.rows.items()) if t<minute_epoch]
         if len(rows)<60: return None
@@ -142,13 +153,10 @@ class MinuteBook:
 class PaperAccount:
     """One virtual position, fixed-contract identity and account-level daily locks."""
     def __init__(self,root,c,asset,emit=print):
-        from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
-        if c.strategy in TRADEMIND_STRATEGIES:
-            raise ValueError('TradeMind strategies are backtest-only; Paper/Live disabled')
+        c.validate()  # Reject removed/invalid strategies before any account writes.
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
-        self.c=c; c.validate(); self.asset=asset; self.emit=emit
+        self.c=c; self.asset=asset; self.emit=emit
         policy=asdict(c); policy.pop('start'); policy.pop('end')
-        policy={k:v for k,v in policy.items() if not k.startswith('trademind_')}
         if c.strategy!='expiry_intraday':
             policy={k:v for k,v in policy.items() if not k.startswith('intraday_')}
         if c.strategy!='expiry_day':

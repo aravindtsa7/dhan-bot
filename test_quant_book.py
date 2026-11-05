@@ -54,18 +54,11 @@ class BookTests(unittest.TestCase):
                 c=build_config('NATURALGAS' if key=='mcx_evening_breakout' else 'NIFTY 50',label,
                     (pd.Timestamp(DATE).date(),pd.Timestamp(DATE).date()),1_000_000,'100%','5 minutes','25%','15%',0,'Target / EOD')
                 record=save_strategy(root,c,f'custom_{i}')
-                from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
-                if key in TRADEMIND_STRATEGIES:
-                    with self.assertRaisesRegex(ValueError,'backtest-only'):
-                        configuration(SimpleNamespace(saved_strategy=record['strategy_id'],strategies_file=saved_strategy_path(root)))
-                    with self.assertRaisesRegex(ValueError,'backtest-only'):
-                        launch_strategy(record,root/'paper',saved_strategy_path(root))
-                    continue
                 actual=configuration(SimpleNamespace(saved_strategy=record['strategy_id'],strategies_file=saved_strategy_path(root)))
                 self.assertEqual(actual.strategy,key)
                 with patch('quant_deployment.subprocess.Popen',return_value=Mock(pid=123)):
                     self.assertEqual(launch_strategy(record,root/'paper',saved_strategy_path(root)),123)
-            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),16)
+            self.assertEqual(len(load_saved_strategies(saved_strategy_path(root))),10)
             c,d,_=fixture(); result=run_backtest(c,d,persist=False)
             save_result(root,result,'spread saved')
             self.assertTrue((root/'runs'/result['run_id']/'trades.parquet').exists())
@@ -354,10 +347,10 @@ class BookTests(unittest.TestCase):
         original=asdict(c)
         for key in ('start','end','momentum_lookback','momentum_threshold'): original.pop(key)
         for key in list(original):
-            if key.startswith(('expiry_','intraday_','trademind_')): original.pop(key)
+            if key.startswith(('expiry_','intraday_')): original.pop(key)
         digest=hashlib.sha256(json.dumps(original,sort_keys=True).encode()).hexdigest()
-        # Independently recovered from Config at pre-TradeMind HEAD 0fc93e8;
-        # new backtest-only fields were absent from that policy preimage.
+        # Independently recovered from Config at HEAD 0fc93e8; preserve the
+        # existing account policy preimage when unrelated fields are added.
         self.assertEqual(digest,'45ab3f8de804ae732ba9b7fba2d7667cf67185528fb12e9faf211eccdc04144c')
         with TemporaryDirectory() as directory:
             account=PaperAccount(directory,c,asset,lambda _:None)

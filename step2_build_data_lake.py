@@ -374,7 +374,7 @@ def main():
     p.add_argument('--start',default='2025-01-01');p.add_argument('--end',default=datetime.now(ZoneInfo(IST)).date().isoformat())
     p.add_argument('--root',type=Path,default=ROOT);p.add_argument('--summary-only',action='store_true')
     p.add_argument('--only',choices=['all','spot','options','mcx'],default='all')
-    p.add_argument('--option-wing',type=int,choices=range(1,11),default=1,
+    p.add_argument('--option-wing','--max-wing-steps',dest='option_wing',type=int,choices=range(1,11),default=1,
                    help='Fetch ATM plus this many strikes on each side; use 10 for the full index ladder')
     args=p.parse_args();start=date.fromisoformat(args.start);end=date.fromisoformat(args.end)
     if start<date(2025,1,1) or end<=start or end>datetime.now(ZoneInfo(IST)).date():

@@ -24,7 +24,6 @@ from quant_strategy_models import futures_risk, profit_lock
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
 from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
 from quant_data_quality import require_current_audit
-from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
 
 ENGINE_VERSION = '5.5.0'
 OUT = ROOT / 'backtests'
@@ -38,7 +37,28 @@ RESEARCH_STRATEGIES = ['vwap_ema_pullback', 'orb_volume_breakout',
                        'supertrend_adx_trend', 'mcx_evening_breakout']
 BOOK_STRATEGIES = ['book_vertical_spread', 'book_iron_butterfly',
                    'book_strap_strip', 'book_vol_oi_momentum']
-STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day','expiry_intraday'] + list(TRADEMIND_STRATEGIES)
+STRATEGIES = RESEARCH_STRATEGIES + BOOK_STRATEGIES + ['expiry_day','expiry_intraday']
+# Tombstones identify historical records only. No implementation or execution
+# route is retained for these keys.
+REMOVED_STRATEGIES = frozenset(('v2_trend_down_pe', 'v4_momentum_expansion_pe',
+    'v8_bullish_reclaim_ce', 't3_vix_atm_iron_fly', 'ce_pe_rise5m_h30', 'nifty_orb_single_option'))
+OBSOLETE_CONFIG_FIELDS = frozenset(('trademind_provider', 'trademind_scenario', 'trademind_execution_mode'))
+
+
+class StrategyRemovedError(ValueError):
+    """Safe, fixed-catalog validation message for retired saved configurations."""
+
+
+def assert_strategy_available(strategy):
+    if strategy in REMOVED_STRATEGIES:
+        raise StrategyRemovedError(f'Strategy removed: {strategy}. Historical results are read-only; new Backtest/Paper/Live runs are disabled.')
+
+
+def config_from_saved(values):
+    """Read old supported configurations without resurrecting removed logic."""
+    assert_strategy_available(values.get('strategy'))
+    return Config(**{k:v for k,v in values.items() if k not in OBSOLETE_CONFIG_FIELDS})
+
 INSTRUMENTS = ['NIFTY', 'SENSEX', 'CRUDEOIL', 'NATURALGAS', 'GOLDM']
 POINT_VALUE = {'CRUDEOIL': 100, 'NATURALGAS': 1250, 'GOLDM': 10}
 LIMITATIONS = [
@@ -126,13 +146,9 @@ class Config:
 
     intraday_entry_signal: str = '09:20'
     intraday_exit_cutoff: str = '15:20'
-    trademind_provider: str = 'dhan'
-    trademind_scenario: str = 'source_baseline'
 
     def validate(self):
-        if self.strategy in TRADEMIND_STRATEGIES:
-            from trademind_backtest import validate_config
-            return validate_config(self)
+        assert_strategy_available(self.strategy)
         if self.instrument == 'BANKNIFTY':
             raise ValueError('BANKNIFTY spot is available, but option history and a dated contract schedule are not configured. Choose NIFTY 50 or SENSEX for option backtests.')
         if self.instrument not in INSTRUMENTS or self.strategy not in STRATEGIES + LEGACY_STRATEGIES:
@@ -1016,17 +1032,6 @@ def persist_result(result, output=OUT):
 
 def run_backtest(c, data=None, output=OUT, persist=True):
     c.validate()
-    if c.strategy in TRADEMIND_STRATEGIES:
-        from trademind_backtest import availability, run_observed
-        from quant_trademind import Unavailable
-        ready = availability(c.strategy, c.trademind_provider)
-        if not ready['runnable']:
-            raise Unavailable(ready['reason'])
-        if data is None:
-            from trademind_data import RetainedTradeMindLake
-            data = RetainedTradeMindLake()
-        result = run_observed(c, data)
-        return persist_result(result, output) if persist else result
     data=data or ResearchData(c.instrument,c.start,c.end,**({'expiry_config':c} if c.strategy=='expiry_day' else {}))
     if c.strategy=='expiry_day':
         from quant_expiry import check_prepared_windows
@@ -1045,7 +1050,6 @@ def run_backtest(c, data=None, output=OUT, persist=True):
     if c.price_policy=='strict_observed' and any(e.get('method')=='synthetic_ffill' for e in execution_repairs+warmup_repairs):
         raise MissingObservedPrice('Strict-observed run includes synthetic repaired inputs in a dependency window. Choose an unrepaired observed-data range or explicitly use the modeled-price policy.')
     identity_config=asdict(c)
-    identity_config={k:v for k,v in identity_config.items() if not k.startswith('trademind_')}
     if c.strategy!='expiry_intraday':
         identity_config={k:v for k,v in identity_config.items() if not k.startswith('intraday_')}
     revision='stateful-execution-v5' if c.strategy=='expiry_day' else 'validated-window-baskets-v8'

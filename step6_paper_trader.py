@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 from urllib.parse import urlencode
 
@@ -21,7 +22,7 @@ from websockets.exceptions import WebSocketException
 from paper_feed import (Asset, Tick, IST, SEGMENTS, FeedError, decode_packets, instruments, warmup,
                         master_path, option_asset, option_volume_confirmed)
 from paper_engine import PaperAccount, AccountLock, MinuteBook, atomic, stamp
-from quant_backtester import Config, HIGH_STRATEGIES, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE
+from quant_backtester import Config, HIGH_STRATEGIES, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE, config_from_saved, StrategyRemovedError
 
 BASE=Path(__file__).resolve().parent
 
@@ -35,16 +36,48 @@ def book_activity_confirmed(rows,c,event,now):
     import pandas as pd
     from types import SimpleNamespace
     from quant_book import activity
+    side='PE' if event[1] in ('PE','STRIP','BEAR_PUT_SPREAD') else 'CE'
     local=datetime.fromtimestamp(now,IST)
     candles={int((datetime.fromtimestamp(r['timestamp'],IST)-local.replace(hour=0,minute=0,second=0,microsecond=0)).total_seconds()/60):r
              for r in rows if datetime.fromtimestamp(r['timestamp'],IST).date()==local.date()}
-    day={'option_meta':{(k,'CE',0):(r.get('oi',float('nan')),) for k,r in candles.items()},
-         'rolling':{('CE','ATM'):{k:0 for k in candles}},
-         'options':{(k,'CE',0):tuple(r[v] for v in ('open','high','low','close','volume')) for k,r in candles.items()}}
-    data=SimpleNamespace(mcx=False,price=lambda d,k,s,strike:tuple(candles[k][v] for v in ('open','high','low','close','volume')) if k in candles else None)
-    a=activity(data,day,pd.DataFrame({'volume':[0]*(c.momentum_lookback+1)}),c.momentum_lookback,event[0],'CE',0,c)
+    day={'option_meta':{(k,side,0):(r.get('oi',float('nan')),) for k,r in candles.items()},
+         'rolling':{(side,'ATM'):{k:0 for k in candles}},
+         'options':{(k,side,0):tuple(r[v] for v in ('open','high','low','close','volume')) for k,r in candles.items()}}
+    data=SimpleNamespace(mcx=False,price=lambda d,k,s,strike:tuple(candles[k][v] for v in ('open','high','low','close','volume')) if s==side and k in candles else None)
+    a=activity(data,day,pd.DataFrame({'volume':[0]*(c.momentum_lookback+1)}),c.momentum_lookback,event[0],side,0,c)
     return bool(a and a['signal_log_volume']>math.log(max(1.4,c.volume_multiple) if c.strategy=='book_strap_strip' else c.volume_multiple) and
                 (c.strategy!='book_vol_oi_momentum' or not a['signal_oi_available'] or a['signal_log_oi']>0))
+
+
+def pending_deadline(received):
+    return min(int(received)//60*60+55,int(received)+45)
+
+
+def warmup_candidates(client_id,token,candidates,now):
+    from concurrent.futures import ThreadPoolExecutor
+    if not candidates: return {}
+    with ThreadPoolExecutor(max_workers=min(6,len(candidates))) as pool:
+        futures={asset.key:pool.submit(warmup,client_id,token,asset,now) for _,asset in candidates}
+        return {key:future.result() for key,future in futures.items()}
+
+
+def quote_label(asset):
+    return f'{asset.name}:{asset.security_id}' if asset.option_type else asset.name
+
+
+def build_status_quotes(assets,latest,now):
+    quotes={}; option_quotes={}; parts=[]
+    for asset in assets:
+        q=latest.get(asset.key); fresh=bool(q and q.fresh(now))
+        label=quote_label(asset)
+        entry=dict(ltp=q.price if q else None,exchange_time=stamp(q.exchange_time) if q else None,
+            fresh=fresh,age_seconds=round(now-q.exchange_time,1) if q else None,wire_epoch=q.wire_epoch if q else None)
+        if asset.option_type:
+            entry.update(security_id=asset.security_id,expiry=asset.expiry,strike=asset.strike,option_type=asset.option_type)
+            option_quotes[label]=entry
+        quotes[label]=entry
+        parts.append(f'{label}={q.price:.2f}{"" if fresh else "(STALE)"}' if q else f'{label}=WAIT')
+    return quotes,option_quotes,parts
 
 
 def logger(root):
@@ -64,10 +97,7 @@ def configuration(args):
         records=load_saved_strategies(args.strategies_file)
         record=next((r for r in records if args.saved_strategy in (r['strategy_id'],r['name'])),None)
         if record is None: raise ValueError('Saved strategy was not found')
-        c=Config(**record['config'])
-        from quant_trademind import STRATEGIES as TRADEMIND_STRATEGIES
-        if c.strategy in TRADEMIND_STRATEGIES:
-            raise ValueError('TradeMind strategies are backtest-only; Paper/Live disabled')
+        c=config_from_saved(record['config'])
         if c.strategy not in STRATEGIES: raise ValueError('Saved strategy logic is unsupported')
         today=datetime.now(IST).date()
         c=replace(c,start=str(today),end=str(today+timedelta(days=1)))
@@ -113,14 +143,14 @@ async def live(args,c,emit,transport):
     chosen=next(a for a in assets if a.name==c.instrument)
     from paper_basket import BasketPaperAccount
     from paper_feed import option_structure_assets
-    account=BasketPaperAccount(args.output,c,chosen,emit)
+    account=BasketPaperAccount(args.output,c,chosen,emit,allow_async_skew=True)
     if account.position:
         opened=Asset(**account.position['asset'])
         if opened.key not in {a.key for a in assets}: assets.append(opened)
         for leg in account.position.get('legs',[]):
             opened=Asset(**leg['asset'])
             if opened.key not in {a.key for a in assets}: assets.append(opened)
-    by_key={a.key:a for a in assets}; book=MinuteBook(history_days=5 if c.strategy in STRATEGIES else 0)
+    by_key={a.key:a for a in assets}; book=MinuteBook(history_days=5 if c.strategy in STRATEGIES else 0,allow_quiet_minutes=True)
     option_master=None; pending=None
     if c.instrument not in POINT_VALUE:
         import pandas as pd
@@ -129,9 +159,9 @@ async def live(args,c,emit,transport):
     emit(f'Strategy {c.strategy} {chosen.name} signal contract {chosen.security_id}; PAPER ONLY')
     emit(f'Capital INR {c.capital:,.0f} | allocation {c.capital_usage_pct:g}% | assumed margin {c.futures_margin_pct:g}% | daily loss/profit {c.daily_loss_limit:g}/{c.daily_profit_target:g}')
     stopping=False; shutdown_started=None; started=time.monotonic(); ws=None
-    last_print=0.; last_seed=0.; seed_task=None; last_message=0.; retry_at=0.; attempts=0
-    latest={}; last_epochs={}; counters={a.name:0 for a in assets}; rejects=0; seed_count=0
-    fresh_counts={a.name:0 for a in assets}
+    last_print=0.; last_seed=-60.; seed_task=None; last_message=0.; retry_at=0.; attempts=0
+    latest={}; last_epochs={}; counters={quote_label(a):0 for a in assets}; rejects=0; seed_count=0
+    fresh_counts={quote_label(a):0 for a in assets}
     stop_reason='shutdown'; fatal=None
     def stop(*_):
         nonlocal stopping,shutdown_started
@@ -181,8 +211,8 @@ async def live(args,c,emit,transport):
                         group=[a for a in assets if (15 if a.segment==0 else 21)==code]
                         await ws.send(json.dumps(dict(RequestCode=code,InstrumentCount=len(group),InstrumentList=[dict(ExchangeSegment=SEGMENTS[a.segment],SecurityId=str(a.security_id)) for a in group])))
                     last_message=mono; latest={}; book.disconnect(); account.disconnect()
-                    emit('FEED connected; subscriptions sent for '+', '.join(a.name for a in assets))
-                    last_seed=0
+                    emit('FEED connected; subscriptions sent for '+', '.join(quote_label(a) for a in assets))
+                    last_seed=-60.
                 except Exception:
                     emit('FEED connection failed; credentials and upstream exception text suppressed')
                     await drop()
@@ -219,13 +249,13 @@ async def live(args,c,emit,transport):
                 # as transport failures and retry indefinitely.
                 for tick in ticks:
                     if tick.key not in by_key: continue
-                    name=by_key[tick.key].name; counters[name]+=1
+                    name=quote_label(by_key[tick.key]); counters[name]=counters.get(name,0)+1
                     if not tick.fresh(received):
                         latest[tick.key]=tick; rejects+=1; continue
                     if tick.exchange_time<last_epochs.get(tick.key,0): rejects+=1; continue
                     last_epochs[tick.key]=tick.exchange_time
                     latest[tick.key]=tick
-                    fresh_counts[name]+=1
+                    fresh_counts[name]=fresh_counts.get(name,0)+1
                     attempts=0
                     account.on_tick(tick,received)
                     if pending and isinstance(pending[1],list):
@@ -248,21 +278,20 @@ async def live(args,c,emit,transport):
                             elif c.strategy in ('expiry_day','expiry_intraday'):
                                 from quant_expiry import paper_candidates, paper_selection
                                 candidates=paper_candidates(option_master,c.instrument,tick.price,received)
-                                histories={}
-                                for _,asset in candidates:
-                                    histories[asset.key]=await asyncio.to_thread(warmup,client_id,token,asset,received)
+                                histories=await asyncio.to_thread(warmup_candidates,client_id,token,candidates,received)
                                 resolved=paper_selection(c,candidates,histories,event,received)
                                 if len(resolved)==2:
                                     for _,asset in resolved:
                                         if asset.key not in by_key:
                                             assets.append(asset);by_key[asset.key]=asset
                                             await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
-                                    pending=(event,resolved,int(received)//60*60+15)
+                                    pending=(event,resolved,pending_deadline(received))
                             elif c.strategy in BOOK_STRATEGIES[:3]:
                                 resolved=option_structure_assets(option_master,c.instrument,event[1],tick.price,received)
                                 confirmed=True
-                                if c.strategy=='book_strap_strip':
-                                    asset=next(a for spec,a in resolved if spec['side']==('CE' if event[1]=='STRAP' else 'PE'))
+                                if c.strategy in ('book_vertical_spread','book_strap_strip'):
+                                    target_side='PE' if event[1] in ('STRIP','BEAR_PUT_SPREAD') else 'CE'
+                                    asset=next(a for spec,a in resolved if spec['side']==target_side and spec['ratio']>0)
                                     rows=await asyncio.to_thread(warmup,client_id,token,asset,received)
                                     confirmed=book_activity_confirmed(rows,c,event,received)
                                 if confirmed:
@@ -270,7 +299,7 @@ async def live(args,c,emit,transport):
                                         if asset.key not in by_key:
                                             assets.append(asset); by_key[asset.key]=asset
                                             await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
-                                    pending=(event,resolved,int(received)//60*60+15)
+                                    pending=(event,resolved,pending_deadline(received))
                             else:
                                 asset=option_asset(option_master,c.instrument,event[1],tick.price,received)
                                 confirmed=True
@@ -281,15 +310,11 @@ async def live(args,c,emit,transport):
                                     if asset.key not in by_key:
                                         assets.append(asset); by_key[asset.key]=asset
                                         await ws.send(json.dumps(dict(RequestCode=21,InstrumentCount=1,InstrumentList=[dict(ExchangeSegment=SEGMENTS[asset.segment],SecurityId=str(asset.security_id))])))
-                                    pending=(event,asset,int(received)//60*60+15)
+                                    pending=(event,asset,pending_deadline(received))
             else: await asyncio.sleep(.25)
             if mono-last_print>=args.status_seconds:
-                last_print=mono; now=time.time(); quotes={}; parts=[]
-                for asset in assets:
-                    q=latest.get(asset.key); fresh=bool(q and q.fresh(now))
-                    quotes[asset.name]=dict(ltp=q.price if q else None,exchange_time=stamp(q.exchange_time) if q else None,
-                        fresh=fresh,age_seconds=round(now-q.exchange_time,1) if q else None,wire_epoch=q.wire_epoch if q else None)
-                    parts.append(f'{asset.name}={q.price:.2f}{"" if fresh else "(STALE)"}' if q else f'{asset.name}=WAIT')
+                last_print=mono; now=time.time()
+                quotes,option_quotes,parts=build_status_quotes(assets,latest,now)
                 p=account.position; mark=None
                 if p:
                     q=latest.get(Asset(**p['asset']).key)
@@ -305,7 +330,7 @@ async def live(args,c,emit,transport):
                         quote_time=stamp(min(q.exchange_time for q in leg_quotes)) if leg_quotes else None
                     positions.append(dict(trade_id=p['trade_id'],security_id=p['security_id'],
                         ltp=live_value,quote_time=quote_time,net_pnl=mark,contract=p.get('contract','')))
-                status=dict(mode='PAPER_ONLY',timestamp=stamp(now),running=True,connected=ws is not None,quotes=quotes,positions=positions,
+                status=dict(mode='PAPER_ONLY',timestamp=stamp(now),running=True,connected=ws is not None,quotes=quotes,option_quotes=option_quotes,positions=positions,
                     open_positions=int(p is not None),net_open_pnl=mark,realized_today=account.realized_today(now),
                     realized_equity=account.equity,daily_lock=account.session(now)['lock'],ticks=counters,
                     stale_or_rejected=rejects,completed_candles=len(book.rows),monitor_only=args.monitor_only)
@@ -362,11 +387,18 @@ def main():
     if args.mode=='demo' and args.saved_strategy: parser.error('Saved strategies deploy in live paper mode only')
     if not math.isfinite(args.duration) or args.duration<0 or not math_is_positive(args.status_seconds): parser.error('Invalid duration/status interval')
     if args.mode=='demo' and (args.strategy!='h4' or args.trade_instrument!='CRUDEOIL'): parser.error('Demo uses Crude H4 execution settings')
+    try:
+        c=configuration(args); c.validate()
+    except StrategyRemovedError as exc:
+        print(str(exc),file=sys.stderr)
+        return 2
+    except ValueError:
+        print('Configuration validation failed; check settings.',file=sys.stderr)
+        return 2
     args.output=(args.output or BASE/'data_lake'/('paper_demo' if args.mode=='demo' else 'paper_trades')).resolve()
     args.output.mkdir(parents=True,exist_ok=True)
     log,transport=logger(args.output)
     try:
-        c=configuration(args); c.validate()
         with AccountLock(args.output):
             atomic(args.output/'process.json',dict(pid=os.getpid(),started_at=stamp(time.time()),mode=args.mode))
             if (args.output/'STOP').exists(): log.info('STOP file exists; remove it before starting this account'); return 0
