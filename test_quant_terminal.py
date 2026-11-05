@@ -170,6 +170,34 @@ class TerminalParameterTests(unittest.TestCase):
             self.assertTrue(all(v is None for v in snapshot['markets'].values()))
             self.assertEqual(snapshot['quality'],{})
 
+    def test_allocated_capital_scales_with_balance_and_daily_limits_are_pct_of_allocated(self):
+        with self.assertRaises(ValueError):
+            replace(self.config(), daily_profit_target=501).validate()
+        with self.assertRaises(ValueError):
+            replace(self.config(), daily_loss_limit=501).validate()
+        c = replace(self.config(sizing_mode='allocation', capital=28000, capital_usage_pct=50, target_pct=100, sl_pct=80, max_trades_day=2), compound=False)
+        d = prepared(c, events=[(600, 'CE', 24000, None, 1), (610, 'CE', 24000, None, 1)])
+        d.price = lambda day, t, s, k: (100, 201, 99, 200, 100)
+        trades, _, _ = execute_portfolio(d, c, 'scale')
+        # First trade: 28000 * 50% = 14000 allocated -> 2 lots (130 qty). After +100% profit, balance > 40000 -> 50% allocated > 20000 -> 3+ lots (195+ qty)
+        self.assertEqual(trades[0]['quantity'], 130)
+        self.assertGreater(trades[1]['quantity'], 130)
+        # Daily profit target % and loss limit % are computed from session_allocated_capital = start_equity * (capital_usage_pct / 100)
+        c_profit = replace(self.config(sizing_mode='allocation', capital=40000, capital_usage_pct=50, daily_profit_target=10.0, target_pct=500, sl_pct=80))
+        d_profit = prepared(c_profit, events=[(600, 'CE', 24000, None, 1)])
+        d_profit.price = lambda day, t, s, k: (100, 125, 99, 120, 100) if t == 600 else (120, 121, 119, 120, 100)
+        audit = []
+        trades_p, _, _ = execute_portfolio(d_profit, c_profit, 'profit_pct', audit)
+        self.assertEqual(audit[0]['profit_limit'], 2000.0)
+        self.assertEqual(trades_p[0]['exit_reason'], 'daily_profit_target')
+        c_loss = replace(self.config(sizing_mode='allocation', capital=40000, capital_usage_pct=50, daily_loss_limit=5.0, target_pct=500, sl_pct=80))
+        d_loss = prepared(c_loss, events=[(600, 'CE', 24000, None, 1)])
+        d_loss.price = lambda day, t, s, k: (100, 101, 79, 80, 100) if t == 600 else (80, 81, 79, 80, 100)
+        audit_l = []
+        trades_l, _, _ = execute_portfolio(d_loss, c_loss, 'loss_pct', audit_l)
+        self.assertEqual(audit_l[0]['loss_limit'], 1000.0)
+        self.assertEqual(trades_l[0]['exit_reason'], 'daily_loss_limit')
+
 
 class TerminalUITests(unittest.TestCase):
     def setUp(self):
@@ -217,6 +245,10 @@ class TerminalUITests(unittest.TestCase):
             app.number_input(key='bt_capital').set_value(250000)
             app.selectbox(key='bt_allocation').select('50%')
             app.number_input(key='bt_minimum_premium').set_value(125)
+            self.assertEqual(app.number_input(key='bt_daily_profit_target').label, 'Daily profit target (%, 0 = off)')
+            self.assertEqual(app.number_input(key='bt_daily_loss_limit').label, 'Daily loss limit (%, 0 = off)')
+            app.number_input(key='bt_daily_profit_target').set_value(15.0)
+            app.number_input(key='bt_daily_loss_limit').set_value(8.0)
             app.selectbox(key='bt_exit_label').select('Trailing SL')
             app.button(key='run_backtest').click().run();self.clean(app)
             self.assertEqual(len(configs),1)

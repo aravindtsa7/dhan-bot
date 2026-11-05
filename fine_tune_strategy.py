@@ -37,13 +37,13 @@ def targeted_grid(start,end,option_capital=100000,futures_capital=500000,margin_
                 daily_profit_pct=0,daily_loss_pct=0)
     base=Config(instrument='CRUDEOIL',strategy=HIGH_STRATEGIES[3],timeframe='5m',capital=futures_capital,
         futures_margin_pct=margin_pct,entry_start='17:30',entry_end='21:30',slippage=1,compression_ratio=1,**common)
-    for sl,rr,jump,loss,usage,goal in product((1.5,2.),(2.,3.),(.25,.5),(1000,1500),(25,50),(1000,2000)):
+    for sl,rr,jump,loss,usage,goal in product((1.5,2.),(2.,3.),(.25,.5),(1,1.5),(25,50),(1,2)):
         yield 'steady',replace(base,atr_sl=sl,reward_risk=rr,atr_trail_jump=jump,daily_loss_limit=loss,
                               capital_usage_pct=usage,daily_profit_target=goal,trail_pct=20)
     for instrument,tf in (('NIFTY','3m'),('SENSEX','5m')):
         base=Config(instrument=instrument,strategy=HIGH_STRATEGIES[4],timeframe=tf,capital=option_capital,
             strategy_mode='growth',entry_start='13:00',entry_end='14:30',trail_pct=20,daily_profit_target=0,**common)
-        for sl,target,jump,loss,usage in product((20,25),(50,100,150),(5,10),(1500,2500),(50,75)):
+        for sl,target,jump,loss,usage in product((20,25),(50,100,150),(5,10),(1.5,2.5),(50,75)):
             yield 'explosive',replace(base,sl_pct=sl,target_pct=target,trail_jump_pct=jump,
                                      daily_loss_limit=loss,capital_usage_pct=usage)
     if include_high_beta:
@@ -51,7 +51,7 @@ def targeted_grid(start,end,option_capital=100000,futures_capital=500000,margin_
             base=Config(instrument=instrument,strategy=HIGH_STRATEGIES[5],timeframe='3m',capital=futures_capital,
                 strategy_mode='growth',futures_margin_pct=margin_pct,entry_start='17:30',entry_end='21:30',
                 slippage=.5 if instrument=='NATURALGAS' else 1,atr_expansion=1.5,trail_pct=20,**common)
-            for sl,rr,jump,loss,usage in product((1.5,2.),(2.,3.),(.25,.5),(1500,2500),(50,75)):
+            for sl,rr,jump,loss,usage in product((1.5,2.),(2.,3.),(.25,.5),(1.5,2.5),(50,75)):
                 yield 'explosive',replace(base,atr_sl=sl,reward_risk=rr,atr_trail_jump=jump,
                                          daily_loss_limit=loss,capital_usage_pct=usage)
 

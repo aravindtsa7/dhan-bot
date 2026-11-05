@@ -197,7 +197,7 @@ class BookTests(unittest.TestCase):
         self.assertEqual(t['exit_reason'],'trailing_stop')
         self.assertEqual(t['exit_time'].minute,2)
         self.assertGreater(path[1]['stop'],path[0]['stop'])
-        c=replace(c,daily_loss_limit=1)
+        c=replace(c,daily_loss_limit=0.005)
         result=run_backtest(c,d,persist=False)
         self.assertEqual(result['_frames']['trades'].iloc[0].exit_reason,'daily_loss_limit')
 

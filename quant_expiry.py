@@ -157,7 +157,7 @@ def expiry_steps(data,c,date,event,trade_id,budget=None,entry_equity=None,exit_d
                    previous=data.price(day,at-1,leg['side'],leg['strike']),modeled_bars=0,
                    modeled_wing_fallback=False,exit_price_source='observed')
         leg['pricing_state']={};option_mark_state(day,at,quote,leg['pricing_state'],open_only=True)
-    budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
+    budget=max(0.0,c.capital if entry_equity is None else entry_equity)*(c.capital_usage_pct/100.0) if budget is None else budget
     entry_equity=c.capital if entry_equity is None else entry_equity
     qty,allocated,reserve,entry=basket_allocation(c,date,legs,budget)
     if not qty: return None,[]
@@ -248,7 +248,7 @@ def execute_expiry_portfolio(data,c,run_id,daily_audit=None):
             skipped.append(dict(date=expiry,entry_date=entry,side='EXPIRY_DAY',reason='missing_or_ineligible_entry_or_expiry_session'))
             continue
         if equity<=0: continue
-        base=equity if c.compound else min(c.capital,equity);budget=max(0,base)*c.capital_usage_pct/100
+        base=equity;budget=max(0.0,base)*(c.capital_usage_pct/100.0)
         at=minute(c.expiry_entry_signal)+1 if c.expiry_entry_mode=='btst' else 556
         steps=expiry_steps(data,c,entry,(at,'EXPIRY_DAY',0,None,0),f'{run_id}_{serial:06d}',budget,equity,expiry)
         audits={};force=None
@@ -268,8 +268,8 @@ def execute_expiry_portfolio(data,c,run_id,daily_audit=None):
             a['max_drawdown_1m_close']=max(a['max_drawdown_1m_close'],a['peak_net_pnl']-net)
             positive=lambda *xs:min((x for x in xs if x>0),default=float('inf'))
             if not force:
-                if net>=positive(c.daily_profit_target,equity*c.daily_profit_pct/100): force='daily_profit_target'
-                elif net<=-positive(c.daily_loss_limit,equity*c.daily_loss_pct/100): force='daily_loss_limit'
+                if net>=positive((a['start_equity']*(c.capital_usage_pct/100.0))*(c.daily_profit_target/100.0),a['start_equity']*c.daily_profit_pct/100): force='daily_profit_target'
+                elif net<=-positive((a['start_equity']*(c.capital_usage_pct/100.0))*(c.daily_loss_limit/100.0),a['start_equity']*c.daily_loss_pct/100): force='daily_loss_limit'
                 if force: a.update(lock_reason=force,lock_minute=state['minute'],lock_trigger_pnl=net)
         if daily_audit is not None: daily_audit.extend(audits.values())
     return records,paths,skipped

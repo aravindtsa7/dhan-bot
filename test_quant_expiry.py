@@ -232,7 +232,7 @@ class ExpiryTests(unittest.TestCase):
             self.assertEqual(t['exit_reason'],'target');self.assertEqual(t['combined_return_pct'],25)
 
     def test_paper_daily_account_lock_overrides_hold_for_entire_basket(self):
-        c,_=fixture(daily_loss_limit=1);now=datetime(2026,10,26,15,26,tzinfo=IST).timestamp()
+        c,_=fixture(daily_loss_limit=0.005);now=datetime(2026,10,26,15,26,tzinfo=IST).timestamp()
         resolved=[(dict(side=s,strike=100,ratio=1),Asset('NIFTY',2,10+i,EXP,1,100,s)) for i,s in enumerate(('CE','PE'))]
         assets=[a for _,a in resolved];quotes={a.key:Tick(a.key,100,now,now) for a in assets}
         with TemporaryDirectory() as directory:

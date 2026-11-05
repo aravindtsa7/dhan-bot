@@ -359,7 +359,7 @@ def basket_steps(data,c,date,event,trade_id,budget=None,entry_equity=None):
                    previous=data.price(day,at-1,leg['side'],leg['strike']),modeled_bars=0,
                    modeled_wing_fallback=False,spread_bounds_applied=False,exit_price_source='observed')
         leg['pricing_state']={};option_mark_state(day,at,row,leg['pricing_state'],open_only=True)
-    budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
+    budget=max(0.0,c.capital if entry_equity is None else entry_equity)*(c.capital_usage_pct/100.0) if budget is None else budget
     entry_equity=c.capital if entry_equity is None else entry_equity
     qty,allocated,reserve,entry=basket_allocation(c,date,legs,budget)
     if not qty: return None,[]

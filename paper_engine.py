@@ -220,8 +220,8 @@ class PaperAccount:
         if session['lock']: return False
         net=self.realized_today(now)+(self.mark(tick) or 0)
         positive=lambda *xs:min((v for v in xs if v>0),default=float('inf'))
-        goal=positive(self.c.daily_profit_target,session['opening_equity']*self.c.daily_profit_pct/100)
-        loss=positive(self.c.daily_loss_limit,session['opening_equity']*self.c.daily_loss_pct/100)
+        goal=positive((session['opening_equity']*(self.c.capital_usage_pct/100.0))*(self.c.daily_profit_target/100.0),session['opening_equity']*self.c.daily_profit_pct/100)
+        loss=positive((session['opening_equity']*(self.c.capital_usage_pct/100.0))*(self.c.daily_loss_limit/100.0),session['opening_equity']*self.c.daily_loss_pct/100)
         reason='daily_loss_limit' if net<=-loss+1e-8 else 'daily_profit_target' if net>=goal-1e-8 else ''
         if reason:
             session.update(lock=reason,lock_time=stamp(now),lock_pnl=net)
@@ -250,7 +250,7 @@ class PaperAccount:
         side=event[1]; direction=-1 if side=='SHORT' else 1
         entry=self.price(tick,direction==1)
         if self.asset.option_type and (tick.price<self.c.minimum_premium or self.c.option_side not in ('both',side)): return False
-        budget=max(0,min(self.c.capital,self.equity))*self.c.capital_usage_pct/100
+        budget=max(0.0,self.equity)*(self.c.capital_usage_pct/100.0)
         allocation_config=replace(self.c,lot_size=self.asset.point_value)
         qty,allocated,reserve=order_allocation(allocation_config,date,entry,budget,direction)
         atr_risk=self.c.instrument in POINT_VALUE and (self.c.risk_basis=='legacy' or self.c.strategy in BOOK_STRATEGIES)

@@ -179,7 +179,7 @@ class BasketPaperAccount(PaperAccount):
         raw_snapshot=self._validate_snapshot(event[1],legs,[quotes[a.key] for a in assets],now,'paper_entry')
         if any(l['ratio']>0 and l['raw_entry_price']<self.c.minimum_premium for l in legs):return False
         allocation=replace(self.c,lot_size=assets[0].point_value)
-        budget=max(0,min(self.c.capital,self.equity))*self.c.capital_usage_pct/100
+        budget=max(0.0,self.equity)*(self.c.capital_usage_pct/100.0)
         qty,allocated,reserve,entry=basket_allocation(allocation,date,legs,budget)
         if not qty: return False
         distance=abs(entry)*self.c.sl_pct/100

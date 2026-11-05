@@ -210,11 +210,11 @@ def configure_card():
                 help='End of day: protective stop, no target. Target + SL / Target / EOD use fixed target and stop. Only Trailing SL activates a stepped profit lock. Every mode closes by session end; Expiry Day closes on its expiry session.')
         a, b = st.columns(2)
         with a:
-            daily_profit_target = st.number_input('Daily profit target (₹, 0 = off)', min_value=0., value=float(defaults.get('daily_profit_target', 0.)), step=500., format='%.0f', key='bt_daily_profit_target',
-                help='Account-level daily net profit lock in ₹ (0 disables).')
+            daily_profit_target = st.number_input('Daily profit target (%, 0 = off)', min_value=0., max_value=500., value=float(defaults.get('daily_profit_target', 0.)), step=1., format='%.1f', key='bt_daily_profit_target',
+                help='Account-level daily net profit lock as % of allocated capital (0 disables).')
         with b:
-            daily_loss_limit = st.number_input('Daily loss limit (₹, 0 = off)', min_value=0., value=float(defaults.get('daily_loss_limit', 0.)), step=500., format='%.0f', key='bt_daily_loss_limit',
-                help='Account-level daily net loss cutoff in ₹ (0 disables).')
+            daily_loss_limit = st.number_input('Daily loss limit (%, 0 = off)', min_value=0., max_value=500., value=float(defaults.get('daily_loss_limit', 0.)), step=1., format='%.1f', key='bt_daily_loss_limit',
+                help='Account-level daily net loss cutoff as % of allocated capital (0 disables).')
         if instrument in ('CRUDEOIL','NATURALGAS','GOLDM'):
             st.caption('Futures: 20% assumed margin. TP30/SL15 scales to 2.2 ATR target / 1.2 ATR stop. Only Trailing SL activates the +1.2 ATR profit lock.')
         elif STRATEGY_LABELS[strategy][0] in ('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend','book_vertical_spread','book_vol_oi_momentum'):

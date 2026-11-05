@@ -13,8 +13,8 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
     for date in sorted(data.days):
         start_equity=equity
         positive=lambda *values: min((x for x in values if x>0),default=float('inf'))
-        profit=positive(c.daily_profit_target,start_equity*c.daily_profit_pct/100)
-        loss=positive(c.daily_loss_limit,start_equity*c.daily_loss_pct/100)
+        profit=positive((start_equity*(c.capital_usage_pct/100.0))*(c.daily_profit_target/100.0),start_equity*c.daily_profit_pct/100)
+        loss=positive((start_equity*(c.capital_usage_pct/100.0))*(c.daily_loss_limit/100.0),start_equity*c.daily_loss_pct/100)
         audit=dict(date=date,start_equity=start_equity,net_pnl=0.,trades=0,peak_net_pnl=0.,minimum_net_pnl=0.,
             max_drawdown_1m_close=0.,lock_reason='',lock_minute=None,lock_trigger_pnl=None,
             profit_limit=profit if profit<float('inf') else None,loss_limit=loss if loss<float('inf') else None,
@@ -46,7 +46,7 @@ def execute_portfolio(data,c,run_id,daily_audit=None):
                 unrealized=sum(p['net_mtm'] for p in active)
                 # Do not borrow unrealized gains; unrealized losses reduce buying power.
                 available_equity=max(0,equity+min(0,unrealized))
-                base=available_equity if c.compound else min(c.capital,available_equity)
+                base=available_equity
                 ceiling=base*c.capital_usage_pct/100
                 budget=max(0,min(ceiling-reserved,available_equity-reserved))
                 if pair: budget=min(budget,ceiling/2)

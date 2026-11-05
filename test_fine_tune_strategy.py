@@ -19,7 +19,7 @@ class FineTuneTests(unittest.TestCase):
         return replace(Config(),capital=50000,lot_size=100,slippage=0,sl_pct=80,target_pct=200,trail_pct=0,**kw)
 
     def test_loss_latch_survives_rebound_and_reports_overshoot(self):
-        c=self.config(daily_loss_limit=1500)
+        c=self.config(daily_loss_limit=3)
         data=self.fixture({600:(100,101,79,80,1),601:(75,200,70,190,1)})
         audit=[]; trades,_,_=execute_portfolio(data,c,'loss',audit)
         self.assertEqual(len(trades),1)
@@ -32,7 +32,7 @@ class FineTuneTests(unittest.TestCase):
         self.assertAlmostEqual(a['max_drawdown_1m_close'],-trades[0]['net_pnl'])
 
     def test_profit_latch_does_not_reopen_when_profit_fades(self):
-        c=self.config(daily_profit_target=2000)
+        c=self.config(daily_profit_target=4)
         data=self.fixture({600:(100,126,99,125,1),601:(110,115,100,105,1)})
         audit=[]; trades,_,_=execute_portfolio(data,c,'profit',audit)
         a=audit[0]
@@ -45,7 +45,7 @@ class FineTuneTests(unittest.TestCase):
         self.assertAlmostEqual(a['max_drawdown_1m_close'],a['lock_trigger_pnl']-trades[0]['net_pnl'])
 
     def test_locks_reset_next_session_and_empty_day_is_included(self):
-        c=self.config(daily_profit_target=2000)
+        c=self.config(daily_profit_target=4)
         data=self.fixture({600:(100,126,99,125,1),601:(125,126,124,125,1)})
         data.days['2026-10-23']=dict(timestamp=pd.Timestamp('2026-10-23',tz='Asia/Kolkata'),contract='FIXED')
         data.days['2026-10-26']=dict(timestamp=pd.Timestamp('2026-10-26',tz='Asia/Kolkata'),contract='FIXED')
@@ -57,7 +57,7 @@ class FineTuneTests(unittest.TestCase):
         self.assertEqual(audit[2]['trades'],0)
 
     def test_net_costs_determine_lock_not_gross_gain(self):
-        c=self.config(daily_profit_target=2000)
+        c=self.config(daily_profit_target=4)
         data=self.fixture({600:(100,121,99,120,1),601:(120,126,119,125,1),602:(125,126,124,125,1)})
         audit=[]; trades,_,_=execute_portfolio(data,c,'net',audit)
         self.assertEqual(audit[0]['lock_minute'],601)
@@ -101,8 +101,8 @@ class FineTuneTests(unittest.TestCase):
         for _,c in grid: c.validate()
         steady=[c for p,c in grid if p=='steady']
         self.assertEqual({c.capital_usage_pct for c in steady},{25,50})
-        self.assertEqual({c.daily_loss_limit for c in steady},{1000,1500})
-        self.assertEqual({c.daily_profit_target for c in steady},{1000,2000})
+        self.assertEqual({c.daily_loss_limit for c in steady},{1,1.5})
+        self.assertEqual({c.daily_profit_target for c in steady},{1,2})
 
     def test_ranking_ignores_later_outcomes(self):
         common=dict(profile='steady',instrument='CRUDEOIL',development_trading_days=20,

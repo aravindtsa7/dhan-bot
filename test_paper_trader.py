@@ -143,18 +143,18 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(b.state['trades'][0]['exit_reason'],'trailing_stop')
 
     def test_daily_net_profit_lock_exits_and_blocks_reentry(self):
-        a=self.account(daily_profit_target=1000,max_trades_day=2,strategy=HIGH_STRATEGIES[5])
+        a=self.account(daily_profit_target=0.4,max_trades_day=2,strategy=HIGH_STRATEGIES[5])
         self.enter(a); a.on_tick(tick(115,NOW+1),NOW+1)
         self.assertIsNone(a.position)
         self.assertEqual(a.state['trades'][0]['exit_reason'],'daily_profit_target')
         self.assertGreaterEqual(a.realized_today(NOW),1000)
         self.assertFalse(self.enter(a,at=NOW+60))
-        b=self.account(daily_profit_target=1000,max_trades_day=2,strategy=HIGH_STRATEGIES[5])
+        b=self.account(daily_profit_target=0.4,max_trades_day=2,strategy=HIGH_STRATEGIES[5])
         self.assertEqual(b.session(NOW)['lock'],'daily_profit_target')
         self.assertFalse(self.enter(b,at=NOW+120))
 
     def test_daily_loss_cutoff_uses_unrealized_net_costs(self):
-        a=self.account(daily_loss_limit=500); self.enter(a)
+        a=self.account(daily_loss_limit=0.2); self.enter(a)
         a.on_tick(tick(99,NOW+1),NOW+1)
         p=a.state['trades'][0]
         self.assertEqual(p['exit_reason'],'daily_loss_limit')
@@ -366,14 +366,41 @@ class LivePaperGapTests(unittest.TestCase):
             '15%',
             50,
             'Target / EOD',
-            daily_profit_target=4500.0,
-            daily_loss_limit=2500.0,
+            daily_profit_target=18.0,
+            daily_loss_limit=10.0,
         )
-        self.assertEqual(cfg.daily_profit_target, 4500.0)
-        self.assertEqual(cfg.daily_loss_limit, 2500.0)
+        self.assertEqual(cfg.daily_profit_target, 18.0)
+        self.assertEqual(cfg.daily_loss_limit, 10.0)
         restored = form_values(asdict(cfg), 'Saved Test Strategy')
-        self.assertEqual(restored['daily_profit_target'], 4500.0)
-        self.assertEqual(restored['daily_loss_limit'], 2500.0)
+        self.assertEqual(restored['daily_profit_target'], 18.0)
+        self.assertEqual(restored['daily_loss_limit'], 10.0)
+
+    def test_dynamic_balance_lot_sizing_and_allocated_capital_daily_limits(self):
+        c = config(capital=50000, capital_usage_pct=50, futures_margin_pct=20, sizing_mode='allocation',
+                   slippage=0, max_trades_day=2, strategy=HIGH_STRATEGIES[5], daily_profit_target=10.0, daily_loss_limit=5.0)
+        a = PaperAccount(self.root, c, ASSET, lambda _: None)
+        # Initial balance = 50,000 -> allocated_capital = 25,000. At price=100, 1 lot (100 qty * 100 * 20% = 2,000 margin) -> 12 lots fit
+        local = datetime.fromtimestamp(NOW, IST)
+        self.assertTrue(a.enter((local.hour * 60 + local.minute, 'LONG', 0, None, 10), tick(100, NOW, bid=100, ask=100), NOW))
+        first_lots = a.position['lots']
+        self.assertEqual(first_lots, 12)
+        # Close with a large gain so balance doubles above initial capital (> 100,000)
+        a.close(tick(150, NOW + 1, bid=150, ask=150), NOW + 1, 'manual')
+        self.assertGreater(a.equity, 100000)
+        # Next day session: opening_equity > 100,000 -> session_allocated_capital = opening_equity * 50% > 50,000
+        next_day = NOW + 3 * 86400
+        local2 = datetime.fromtimestamp(next_day, IST)
+        self.assertTrue(a.enter((local2.hour * 60 + local2.minute, 'LONG', 0, None, 10), tick(100, next_day, bid=100, ask=100), next_day))
+        self.assertGreater(a.position['lots'], first_lots * 2)
+        # Daily profit target is 10% of session_allocated_capital (opening_equity * 50% * 10%)
+        expected_goal = a.session(next_day)['opening_equity'] * 0.50 * 0.10
+        # Small tick gain below expected_goal does not lock
+        a.on_tick(tick(101, next_day + 1, bid=101, ask=101), next_day + 1)
+        self.assertEqual(a.session(next_day)['lock'], '')
+        # Tick gain exceeding expected_goal triggers daily_profit_target lock and closes position
+        a.on_tick(tick(105, next_day + 2, bid=105, ask=105), next_day + 2)
+        self.assertEqual(a.session(next_day)['lock'], 'daily_profit_target')
+        self.assertGreaterEqual(a.realized_today(next_day + 2), expected_goal)
 
 
 if __name__=='__main__': unittest.main()

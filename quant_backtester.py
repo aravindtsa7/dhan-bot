@@ -106,7 +106,7 @@ class Config:
     compound: bool = False
     futures_margin_pct: float = 100  # explicit research assumption, not broker margin
     strategy_mode: str = 'steady'
-    daily_profit_target: float = 0  # zero disables the respective limit
+    daily_profit_target: float = 0  # percentage of session allocated capital (0 disables, 0..500%)
     daily_loss_limit: float = 0
     daily_profit_pct: float = 0  # percentage of start-of-session account equity
     daily_loss_pct: float = 0
@@ -186,7 +186,7 @@ class Config:
             raise ValueError('Invalid sizing or strategy mode')
         if self.max_lots<1 or int(self.max_lots)!=self.max_lots or int(self.lots)!=self.lots or int(self.lot_size)!=self.lot_size:
             raise ValueError('Lots and multipliers must be whole numbers')
-        if min(self.daily_profit_target,self.daily_loss_limit,self.daily_profit_pct,self.daily_loss_pct)<0:
+        if min(self.daily_profit_target,self.daily_loss_limit,self.daily_profit_pct,self.daily_loss_pct)<0 or max(self.daily_profit_target,self.daily_loss_limit)>500:
             raise ValueError('Daily limits cannot be negative')
         if self.strategy in (LEGACY_STRATEGIES[2],HIGH_STRATEGIES[1]) and self.strike != 'ATM':
             raise ValueError('Dual-leg strategy uses ATM anchor strikes')
@@ -856,7 +856,7 @@ def _trade_steps(data, c, date, event, trade_id, budget=None, entry_equity=None)
         return None, []
     entry = adverse_tick(raw_entry+direction*c.slippage,c,direction==1)
     entry_equity=c.capital if entry_equity is None else entry_equity
-    budget=c.capital*c.capital_usage_pct/100 if budget is None else budget
+    budget=max(0.0,entry_equity)*(c.capital_usage_pct/100.0) if budget is None else budget
     qty,allocated,reserve=order_allocation(c,date,entry,budget,direction)
     if not qty: return None, []
     atr_risk = data.mcx and (c.risk_basis == 'legacy' or c.strategy in BOOK_STRATEGIES)

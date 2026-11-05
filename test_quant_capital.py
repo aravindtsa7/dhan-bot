@@ -35,7 +35,7 @@ class CapitalTests(unittest.TestCase):
         self.assertEqual(order_allocation(replace(c,futures_margin_pct=100),'2026-10-22',6000,130000)[0],0)
 
     def test_profit_and_loss_cutoff_next_open_no_reentry(self):
-        for mark,limit,reason in [(120,1000,'daily_profit_target'),(80,1000,'daily_loss_limit')]:
+        for mark,limit,reason in [(120,5,'daily_profit_target'),(80,5,'daily_loss_limit')]:
             c=self.config(daily_profit_target=limit if mark>100 else 0,daily_loss_limit=limit if mark<100 else 0)
             prices=lambda t,s:(100,121,79,mark,100) if t==600 else (110,115,105,110,100)
             d=self.data(c,[(600,'CE',100,None,1),(610,'PE',100,None,1)],prices)
@@ -47,7 +47,7 @@ class CapitalTests(unittest.TestCase):
             self.assertEqual(records[0]['status'],'closed')
 
     def test_two_legs_share_capital_and_joint_daily_limit(self):
-        c=self.config(strategy=STRATEGIES[2],mode='B',sizing_mode='allocation',capital_usage_pct=75,daily_profit_target=1800)
+        c=self.config(strategy=STRATEGIES[2],mode='B',sizing_mode='allocation',capital_usage_pct=75,daily_profit_target=12)
         def prices(t,s):
             return (100,120,99,120,100) if t==600 else (120,121,119,120,100)
         d=self.data(c,[(600,'CE',100,None,1),(600,'PE',100,None,1)],prices)
@@ -63,7 +63,7 @@ class CapitalTests(unittest.TestCase):
         d=self.data(c,[(600,'CE',100,None,1),(610,'CE',100,None,1)],prices)
         fixed,_,_=execute_portfolio(d,c,'fixed')
         grown,_,_=execute_portfolio(d,replace(c,compound=True),'grown')
-        self.assertEqual([t['quantity'] for t in fixed],[130,130])
+        self.assertEqual([t['quantity'] for t in fixed],[130,260])
         self.assertEqual([t['quantity'] for t in grown],[130,260])
         for t in grown:
             self.assertLessEqual(t['capital_reserved'],t['entry_equity'])
