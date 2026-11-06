@@ -1,5 +1,6 @@
 """Self-contained data workspace fixtures. No local lake or network required."""
 from copy import deepcopy
+from datetime import date
 import hashlib
 import io
 import json
@@ -439,6 +440,40 @@ class SyncResilienceTests(LakeFixture):
                 patch('step2_build_data_lake.time.sleep'):
             merged=api.post('/charts/rollingoption',{'fromDate':'2026-10-22','toDate':'2026-10-24','drvOptionType':'CALL'})
         self.assertEqual(merged['ce']['timestamp'],[ts_22,ts_23])
+
+    def test_rolling_daily_fallback_skips_holiday_dh905_days_and_returns_valid_days(self):
+        import threading
+        from unittest.mock import Mock
+        import step2_build_data_lake
+        from step1_health_check import CheckError
+        api=object.__new__(step2_build_data_lake.API)
+        api.rate_lock=threading.Lock();api.auth_lock=threading.Lock();api.last=0;api.calls=0;api.refreshes=0
+        api.session=Mock(headers={'access-token':'tok','client-id':'cid'})
+        holiday=date(2026,10,28)  # weekday exchange holiday rejected by provider
+        calls=[]
+        def stamp(d):return int(pd.Timestamp(f'{d} 09:15',tz='Asia/Kolkata').timestamp())
+        def fake_once(endpoint,payload):
+            lo=date.fromisoformat(payload['fromDate']);hi=date.fromisoformat(payload['toDate'])
+            if (hi-lo).days>1:raise CheckError('DH-905')
+            calls.append(lo)
+            if lo==holiday:raise CheckError('DH-905')
+            # Provider returns both lo and the following day (inclusive upper bound).
+            ts=[stamp(lo),stamp(hi)]
+            col=lambda v:[v,v]
+            return {'ce':{'timestamp':ts,'open':col(1.),'high':col(2.),'low':col(1.),'close':col(1.),'volume':col(1),
+                          'oi':col(1),'iv':col(1.),'spot':col(1.),'strike':col(1.)},'pe':None}
+        with patch.object(api,'_post_once',side_effect=fake_once):
+            merged=api.post('/charts/rollingoption',{'fromDate':'2026-10-23','toDate':'2026-11-05','drvOptionType':'CALL'})
+        days=[pd.Timestamp(t,unit='s',tz='UTC').tz_convert('Asia/Kolkata').date() for t in merged['ce']['timestamp']]
+        expected=[date(2026,10,23),date(2026,10,26),date(2026,10,27),date(2026,10,29),date(2026,10,30),
+                  date(2026,11,2),date(2026,11,3),date(2026,11,4)]
+        self.assertEqual(days,expected)
+        self.assertTrue(all(d.weekday()<5 for d in calls))
+        # Zero valid days still reports the provider error.
+        with patch.object(api,'_post_once',side_effect=CheckError('DH-905')):
+            with self.assertRaises(CheckError) as caught:
+                api.post('/charts/rollingoption',{'fromDate':'2026-10-23','toDate':'2026-11-05'})
+        self.assertEqual(caught.exception.code,'DH-905')
 
     def test_row_level_nifty_spot_and_options_sync_complete_without_runtime_error(self):
         import threading
