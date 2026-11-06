@@ -326,4 +326,143 @@ class DataPageTests(LakeFixture):
                     self.assertFalse(app.exception,[e.message for e in app.exception])
 
 
+class SyncResilienceTests(LakeFixture):
+    def _add_index_day(self, day='2026-10-22'):
+        times=[str(t) for t in pd.date_range(f'{day} 09:15',periods=375,freq='min')]
+        end=str((pd.Timestamp(day)+pd.Timedelta(days=1)).date())
+        self.add(times=times,name='NIFTY',dataset='spot_1m',start=day,end=end)
+        for side in ('CE','PE'):
+            for offset in ('ATM','ATM-1','ATM+1'):
+                name=f'NIFTY_{side}_{offset}_WEEK1'
+                key=f'options_rolling_1m/{name}/{day}'
+                frame=pd.DataFrame(dict(timestamp=pd.to_datetime(times).tz_localize('Asia/Kolkata'),
+                                        open=100.,high=102.,low=98.,close=101.,volume=10.,
+                                        oi=1000.,iv=20.,spot=24000.,strike=24000.,
+                                        instrument=name,option_type=side,moneyness=offset))
+                path=self.root/(key+'.parquet');path.parent.mkdir(parents=True,exist_ok=True);frame.to_parquet(path,index=False)
+                self.manifest['chunks'][key]=dict(dataset='options_rolling_1m',instrument=name,start=day,end=end,
+                                                  status='complete',endpoint='/charts/rollingoption',
+                                                  path=path.relative_to(self.root).as_posix(),rows=len(frame),
+                                                  sha256=_hash_file(path),first=str(frame.timestamp.min()),
+                                                  last=str(frame.timestamp.max()),quality={})
+        self.save();run_quality_check(self.root)
+
+    def _download(self, job, stage):
+        stamps=[]
+        for day in pd.date_range(job['start'],job['end'],inclusive='left'):
+            if day.weekday()<5:
+                stamps.extend(pd.date_range(f'{day.date()} 09:15',periods=375,freq='min',tz='Asia/Kolkata'))
+        extra=dict(oi=1000.,iv=20.,spot=24000.,strike=24000.) if job['dataset']=='options_rolling_1m' else {}
+        frame=pd.DataFrame(dict(timestamp=pd.DatetimeIndex(stamps),open=100.,high=102.,low=98.,close=101.,volume=10.,**extra,**job['meta']))
+        path=stage/(job['key']+'.parquet');path.parent.mkdir(parents=True,exist_ok=True);frame.to_parquet(path,index=False)
+        return dict(dataset=job['dataset'],instrument=job['meta']['instrument'],start=job['start'],end=job['end'],
+                    status='complete',path=path.relative_to(stage).as_posix(),rows=len(frame),
+                    sha256=_hash_file(path),first=str(frame.timestamp.min()),last=str(frame.timestamp.max()),
+                    quality={},endpoint=job['endpoint'],payload=job['payload'])
+
+    def test_env_override_reload_and_totp_auto_refresh_on_sync(self):
+        import os
+        import threading
+        from unittest.mock import Mock
+        import quant_data_sync
+        import step2_build_data_lake
+        self._add_index_day('2026-10-22')
+        env_file=self.root/'.env'
+        env_file.write_text('DHAN_CLIENT_ID=1100000001\nDHAN_ACCESS_TOKEN=fresh-disk-token\nDHAN_PIN=123456\nDHAN_TOTP_SECRET=JBSWY3DPEHPK3PXP\n',encoding='utf-8')
+        seen_tokens=[]
+        def download(job,stage):
+            seen_tokens.append(os.environ.get('DHAN_ACCESS_TOKEN'))
+            return self._download(job,stage)
+        with patch.object(quant_data_sync,'ENV_FILE',env_file), \
+                patch.dict('os.environ',{'DHAN_CLIENT_ID':'1100000001','DHAN_ACCESS_TOKEN':'stale-cached-token'},clear=True):
+            result=quant_data_sync.run_sync(self.root,'NIFTY SPOT',latest=True,now='2026-10-23 16:00+05:30',downloader=download,check_credentials=True)
+            self.assertEqual(result['committed'],1)
+            self.assertEqual(seen_tokens,['fresh-disk-token'])
+        # Verify API._post_once auto-refreshes expired token via TOTP once and retries
+        env_file.write_text('DHAN_CLIENT_ID=1100000001\nDHAN_ACCESS_TOKEN=expired-token\nDHAN_PIN=123456\nDHAN_TOTP_SECRET=JBSWY3DPEHPK3PXP\n',encoding='utf-8')
+        api=object.__new__(step2_build_data_lake.API)
+        api.rate_lock=threading.Lock();api.auth_lock=threading.Lock();api.last=0;api.calls=0;api.refreshes=0
+        api.session=Mock(headers={'access-token':'expired-token','client-id':'1100000001'})
+        r_401=Mock(status_code=401,ok=False);r_401.json.return_value={'errorCode':'DH-901','errorMessage':'Invalid Token'}
+        r_200=Mock(status_code=200,ok=True);r_200.json.return_value={'status':'success','data':{'timestamp':[1761191100]}}
+        with patch.object(step2_build_data_lake,'ENV_FILE',env_file), \
+                patch.dict('os.environ',{'DHAN_CLIENT_ID':'1100000001','DHAN_ACCESS_TOKEN':'expired-token','DHAN_PIN':'123456','DHAN_TOTP_SECRET':'JBSWY3DPEHPK3PXP'},clear=True), \
+                patch('step2_build_data_lake.requests.post',side_effect=[r_401,r_200]) as post_mock, \
+                patch('step2_build_data_lake.new_access_token',return_value='totp-refreshed-token') as totp_mock, \
+                patch('step2_build_data_lake.set_key') as set_key_mock:
+            out=api.post('/charts/intraday',{'securityId':'13'})
+            self.assertEqual(out,{'timestamp':[1761191100]})
+            self.assertEqual(post_mock.call_count,2)
+            totp_mock.assert_called_once()
+            self.assertEqual(api.session.headers['access-token'],'totp-refreshed-token')
+            self.assertEqual(os.environ['DHAN_ACCESS_TOKEN'],'totp-refreshed-token')
+            set_key_mock.assert_called_once_with(str(env_file),'DHAN_ACCESS_TOKEN','totp-refreshed-token')
+
+    def test_non_auth_errors_never_trigger_false_auth_abort_and_rolling_dh905_falls_back_to_daily(self):
+        import threading
+        from unittest.mock import Mock
+        import quant_data_sync
+        import step2_build_data_lake
+        self._add_index_day('2026-10-22')
+        # 1) Non-auth errors with empty provider_message must not abort remaining streams or masquerade as AUTH
+        def partial_fail(job,stage):
+            if job['meta']['instrument']=='NIFTY_CE_ATM+1_WEEK1':
+                return dict(status='failed',error='DH-905',provider_message='')
+            return self._download(job,stage)
+        result=quant_data_sync.run_sync(self.root,'NIFTY OPTIONS',latest=True,now='2026-10-23 16:00+05:30',downloader=partial_fail,check_credentials=False)
+        self.assertEqual(result['attempted'],6)
+        self.assertEqual(result['committed'],5)
+        self.assertFalse(any('Remaining requests stopped' in f for f in result['failures']))
+        self.assertTrue(any('DH-905 — Dhan rejected the request parameters' in f for f in result['failures']))
+        self.assertFalse(any('provider description unavailable' in f for f in result['failures']))
+        # 2) Multi-day /charts/rollingoption DH-905 automatically falls back to 1-day windows and deduplicates
+        api=object.__new__(step2_build_data_lake.API)
+        api.rate_lock=threading.Lock();api.auth_lock=threading.Lock();api.last=0;api.calls=0;api.refreshes=0
+        api.session=Mock(headers={'access-token':'tok','client-id':'cid'})
+        ts_22=int(pd.Timestamp('2026-10-22 09:15',tz='Asia/Kolkata').timestamp())
+        ts_23=int(pd.Timestamp('2026-10-23 09:15',tz='Asia/Kolkata').timestamp())
+        def fake_post(url,headers=None,json=None,timeout=None,allow_redirects=False):
+            lo,hi=json['fromDate'],json['toDate']
+            resp=Mock()
+            if (pd.Timestamp(hi)-pd.Timestamp(lo)).days>1:
+                resp.status_code=400;resp.ok=False
+                resp.json.return_value={'errorCode':'DH-905','errorMessage':'Missing required fields, bad values for parameters etc.'}
+                return resp
+            resp.status_code=200;resp.ok=True
+            # Return both lo and hi timestamps to verify per-day IST deduplication
+            stamps=[ts_22,ts_23]
+            resp.json.return_value={'data':{'ce':{'timestamp':stamps,'open':[100.,101.],'high':[102.,103.],'low':[98.,99.],
+                                                  'close':[101.,102.],'volume':[10,20],'oi':[100,200],'iv':[15.,16.],
+                                                  'spot':[24000.,24050.],'strike':[24000.,24000.]},'pe':None}}
+            return resp
+        with patch('step2_build_data_lake.requests.post',side_effect=fake_post), \
+                patch('step2_build_data_lake.time.sleep'):
+            merged=api.post('/charts/rollingoption',{'fromDate':'2026-10-22','toDate':'2026-10-24','drvOptionType':'CALL'})
+        self.assertEqual(merged['ce']['timestamp'],[ts_22,ts_23])
+
+    def test_row_level_nifty_spot_and_options_sync_complete_without_runtime_error(self):
+        import threading
+        import time
+        import quant_data_sync
+        from step2_build_data_lake import writer_lock
+        self._add_index_day('2026-10-22')
+        # Hold writer_lock briefly in a background thread to simulate an overlapping UI audit/sync finishing
+        ready=threading.Event()
+        def hold_briefly():
+            with writer_lock(self.root):
+                ready.set()
+                time.sleep(0.35)
+        t=threading.Thread(target=hold_briefly)
+        t.start();ready.wait(timeout=5)
+        try:
+            spot_res=quant_data_sync.run_sync(self.root,'NIFTY SPOT',latest=True,now='2026-10-23 16:00+05:30',downloader=self._download,check_credentials=False)
+            opt_res=quant_data_sync.run_sync(self.root,'NIFTY OPTIONS',latest=True,now='2026-10-23 16:00+05:30',downloader=self._download,check_credentials=False)
+        finally:
+            t.join(timeout=5)
+        self.assertEqual(spot_res['committed'],1)
+        self.assertFalse(spot_res['failures'])
+        self.assertEqual(opt_res['committed'],6)
+        self.assertFalse(opt_res['failures'])
+
+
 if __name__=='__main__': unittest.main()

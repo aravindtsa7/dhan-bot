@@ -102,6 +102,11 @@ def _run(root,selection,*,latest=False,start=None,end=None,skip=True):
         st.cache_data.clear();st.session_state.pop('range_report',None)
         st.rerun()
     except ValueError as exc:st.error(str(exc))
+    except RuntimeError as exc:
+        if 'Another lake writer is running' in str(exc):
+            st.info('Another sync or quality audit is currently finishing in the background. Please wait a moment and refresh.')
+        else:
+            st.error(f'Sync could not complete ({type(exc).__name__}). Existing data was retained where possible. Check the local audit before running a backtest. No secret values are displayed.')
     except Exception as exc:st.error(f'Sync could not complete ({type(exc).__name__}). Existing data was retained where possible. Check the local audit before running a backtest. No secret values are displayed.')
 
 

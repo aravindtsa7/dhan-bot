@@ -1,4 +1,4 @@
-﻿"""Resumable Dhan historical data lake. No orders; secrets never logged.
+"""Resumable Dhan historical data lake. No orders; secrets never logged.
 
 Run: .venv/Scripts/python.exe -u step2_build_data_lake.py
 End date is exclusive; defaults to today IST, excluding the current session.
@@ -29,6 +29,7 @@ from quant_lake import QuantDataLake, summary, ROOT, IST
 
 FIELDS=['open','high','low','close','volume','oi','iv','spot','strike']
 MASTER_URL='https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
+ENV_FILE=Path(__file__).with_name('.env')
 
 
 def provider_message(body,*,secrets=()):
@@ -55,9 +56,10 @@ def provider_message(body,*,secrets=()):
     return ' '.join(message.split())[:500]
 
 
-def provider_error(code,body,headers):
-    error=CheckError(code)
-    error.provider_message=provider_message(body,secrets=(headers.get('access-token'),headers.get('client-id')))
+def provider_error(code,body,headers,detail=None):
+    error=CheckError(code,detail)
+    msg=provider_message(body,secrets=(headers.get('access-token'),headers.get('client-id')))
+    error.provider_message=msg or error.provider_message
     return error
 
 
@@ -76,18 +78,28 @@ def digest(path):
 
 
 @contextlib.contextmanager
-def writer_lock(root):
+def writer_lock(root, timeout=0.0):
     # OS-owned lock releases automatically even if the process crashes.
-    p=root/'.writer.lock'
+    p=Path(root)/'.writer.lock'
     with p.open('a+b') as f:
-        f.seek(0);f.write(b'0');f.flush();f.seek(0)
-        if os.name=='nt':
-            import msvcrt
-            try: msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
-            except OSError: raise RuntimeError('Another lake writer is running') from None
-        else:
-            import fcntl
-            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        deadline=time.monotonic()+max(0.0,float(timeout))
+        while True:
+            try:
+                f.seek(0,2)
+                if not f.tell():
+                    f.write(b'0');f.flush()
+                f.seek(0)
+                if os.name=='nt':
+                    import msvcrt
+                    msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+                else:
+                    import fcntl
+                    fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic()>=deadline:
+                    raise RuntimeError('Another lake writer is running') from None
+                time.sleep(0.2)
         try:
             from quant_publication import recover_publication
             recover_publication(root,'lake')
@@ -100,7 +112,7 @@ def writer_lock(root):
 
 class API:
     def __init__(self):
-        load_dotenv(Path(__file__).with_name('.env'),override=True)
+        load_dotenv(ENV_FILE,override=True)
         logging.disable(logging.CRITICAL)
         self.session=requests.Session();self.last=0;self.refreshes=0;self.calls=0
         self.rate_lock=threading.Lock()
@@ -108,10 +120,12 @@ class API:
         self.session.headers.update({'access-token':os.getenv('DHAN_ACCESS_TOKEN',''),
                                      'client-id':os.getenv('DHAN_CLIENT_ID','')})
 
-    def post(self,endpoint,payload):
+    def _post_once(self,endpoint,payload):
+        auth_lock=getattr(self,'auth_lock',None) or threading.Lock()
+        min_gap=0.55 if endpoint=='/charts/rollingoption' else 0.35
         for attempt in range(7):
             with self.rate_lock:
-                time.sleep(max(0,0.35-(time.monotonic()-self.last)))
+                time.sleep(max(0,min_gap-(time.monotonic()-self.last)))
                 self.last=time.monotonic();self.calls+=1
             try:
                 headers=dict(self.session.headers)
@@ -119,15 +133,33 @@ class API:
                 try: body=r.json()
                 except ValueError: body={}
                 code=error_code(body,'')
-                if code in AUTH_CODES or r.status_code==401:
-                    with self.auth_lock:
-                        if headers['access-token']!=self.session.headers['access-token']:continue
-                        if self.refreshes>=1: raise CheckError('AUTH','Authentication failed after refresh')
-                        token=new_access_token(os.getenv('DHAN_CLIENT_ID'),os.getenv('DHAN_PIN'),pyotp.TOTP(os.getenv('DHAN_TOTP_SECRET')))
-                        self.session.headers['access-token']=token
-                        set_key(str(Path(__file__).with_name('.env')),'DHAN_ACCESS_TOKEN',token)
-                        self.refreshes+=1
-                    continue
+                if code in AUTH_CODES or code=='806' or r.status_code in (401,403):
+                    with auth_lock:
+                        load_dotenv(ENV_FILE,override=True)
+                        if headers.get('access-token')!=self.session.headers.get('access-token'):continue
+                        disk_token=(os.getenv('DHAN_ACCESS_TOKEN') or '').strip()
+                        client_id=(os.getenv('DHAN_CLIENT_ID') or self.session.headers.get('client-id') or '').strip()
+                        if client_id:self.session.headers['client-id']=client_id
+                        if disk_token and disk_token!=headers.get('access-token'):
+                            self.session.headers['access-token']=disk_token
+                            continue
+                        pin=(os.getenv('DHAN_PIN') or '').strip()
+                        secret=(os.getenv('DHAN_TOTP_SECRET') or '').strip()
+                        refreshes=getattr(self,'refreshes',0)
+                        if refreshes<1 and client_id and pin and secret:
+                            try:
+                                token=new_access_token(client_id,pin,pyotp.TOTP(secret))
+                            except CheckError as exc:
+                                raise provider_error(exc.code or 'AUTH',body,headers,getattr(exc,'detail',None) or 'Token auto-refresh failed; check DHAN_PIN and DHAN_TOTP_SECRET') from None
+                            self.session.headers['access-token']=token
+                            os.environ['DHAN_ACCESS_TOKEN']=token
+                            set_key(str(ENV_FILE),'DHAN_ACCESS_TOKEN',token)
+                            self.refreshes=refreshes+1
+                            continue
+                        if code=='806':
+                            raise provider_error('806',body,headers)
+                        detail='Authentication failed after token refresh' if refreshes>=1 else None
+                        raise provider_error(code or f'HTTP-{r.status_code}',body,headers,detail)
                 if r.status_code==429 or r.status_code>=500 or code in ('DH-904','DH-908','DH-909','800','805'):
                     if attempt==6: raise provider_error(code or f'HTTP-{r.status_code}',body,headers)
                     try: retry=float(r.headers.get('Retry-After','0'))
@@ -143,6 +175,52 @@ class API:
                 if attempt==6: raise CheckError('NETWORK') from None
                 time.sleep(min(60,2**attempt+random.random()))
         raise CheckError('RETRIES','Retry budget exhausted')
+
+    def post(self,endpoint,payload):
+        try:
+            return self._post_once(endpoint,payload)
+        except CheckError as exc:
+            if endpoint=='/charts/rollingoption' and exc.code=='DH-905' and isinstance(payload,dict) and 'fromDate' in payload and 'toDate' in payload:
+                return self._rolling_daily_fallback(endpoint,payload,exc)
+            raise
+
+    def _rolling_daily_fallback(self,endpoint,payload,original_exc):
+        try:
+            lo=date.fromisoformat(str(payload['fromDate']))
+            hi=date.fromisoformat(str(payload['toDate']))
+        except ValueError:
+            raise original_exc
+        if (hi-lo).days<=1:
+            raise original_exc
+        cols=('timestamp',*FIELDS)
+        merged={'ce':{c:[] for c in cols},'pe':{c:[] for c in cols}}
+        succeeded=0;consecutive_905=0;day=lo
+        while day<hi:
+            if day.weekday()<5 or day==date(2025,2,1):
+                try:
+                    sub=self._post_once(endpoint,dict(payload,fromDate=str(day),toDate=str(day+timedelta(days=1))))
+                except CheckError as sub_exc:
+                    if sub_exc.code in ('DH-905','DH-907'):
+                        consecutive_905+=int(sub_exc.code=='DH-905')
+                        if succeeded==0 and consecutive_905>=2:
+                            raise original_exc
+                        day+=timedelta(days=1);continue
+                    raise
+                if isinstance(sub,dict):
+                    succeeded+=1;consecutive_905=0
+                    for side in ('ce','pe'):
+                        side_data=sub.get(side)
+                        if not isinstance(side_data,dict) or not isinstance(side_data.get('timestamp'),list):
+                            continue
+                        stamps=pd.to_datetime(side_data['timestamp'],unit='s',utc=True).tz_convert(IST)
+                        keep=[idx for idx,dt in enumerate(stamps.date) if dt==day]
+                        for k in list(merged[side]):
+                            if isinstance(side_data.get(k),list) and len(side_data[k])==len(side_data['timestamp']):
+                                merged[side][k].extend(side_data[k][idx] for idx in keep)
+            day+=timedelta(days=1)
+        if succeeded==0:
+            raise original_exc
+        return merged
 
 
 def windows(start,end):

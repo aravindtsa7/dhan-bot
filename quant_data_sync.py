@@ -8,13 +8,25 @@ import re
 import shutil
 import tempfile
 
+from dotenv import dotenv_values, load_dotenv
 import pandas as pd
 
 from quant_coverage import PRODUCTS, session_cutoff
 from quant_data_quality import read_document, safe_path, inventory, stream_sessions, parquet_metadata, file_stamp
 
+ENV_FILE=Path(__file__).with_name('.env')
 CHOICES=('All Datasets','NIFTY Spot + Options','SENSEX Spot + Options','BANKNIFTY Spot','MCX Commodities',*PRODUCTS,
          'NIFTY SPOT','NIFTY OPTIONS','SENSEX SPOT','SENSEX OPTIONS','BANKNIFTY SPOT','CRUDEOIL FUT','GOLDM FUT','NATURALGAS FUT')
+
+
+def _reload_env(env_path=None):
+    import dotenv
+    path=Path(env_path) if env_path else ENV_FILE
+    if not hasattr(dotenv.dotenv_values,'_mock_name'):
+        load_dotenv(path,override=True)
+    loaded={k:v for k,v in dotenv.dotenv_values(path).items() if v}
+    os.environ.update(loaded)
+    return {**os.environ,**loaded}
 
 
 def selected_products(selection):
@@ -174,17 +186,17 @@ def _promote(root, stage, records, manifest):
 def run_sync(root, selection, start=None, end=None, *, latest=False, skip=True, now=None, progress=None,
              downloader=None, audit=None, discovery=None, check_credentials=True):
     """Synchronous local job; never invoked on page render or rerun alone."""
-    from dotenv import dotenv_values
     from step2_build_data_lake import Builder, writer_lock
     from quant_data_quality import run_quality_check
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    if check_credentials or hasattr(load_dotenv,'_mock_name'):
+        env=_reload_env()
     if check_credentials:
-        env={**os.environ,**{k:v for k,v in dotenv_values(Path(__file__).with_name('.env')).items() if v}}
         if not env.get('DHAN_CLIENT_ID') or not (env.get('DHAN_ACCESS_TOKEN') or (env.get('DHAN_PIN') and env.get('DHAN_TOTP_SECRET'))):
             raise ValueError('Missing Dhan credentials. Configure DHAN_CLIENT_ID and an access token, or PIN + TOTP secret, in the local .env. Values are never shown.')
     audit=audit or run_quality_check
     failures=[];committed=[];outcomes=[];stopped=None
-    with writer_lock(root):
+    with writer_lock(root,timeout=120.0):
         before=inventory(root);before_sessions={sid:set(stream_sessions(s)) for sid,s in before['streams'].items()}
         plan=build_plan(root,selection,start,end,latest=latest,skip=skip,now=now)
         commodity=[p for p in plan['products'] if p in PRODUCTS[3:]]
@@ -210,19 +222,21 @@ def run_sync(root, selection, start=None, end=None, *, latest=False, skip=True, 
                     record=(downloader(job,stage) if downloader else builder.chunk(job['dataset'],job['meta'],pd.Timestamp(job['start']).date(),pd.Timestamp(job['end']).date(),job['endpoint'],dict(job['payload'],fromDate=job['start'],toDate=job['end'])))
                     outcome['status']=record['status']
                     from step2_build_data_lake import provider_message
-                    detail=provider_message({'message':record.get('provider_message','')})
+                    from step1_health_check import ERROR_HELP
+                    code_str=str(record.get('error',''))
+                    detail=provider_message({'message':record.get('provider_message','')}) or ERROR_HELP.get(code_str,'')
                     outcome['provider_message']=detail
                     outcome['endpoint']=job['endpoint']
                     outcome['query_windows']=record.get('query_windows',[])
                     if job['dataset']=='options_rolling_1m':
                         outcome['rolling_parameters']={k:job['payload'][k] for k in ('securityId','exchangeSegment','instrument','interval','expiryFlag','expiryCode','strike','drvOptionType')}
-                    if re.fullmatch(r'(?:DH-\d{3}|HTTP-\d{3}|NETWORK|AUTH)',str(record.get('error',''))):outcome['reason']=record['error']
+                    if re.fullmatch(r'(?:DH-\d{3}|HTTP-\d{3}|NETWORK|AUTH|API-ERROR)',code_str):outcome['reason']=code_str
                     if record['status']=='failed':
-                        code=str(record.get('error',''))
-                        safe_code=code if re.fullmatch(r'(?:DH-\d{3}|HTTP-\d{3}|NETWORK|AUTH|[A-Za-z]+Error)',code) else 'Provider error'
+                        code=code_str
+                        safe_code=code if re.fullmatch(r'(?:DH-\d{3}|HTTP-\d{3}|NETWORK|AUTH|API-ERROR|[A-Za-z]+Error)',code) else 'Provider error'
                         failures.append(job['meta']['instrument']+' '+job['start']+': '+safe_code+(' — '+detail if detail else ' (provider description unavailable)')+'; existing stored data retained.')
                         outcome['reason']=safe_code
-                        if code in ('NETWORK','AUTH','DH-901','807','808','809','810','HTTP-401'):
+                        if code in ('NETWORK','AUTH','DH-901','807','808','809','810','HTTP-401','HTTP-403'):
                             stopped='Connectivity/authentication failed; resolve credentials or network before retrying'
                             failures.append('Remaining requests stopped after '+stopped+'.');continue
                         failed_streams.add(stream_key);continue
@@ -283,15 +297,14 @@ def repair_dataset_gaps(root, selection='All Datasets', *, offline=False, progre
     from step2_build_data_lake import writer_lock, digest, normalize, fetch_candles
     from quant_data_quality import run_quality_check
     from quant_repairs import recover_negative, fill_isolated
-    from dotenv import dotenv_values
     root=Path(root);products=selected_products(selection);events=[];failures=[];changed=[]
     if not offline and api is None:
-        env={**os.environ,**{k:v for k,v in dotenv_values(Path(__file__).with_name('.env')).items() if v}}
-        if env.get('DHAN_CLIENT_ID') and env.get('DHAN_ACCESS_TOKEN'):
+        env=_reload_env()
+        if env.get('DHAN_CLIENT_ID') and (env.get('DHAN_ACCESS_TOKEN') or (env.get('DHAN_PIN') and env.get('DHAN_TOTP_SECRET'))):
             from step2_build_data_lake import API
             api=API()
         else:failures.append('No active access-token configuration; repair uses retained quarantine and explicitly labeled offline synthetic fills.')
-    with writer_lock(root):
+    with writer_lock(root,timeout=120.0):
         inv=inventory(root)
         if inv['findings']:raise ValueError('Resolve inventory/file errors before repairing. No partition was changed.')
         manifest=json.loads(json.dumps(inv['manifest']));specs=templates(manifest,products)

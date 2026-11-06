@@ -1,4 +1,4 @@
-﻿"""Read-only Dhan connectivity checks. Credentials and API bodies are never printed."""
+"""Read-only Dhan connectivity checks. Credentials and API bodies are never printed."""
 import contextlib
 import inspect
 import io
@@ -28,14 +28,19 @@ AUTH_CODES = {'DH-901', '807', '808', '809', '810', 'HTTP-401'}
 RETRY_CODES = {'DH-904', 'DH-908', 'DH-909', '800', '805', 'HTTP-429',
                'HTTP-500', 'HTTP-502', 'HTTP-503', 'HTTP-504', 'NETWORK'}
 ERROR_HELP = {
+    'AUTH': 'Authentication failed; verify access token or PIN/TOTP configuration',
     'DH-901': 'Client ID or access token is invalid/expired',
     'DH-902': 'API access or Data API subscription is unavailable',
     'DH-903': 'Account/segment activation needs attention',
+    'DH-904': 'Provider rate limit exceeded',
     'DH-905': 'Dhan rejected the request parameters',
     'DH-907': 'No data returned for the requested instrument/range',
     '806': 'Data API subscription is inactive', '807': 'Access token expired',
     '808': 'Authentication failed', '809': 'Access token invalid',
     '810': 'Client ID invalid',
+    'HTTP-401': 'HTTP 401 Unauthorized; access token is invalid or expired',
+    'HTTP-403': 'HTTP 403 Forbidden; check API permissions and credentials',
+    'HTTP-429': 'HTTP 429 Too Many Requests; provider rate limit exceeded',
     'NETWORK': 'Network request failed (credentials and URL suppressed)',
 }
 
@@ -43,6 +48,8 @@ ERROR_HELP = {
 class CheckError(Exception):
     def __init__(self, code, detail=None):
         self.code = code
+        self.detail = detail
+        self.provider_message = detail or ERROR_HELP.get(code, '')
         super().__init__(f"{code}: {detail or ERROR_HELP.get(code, 'Request failed')}")
 
 
