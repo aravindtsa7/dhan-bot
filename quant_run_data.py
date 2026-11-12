@@ -24,19 +24,49 @@ def minute_of(value):
     return h*60+m
 
 
+_VERIFIED_FILE_CACHE = {}
+
+
+def lake_cache_signature(root, quality=None):
+    """State signature over manifest, audit report, and auxiliary lake metadata."""
+    root = Path(root).resolve()
+    parts = [str(root)]
+    for name in ('ingestion_manifest.json', 'quality_report.json', 'expiry_calendar.csv',
+                 'session_coverage.parquet', 'session_calendar.json'):
+        p = root / name
+        if p.exists():
+            st = p.stat()
+            parts.append(f'{name}:{st.st_mtime_ns}:{st.st_size}')
+        else:
+            parts.append(f'{name}:none')
+    if isinstance(quality, dict):
+        for k in ('generated_at', 'manifest_fingerprint', 'file_fingerprint', 'calendar_fingerprint'):
+            parts.append(f'{k}:{quality.get(k)}')
+    return hashlib.sha256('|'.join(parts).encode('utf-8')).hexdigest()
+
+
 def verify_files(root, records):
     """Verify available recorded checksums, including selection-context files."""
     for record in records:
         path = Path(root)/record['path']
         if not path.is_file():
             raise ValueError(f"Missing partition: {record['path']}")
-        if record.get('sha256'):
+        expected = record.get('sha256')
+        if expected:
+            stat = path.stat()
+            cache_key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, expected)
+            if _VERIFIED_FILE_CACHE.get(cache_key) == expected:
+                continue
             digest = hashlib.sha256()
             with path.open('rb') as handle:
                 for block in iter(lambda: handle.read(1024*1024), b''):
                     digest.update(block)
-            if digest.hexdigest() != record['sha256']:
+            actual = digest.hexdigest()
+            if actual != expected:
                 raise ValueError(f"Partition checksum mismatch: {record['path']}")
+            if len(_VERIFIED_FILE_CACHE) >= 4096:
+                _VERIFIED_FILE_CACHE.clear()
+            _VERIFIED_FILE_CACHE[cache_key] = actual
 
 
 def prior_volume(lake, records, end):

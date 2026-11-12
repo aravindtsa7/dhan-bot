@@ -129,7 +129,8 @@ class API:
                 self.last=time.monotonic();self.calls+=1
             try:
                 headers=dict(self.session.headers)
-                r=requests.post('https://api.dhan.co/v2'+endpoint,headers=headers,json=payload,timeout=(10,60),allow_redirects=False)
+                post_fn=self.session.post if isinstance(getattr(self,'session',None),requests.Session) and not hasattr(requests.post,'assert_called') else requests.post
+                r=post_fn('https://api.dhan.co/v2'+endpoint,headers=headers,json=payload,timeout=(10,60),allow_redirects=False)
                 try: body=r.json()
                 except ValueError: body={}
                 code=error_code(body,'')

@@ -10,9 +10,35 @@ import streamlit as st
 
 from quant_lake import IST, ROOT, QuantDataLake
 from quant_calendar import CALENDAR_HASH, regular_session
+from quant_coverage import session_cutoff
+import json
 
-FIRST_DATE = date(2025, 1, 1)
-LAST_DATE = date(2026, 10, 31)
+
+def latest_lake_date(root=ROOT):
+    try:
+        root_path = Path(root if isinstance(root, (str, Path)) else root.root)
+        manifest = root_path / 'ingestion_manifest.json'
+        dates = []
+        if manifest.exists():
+            chunks = json.loads(manifest.read_text(encoding='utf-8')).get('chunks', {})
+            for v in chunks.values():
+                if isinstance(v, dict) and v.get('status') == 'complete':
+                    if v.get('last'):
+                        dates.append(pd.Timestamp(v['last']).date())
+                    elif v.get('end'):
+                        dates.append((pd.Timestamp(v['end']) - pd.Timedelta(days=1)).date())
+        cutoff = session_cutoff(root_path, 'NIFTY').get('date')
+        if cutoff:
+            dates.append(cutoff)
+        if dates:
+            return max(dates)
+    except Exception:
+        pass
+    return pd.Timestamp.now(tz=IST).date()
+
+
+FIRST_DATE = date(2024, 1, 1)
+LAST_DATE = latest_lake_date(ROOT)
 CHAIN_COLUMNS = ['CE stream', 'CE LTP', 'CE Volume', 'CE OI', 'CE IV',
                  'Strike Price', 'Spot Index LTP',
                  'PE LTP', 'PE Volume', 'PE OI', 'PE IV', 'PE stream']
@@ -212,7 +238,7 @@ def render_option_chain(root=ROOT):
     st.subheader('📊 Option Chain & Strike Replay')
     st.caption('WEEKLY EXPIRY · MULTI-STRIKE LADDER · FIXED-STRIKE HISTORY · IST')
     try:
-        _render_option_chain(Path(root))
+        _render_option_chain(Path(root if isinstance(root, (str, Path)) else root.root))
     except (OSError, ValueError, duckdb.Error) as exc:
         st.error(f'Unable to read option-chain data: {exc}')
 
@@ -220,6 +246,7 @@ def render_option_chain(root=ROOT):
 def _render_option_chain(root):
     manifest = root / 'ingestion_manifest.json'
     revision = manifest.stat().st_mtime_ns if manifest.exists() else 0
+    latest_date = max(LAST_DATE, latest_lake_date(root))
     a, b = st.columns([4, 1])
     instrument = a.selectbox('Chain instrument', ['NIFTY', 'SENSEX'],
         format_func=lambda v: 'Nifty' if v == 'NIFTY' else 'Sensex', key='chain_instrument')
@@ -227,7 +254,7 @@ def _render_option_chain(root):
         load_expiries.clear(); load_week.clear(); st.rerun()
     catalog = load_expiries(str(root), revision, instrument, CALENDAR_HASH)
     if catalog.empty:
-        st.info('No weekly option observations for this instrument from January 2025 through October 2026.')
+        st.info(f'No weekly option observations for this instrument from {FIRST_DATE:%B %Y} through {latest_date:%B %Y}.')
         return
     choices = list(zip(catalog.expiry_date, catalog.expiry_basis))
     # Default to the latest expiry with observations in its Monday-to-expiry week.
@@ -242,8 +269,9 @@ def _render_option_chain(root):
     metadata = catalog[catalog.expiry_date.eq(expiry) & catalog.expiry_basis.eq(basis)].iloc[0]
     options, spot = load_week(str(root), revision, instrument, expiry, basis, metadata.first_session, CALENDAR_HASH)
     expiry_day = date.fromisoformat(expiry)
-    monday = max(FIRST_DATE, expiry_day - timedelta(days=expiry_day.weekday()))
-    last_day = min(expiry_day, LAST_DATE)
+    first_bound = date(2025, 1, 1) if pd.Timestamp(metadata.first_session).date() >= date(2025, 1, 1) else FIRST_DATE
+    monday = max(first_bound, expiry_day - timedelta(days=expiry_day.weekday()))
+    last_day = min(expiry_day, max(latest_date, pd.Timestamp(metadata.last_session).date()))
     context = f'{instrument}_{expiry}_{basis}'
     week = options[options.timestamp.dt.date.between(monday, last_day)] if not options.empty else options
     if basis != 'recorded':

@@ -8,6 +8,7 @@ from quant_data_quality import (STATUSES, inventory, report_state, filtered_grou
                                stream_sessions, preview_candles, preview_export, run_quality_check)
 from quant_data_workflows import range_panel, sync_panel, report_for_group
 from quant_coverage import finding_bucket
+from quant_option_chain_ui import render_option_chain
 
 
 def size_label(value):
@@ -194,12 +195,19 @@ def ingestion_panel(inv):
         st.caption('Request records, not job history. Quarantined/rejected rows are excluded from stored candle totals. No download or retry is triggered here.')
 
 
+def render_data_explorer(lake):
+    root = Path(lake if isinstance(lake, (str, Path)) else lake.root)
+    with st.expander('🔍 Inspect Date-Range & Candle Preview', expanded=False):
+        _render_lake_inspector(root)
+    with st.expander('📊 Option Chain & Strike Replay', expanded=False):
+        render_option_chain(lake)
+
+
 def render_data_lake(root):
     from quant_data_lab import render_inventory
     inv=inventory(root);state=report_state(root,inv)
     render_inventory(root,inv,state)
-    with st.expander('🔍 Inspect Date-Range & Candle Preview',expanded=False):
-        _render_lake_inspector(root)
+    render_data_explorer(root)
 
 
 def _render_lake_inspector(root):

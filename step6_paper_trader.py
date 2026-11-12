@@ -15,7 +15,8 @@ import sys
 import time
 from urllib.parse import urlencode
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
+import pyotp
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
@@ -23,8 +24,33 @@ from paper_feed import (Asset, Tick, IST, SEGMENTS, FeedError, decode_packets, i
                         master_path, option_asset, option_volume_confirmed)
 from paper_engine import PaperAccount, AccountLock, MinuteBook, atomic, stamp
 from quant_backtester import Config, HIGH_STRATEGIES, RESEARCH_STRATEGIES, STRATEGIES, BOOK_STRATEGIES, POINT_VALUE, config_from_saved, StrategyRemovedError
+from step1_health_check import new_access_token
 
 BASE=Path(__file__).resolve().parent
+ENV_FILE=BASE/'.env'
+
+
+def refresh_access_token(client_id,current_token='',env_file=None,emit=None):
+    """Reload .env or mint a fresh Dhan access token via TOTP when credentials exist."""
+    target_env=Path(ENV_FILE if env_file is None else env_file)
+    load_dotenv(target_env,override=True)
+    disk_token=(os.environ.get('DHAN_ACCESS_TOKEN') or '').strip()
+    if disk_token and disk_token!=current_token:
+        return disk_token
+    pin=(os.environ.get('DHAN_PIN') or '').strip()
+    secret=(os.environ.get('DHAN_TOTP_SECRET') or '').strip()
+    if not (client_id and pin and secret):
+        return None
+    try:
+        token=new_access_token(client_id,pin,pyotp.TOTP(secret))
+    except Exception:
+        if emit: emit('AUTH TOTP token auto-refresh failed; check DHAN_PIN and DHAN_TOTP_SECRET')
+        return None
+    os.environ['DHAN_ACCESS_TOKEN']=token
+    try: set_key(str(target_env),'DHAN_ACCESS_TOKEN',token)
+    except OSError: pass
+    if emit: emit('AUTH access token refreshed via TOTP and saved to .env')
+    return token
 
 
 def book_activity_confirmed(rows,c,event,now):
@@ -136,8 +162,10 @@ def demo(args,c,emit):
 
 
 async def live(args,c,emit,transport):
-    load_dotenv(BASE/'.env')
+    load_dotenv(ENV_FILE,override=True)
     client_id=os.environ.get('DHAN_CLIENT_ID','').strip(); token=os.environ.get('DHAN_ACCESS_TOKEN','').strip()
+    if client_id and not token:
+        token=await asyncio.to_thread(refresh_access_token,client_id,'',ENV_FILE,emit) or ''
     if not client_id or not token: raise ValueError('Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env')
     assets=await asyncio.to_thread(instruments,args.output,time.time())
     chosen=next(a for a in assets if a.name==c.instrument)
@@ -159,7 +187,7 @@ async def live(args,c,emit,transport):
     emit(f'Strategy {c.strategy} {chosen.name} signal contract {chosen.security_id}; PAPER ONLY')
     emit(f'Capital INR {c.capital:,.0f} | allocation {c.capital_usage_pct:g}% | assumed margin {c.futures_margin_pct:g}% | daily loss/profit {c.daily_loss_limit:g}/{c.daily_profit_target:g}')
     stopping=False; shutdown_started=None; started=time.monotonic(); ws=None
-    last_print=0.; last_seed=-60.; seed_task=None; last_message=0.; retry_at=0.; attempts=0
+    last_print=0.; last_seed=-60.; seed_task=None; last_message=0.; retry_at=0.; attempts=0; token_refreshes=0
     latest={}; last_epochs={}; counters={quote_label(a):0 for a in assets}; rejects=0; seed_count=0
     fresh_counts={quote_label(a):0 for a in assets}
     stop_reason='shutdown'; fatal=None
@@ -227,7 +255,11 @@ async def live(args,c,emit,transport):
                 except FeedError as exc:
                     emit(f'WARMUP {exc}; entries wait for complete observed candles')
                     if str(exc) in ('WARMUP_HTTP_401','WARMUP_HTTP_403'):
-                        fatal=str(exc); stop()
+                        refreshed=await asyncio.to_thread(refresh_access_token,client_id,token,ENV_FILE,emit) if token_refreshes<1 else None
+                        if refreshed:
+                            token=refreshed; token_refreshes+=1; last_seed=-60.; await drop()
+                        else:
+                            fatal=str(exc); stop()
                 except Exception: emit('WARMUP failed; response details suppressed')
                 seed_task=None
             if ws:
@@ -241,7 +273,11 @@ async def live(args,c,emit,transport):
                 except FeedError as exc:
                     emit(f'FEED {exc}')
                     if str(exc).startswith('FEED_DISCONNECT_') and str(exc).split('_')[-1] in ('806','807','808','809','810'):
-                        fatal=str(exc); stop(); await drop()
+                        refreshed=await asyncio.to_thread(refresh_access_token,client_id,token,ENV_FILE,emit) if token_refreshes<1 else None
+                        if refreshed:
+                            token=refreshed; token_refreshes+=1; await drop()
+                        else:
+                            fatal=str(exc); stop(); await drop()
                     else: rejects+=1; await drop()
                 except (WebSocketException,OSError):
                     emit('FEED interrupted; open positions retained, entries paused'); await drop()

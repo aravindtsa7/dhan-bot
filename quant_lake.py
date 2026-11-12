@@ -1,4 +1,4 @@
-﻿"""Parquet/DuckDB query foundation. Dates are inclusive start, exclusive end, in IST."""
+"""Parquet/DuckDB query foundation. Dates are inclusive start, exclusive end, in IST."""
 from pathlib import Path
 import json
 import time
@@ -110,9 +110,16 @@ class QuantDataLake:
         defaults = ''.join(f', {value} AS {name}' for name, value in optional.items() if name not in names)
         return f'SELECT *, {expiry} AS expiry_date{defaults} FROM read_parquet(?, union_by_name=true)'
 
+    def _default_option_end(self):
+        ends = [pd.Timestamp(v['end']).date() for v in self.manifest['chunks'].values()
+                if v.get('status') == 'complete' and v.get('end')]
+        today_exclusive = (pd.Timestamp.now(tz=IST).normalize() + pd.Timedelta(days=1)).date()
+        return str(max(ends + [today_exclusive]))
+
     @lake_consistent_read
-    def option_sessions(self, instrument, start='2025-01-01', end='2026-11-01'):
+    def option_sessions(self, instrument, start='2025-01-01', end=None):
         """Observed trading dates and expiry identities, never calendar-inferred."""
+        end = self._default_option_end() if end is None else end
         files = self._option_files(instrument, start, end)
         if not files:
             return pd.DataFrame(columns=['trading_date', 'expiry_flag', 'expiry_code', 'expiry_date'])
@@ -153,12 +160,13 @@ class QuantDataLake:
         return frame
 
     @lake_consistent_read
-    def weekly_option_sessions(self, instrument, start='2025-01-01', end='2026-11-01'):
+    def weekly_option_sessions(self, instrument, start='2025-01-01', end=None):
         """Resolve weekly groups, keeping recorded and calendar-derived dates separate.
 
         A calendar mapping is a research grouping, NOT proof of a rolling
         contract's identity. Never persist inferred dates into source Parquet.
         """
+        end = self._default_option_end() if end is None else end
         sessions = self.option_sessions(instrument, start, end)
         calendar = expiries(instrument)
         rows = []
@@ -188,8 +196,9 @@ class QuantDataLake:
                                            'source_expiry', 'expiry_date', 'expiry_basis'])
 
     @lake_consistent_read
-    def option_expiries(self, instrument, start='2025-01-01', end='2026-11-01'):
+    def option_expiries(self, instrument, start='2025-01-01', end=None):
         """Expiry choices with actual coverage and an explicit identity basis."""
+        end = self._default_option_end() if end is None else end
         sessions = self.weekly_option_sessions(instrument, start, end)
         if sessions.empty:
             return pd.DataFrame(columns=['expiry_date', 'expiry_basis', 'first_session', 'last_session', 'sessions'])

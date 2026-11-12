@@ -22,7 +22,7 @@ from quant_calendar import CALENDAR_HASH, expiries, next_expiry, is_expiry_day, 
 from quant_option_model import continuation_candle, MissingObservedPrice, intrinsic, option_mark_state
 from quant_strategy_models import futures_risk, profit_lock
 from quant_high_edge import HIGH_STRATEGIES, high_edge_events
-from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence
+from quant_run_data import required_windows, verify_files, prior_volume, select_contracts, stream_check, rejected_evidence, lake_cache_signature
 from quant_data_quality import require_current_audit
 
 ENGINE_VERSION = '5.5.0'
@@ -498,6 +498,7 @@ class ResearchData:
             if not expiry_config:
                 load_start = min([start]+[r['start'] for r in candidates])
             records = [r for r in candidates if self.mcx or r['end'] > load_start]
+            self.verified_records = list(records)
             verify_files(self.root, records)
             if self.mcx:
                 frames = [lake.query(name, load_start, end) for ds, name in lake.instruments()
@@ -742,7 +743,9 @@ class ResearchData:
     def events(self, c, date):
         """Each event contains an entry minute, side, fixed strike, trigger, ATR."""
         key = (c.strategy,c.timeframe,c.strike,c.orb_minutes,c.anchor,c.mode,c.breakout_pct,c.entry_start,c.entry_end,c.adx_min,
-               c.option_lookback,c.volume_multiple,c.oi_mode,c.oi_min_change_pct,c.atr_expansion,c.compression_ratio,c.momentum_lookback,c.momentum_threshold,date)
+               c.option_lookback,c.volume_multiple,c.oi_mode,c.oi_min_change_pct,c.atr_expansion,c.compression_ratio,c.momentum_lookback,c.momentum_threshold,
+               c.minimum_premium,c.expiry_entry_mode,c.expiry_entry_signal,c.expiry_exit_cutoff,c.expiry_include_prior_session,c.expiry_calendar_mode,
+               c.intraday_entry_signal,c.intraday_exit_cutoff,date)
         if key in self._events:
             return self._events[key]
         if c.strategy in STRATEGIES:
@@ -1030,9 +1033,35 @@ def persist_result(result, output=OUT):
     return document
 
 
+_RESEARCH_DATA_CACHE = {}
+_RESEARCH_DATA_CACHE_MAX = 4
+
+
+def cached_research_data(instrument, start='2025-01-01', end='2026-10-23', root=None, expiry_config=None):
+    """Return a verified in-memory ResearchData snapshot, invalidated on any lake or audit change."""
+    if not isinstance(ResearchData, type):
+        return ResearchData(instrument, start, end, **({'expiry_config': expiry_config} if expiry_config is not None else {}))
+    root_path = Path(ROOT if root is None else root).resolve()
+    quality = require_current_audit(root_path)
+    sig = lake_cache_signature(root_path, quality)
+    expiry_key = ((expiry_config.expiry_entry_mode, expiry_config.expiry_entry_signal,
+                   expiry_config.expiry_exit_cutoff, expiry_config.expiry_include_prior_session,
+                   expiry_config.expiry_calendar_mode) if expiry_config is not None else None)
+    key = (instrument, str(start), str(end), sig, expiry_key)
+    cached = _RESEARCH_DATA_CACHE.get(key)
+    if cached is not None:
+        verify_files(root_path, getattr(cached, 'verified_records', ()))
+        return cached
+    data = ResearchData(instrument, start, end, root=root_path, expiry_config=expiry_config)
+    if len(_RESEARCH_DATA_CACHE) >= _RESEARCH_DATA_CACHE_MAX:
+        _RESEARCH_DATA_CACHE.pop(next(iter(_RESEARCH_DATA_CACHE)))
+    _RESEARCH_DATA_CACHE[key] = data
+    return data
+
+
 def run_backtest(c, data=None, output=OUT, persist=True):
     c.validate()
-    data=data or ResearchData(c.instrument,c.start,c.end,**({'expiry_config':c} if c.strategy=='expiry_day' else {}))
+    data=data or cached_research_data(c.instrument,c.start,c.end,expiry_config=c if c.strategy=='expiry_day' else None)
     if c.strategy=='expiry_day':
         from quant_expiry import check_prepared_windows
         check_prepared_windows(data,c)

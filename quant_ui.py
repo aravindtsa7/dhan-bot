@@ -132,11 +132,30 @@ def recent_card(runs, search=''):
         else: st.info('No matching runs yet. Configure a backtest to create your first result.')
 
 
+def _latest_session_date(root=ROOT):
+    try:
+        from quant_coverage import session_cutoff
+        manifest, _ = read_document(Path(root) / 'ingestion_manifest.json')
+        chunks = (manifest or {}).get('chunks', {})
+        lasts = [pd.Timestamp(v['last']).date() for v in chunks.values()
+                 if isinstance(v, dict) and v.get('status') == 'complete' and v.get('last')]
+        if lasts:
+            return max(lasts)
+        cutoff = session_cutoff(root, 'NIFTY').get('date')
+        if cutoff:
+            return cutoff
+    except Exception:
+        pass
+    return pd.Timestamp.now(tz=IST).date()
+
+
 def configure_card():
+    latest_date = max(date(2025, 1, 1), _latest_session_date(ROOT))
+    max_date = max(latest_date, pd.Timestamp.now(tz=IST).date())
     initial_defaults = dict(instrument='NIFTY 50', strategy=next(iter(STRATEGY_LABELS)),
-        period=(date(2025, 1, 1), date(2026, 10, 22)), capital=100000, allocation='25%', interval='5 minutes',
+        period=(date(2025, 1, 1), latest_date), capital=100000, allocation='25%', interval='5 minutes',
         take_profit='30%', stop_loss='20%', minimum_premium=50., exit_label='Target / EOD',
-        daily_profit_target=0., daily_loss_limit=0.)
+        daily_profit_target=0., daily_loss_limit=0., slippage=0.5, brokerage=20.)
     defaults = st.session_state.get('form_defaults', initial_defaults)
     if defaults.get('strategy') not in STRATEGY_LABELS:
         st.warning('Strategy removed: the previous configuration cannot be run. Select a remaining strategy.')
@@ -170,6 +189,9 @@ def configure_card():
         if prior_instrument != instrument or prior_strategy != strategy:
             values = strategy_defaults(INSTRUMENT_LABELS[instrument],STRATEGY_LABELS[strategy][0])
             if prior_instrument==instrument:values.pop('capital',None)
+            else:
+                code = INSTRUMENT_LABELS[instrument]
+                values['slippage'] = 0.5 if code == 'NATURALGAS' or code not in ('CRUDEOIL', 'NATURALGAS', 'GOLDM') else 1.0
             defaults.update(values)
             for key in values: st.session_state.pop('bt_'+key, None)
             for key in ('bt_expiry_tp','bt_expiry_sl'):st.session_state.pop(key,None)
@@ -180,8 +202,9 @@ def configure_card():
             st.session_state.pop('bt_interval',None)
         a, b = st.columns(2)
         with a:
-            period = st.date_input('Period', defaults['period'], min_value=date(2025, 1, 1),
-                                   max_value=date(2026, 12, 31), format='DD/MM/YYYY', key='bt_period')
+            period_bounds = defaults['period'] if isinstance(defaults.get('period'), (list, tuple)) and len(defaults['period']) == 2 else (date(2025, 1, 1), latest_date)
+            period = st.date_input('Period', period_bounds, min_value=date(2025, 1, 1),
+                                   max_value=max(max_date, max(period_bounds)), format='DD/MM/YYYY', key='bt_period')
         with b:
             capital = st.number_input('Capital', min_value=1000, value=defaults['capital'], step=10000, key='bt_capital',
                                        help='Trading capital in Indian rupees. Whole lots include a fee reserve.')
@@ -215,6 +238,14 @@ def configure_card():
         with b:
             daily_loss_limit = st.number_input('Daily loss limit (%, 0 = off)', min_value=0., max_value=500., value=float(defaults.get('daily_loss_limit', 0.)), step=1., format='%.1f', key='bt_daily_loss_limit',
                 help='Account-level daily net loss cutoff as % of allocated capital (0 disables).')
+        a, b = st.columns(2)
+        with a:
+            default_slip = 0.5 if INSTRUMENT_LABELS[instrument] == 'NATURALGAS' or INSTRUMENT_LABELS[instrument] not in ('CRUDEOIL', 'NATURALGAS', 'GOLDM') else 1.0
+            slippage = st.number_input('Slippage (pts)', min_value=0., max_value=100., value=float(defaults.get('slippage', default_slip)), step=0.05, format='%.2f', key='bt_slippage',
+                help='Adverse execution slippage in index/option points per leg order.')
+        with b:
+            brokerage = st.number_input('Brokerage (₹)', min_value=0., max_value=500., value=float(defaults.get('brokerage', 20.)), step=5., format='%.0f', key='bt_brokerage',
+                help='Flat brokerage in ₹ per executed order (2 orders per completed leg).')
         if instrument in ('CRUDEOIL','NATURALGAS','GOLDM'):
             st.caption('Futures: 20% assumed margin. TP30/SL15 scales to 2.2 ATR target / 1.2 ATR stop. Only Trailing SL activates the +1.2 ATR profit lock.')
         elif STRATEGY_LABELS[strategy][0] in ('vwap_ema_pullback','orb_volume_breakout','supertrend_adx_trend','book_vertical_spread','book_vol_oi_momentum'):
@@ -243,7 +274,7 @@ def configure_card():
         st.session_state.form_defaults = dict(instrument=instrument, strategy=strategy, period=period, capital=capital,
             allocation=allocation, interval=interval, take_profit=take_profit, stop_loss=stop_loss,
             minimum_premium=premium, exit_label=exit_label, daily_profit_target=daily_profit_target,
-            daily_loss_limit=daily_loss_limit, **expiry_settings)
+            daily_loss_limit=daily_loss_limit, slippage=slippage, brokerage=brokerage, **expiry_settings)
         html('<div class="cost-bar">ⓘ &nbsp; Costs: Brokerage + taxes + slippage</div>')
         st.caption('Allocation caps committed capital, not maximum loss. Default allocation is 25%; entries require whole lots plus fees.')
         a, b = st.columns(2)
@@ -266,7 +297,8 @@ def configure_card():
                 st.session_state.pop('notice', None)
             try:
                 config = build_config(instrument, strategy, period, capital, allocation, interval, take_profit, stop_loss, premium, exit_label,
-                                      daily_profit_target=daily_profit_target, daily_loss_limit=daily_loss_limit, **expiry_settings)
+                                      daily_profit_target=daily_profit_target, daily_loss_limit=daily_loss_limit,
+                                      slippage=slippage, brokerage=brokerage, **expiry_settings)
                 if submitted:
                     with st.spinner('Simulating eligible historical candles…'):
                         result = run_backtest(config, output=OUT, persist=False)
@@ -407,9 +439,10 @@ def render_saved(records, search):
         if not matched: st.info('Save a configuration to reuse its exact parameters here.')
         for record in reversed(matched):
             removed = record['config'].get('strategy') in REMOVED_STRATEGIES
+            ver = record.get('version_label', 'V1')
             a, b = st.columns([3, 1], vertical_alignment='center')
             with a:
-                st.markdown(f'**{record["name"]}** · {record["config"]["instrument"]}')
+                st.markdown(f'**{record["name"]}** · `{ver}` · {record["config"]["instrument"]}')
                 st.caption(f'{record["config"]["timeframe"]} · {money(record["config"]["capital"])} · {record["last_run"] or "Not run yet"}')
                 if removed: st.warning('Strategy removed: '+record['config']['strategy']+'. Saved record preserved; execution disabled.')
             b.button('Load', key='load_'+record['strategy_id'], width='stretch', on_click=load_saved, args=(record,), disabled=removed)

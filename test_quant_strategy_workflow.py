@@ -208,7 +208,11 @@ class SavedDeploymentTests(unittest.TestCase):
                 self.assertNotIn('--mode demo',command)
             self.assertEqual(account_path(root/'paper',record).parent,root/'paper')
             changed=save_strategy(output,replace(c,minimum_premium=90),'Sensex_Custom_5m')
-            self.assertEqual(len(load_saved_strategies(path)),1)
+            saved_records=load_saved_strategies(path)
+            self.assertEqual(len(saved_records),2)
+            self.assertEqual(saved_records[0]['version_label'],'V1')
+            self.assertEqual(saved_records[1]['version_label'],'V2')
+            self.assertEqual(saved_records[1]['name'],'Sensex_Custom_5m (V2)')
             self.assertNotEqual(account_path(root/'paper',record),account_path(root/'paper',changed))
 
     def test_current_master_contract_resolution_and_exact_option_lot_size(self):

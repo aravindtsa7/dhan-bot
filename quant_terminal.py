@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import pandas as pd
 
@@ -65,7 +66,7 @@ def strategy_defaults(instrument,strategy):
 
 def build_config(instrument, strategy, period, capital, allocation, interval,
                  take_profit, stop_loss, minimum_premium, exit_label,
-                 daily_profit_target=0., daily_loss_limit=0., **expiry_settings):
+                 daily_profit_target=0., daily_loss_limit=0., slippage=None, brokerage=20., **expiry_settings):
     """Every visible form setting is preserved in the engine's hashed config."""
     if len(period) != 2:
         raise ValueError('Choose both the start and end of the Period.')
@@ -78,6 +79,7 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
     engine_strategy, side = STRATEGY_LABELS[strategy]
     mcx = code in POINT_VALUE
     sl, tp = float(str(stop_loss).rstrip('%')), float(str(take_profit).rstrip('%'))
+    default_slippage = .5 if code=='NATURALGAS' or not mcx else 1.0
     config = Config(
         instrument=code, strategy=engine_strategy, option_side=side,
         start=begin.isoformat(), end=(end + timedelta(days=1)).isoformat(),
@@ -86,7 +88,8 @@ def build_config(instrument, strategy, period, capital, allocation, interval,
         timeframe=INTERVALS[interval], sl_pct=sl, target_pct=tp,
         minimum_premium=float(minimum_premium), exit_mode={**EXITS,**EXPIRY_EXITS}[exit_label],
         trail_pct=sl if exit_label == 'Trailing SL' else 0, risk_basis='legacy' if mcx and engine_strategy in BOOK_STRATEGIES else 'percentage',
-        sizing_mode='allocation', slippage=.5 if code=='NATURALGAS' or not mcx else 1.0,
+        sizing_mode='allocation', slippage=default_slippage if slippage is None else float(slippage),
+        brokerage=float(brokerage),
         entry_start='17:00' if mcx and engine_strategy!='vwap_ema_pullback' else '09:25', volume_multiple=1.3,
         entry_end='22:45' if mcx and engine_strategy!='vwap_ema_pullback' else '14:30', price_policy='strict_observed' if mcx else 'model_continuity',
         daily_profit_target=float(daily_profit_target), daily_loss_limit=float(daily_loss_limit),
@@ -236,6 +239,11 @@ def load_saved_strategies(path=None):
             raise ValueError('Invalid saved strategy record')
         if record['strategy_id'] in seen: raise ValueError('Duplicate saved strategy ID')
         seen.add(record['strategy_id'])
+        base_name = (record.get('base_name') or re.sub(r'\s*\(V\d+\)$', '', record['name'].strip())).strip()
+        version = int(record.get('version', 1))
+        record.setdefault('base_name', base_name)
+        record.setdefault('version', version)
+        record.setdefault('version_label', f'V{version}')
         if record['config'].get('strategy') in REMOVED_STRATEGIES:
             continue  # Preserve the record; UI and every execution entry point block it.
         try:
@@ -249,8 +257,9 @@ def load_saved_strategies(path=None):
 
 
 def save_strategy(output, config, label):
-    name = label.strip()
-    if not name or name in STRATEGY_LABELS:
+    raw_name = label.strip()
+    base_name = re.sub(r'\s*\(V\d+\)$', '', raw_name).strip()
+    if not base_name or base_name in STRATEGY_LABELS:
         raise ValueError('Enter a custom Strategy Name before saving.')
     config.validate()
     if config.strategy not in STRATEGIES:
@@ -259,10 +268,20 @@ def save_strategy(output, config, label):
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     values = asdict(config)
-    identifier = hashlib.sha256(name.casefold().encode()).hexdigest()[:12]
     with writer_lock(directory):
         records = load_saved_strategies(path)
-        record = dict(strategy_id=identifier, name=name, config=values,
+        existing_ids = {s['strategy_id'] for s in records}
+        matching = [s for s in records
+                    if (s.get('base_name') or re.sub(r'\s*\(V\d+\)$', '', s['name'].strip())).casefold() == base_name.casefold()]
+        version = max((int(s.get('version', 1)) for s in matching), default=0) + 1
+        version_label = f'V{version}'
+        display_name = base_name if version == 1 else f'{base_name} ({version_label})'
+        seed = base_name.casefold() if version == 1 else f'{base_name.casefold()}:{version_label.lower()}'
+        identifier = hashlib.sha256(seed.encode()).hexdigest()[:12]
+        if identifier in existing_ids:
+            identifier = hashlib.sha256(f'{seed}:{len(records)+1}'.encode()).hexdigest()[:12]
+        record = dict(strategy_id=identifier, name=display_name, base_name=base_name,
+                      version=version, version_label=version_label, config=values,
                       instrument=config.instrument, strategy_key=config.strategy,
                       candle_interval=config.timeframe, capital=config.capital,
                       capital_allocation_pct=config.capital_usage_pct,
@@ -270,7 +289,7 @@ def save_strategy(output, config, label):
                       minimum_premium=config.minimum_premium, exit_mode=config.exit_mode,
                       saved_at=pd.Timestamp.now(tz=IST).isoformat(),
                       last_run=None)
-        records = [s for s in records if s['strategy_id'] != identifier] + [record]
+        records = records + [record]
         atomic_json(path, records)
     return record
 
@@ -278,6 +297,8 @@ def save_strategy(output, config, label):
 def form_values(config, label):
     """Restore a saved terminal configuration without silently changing defaults."""
     assert_strategy_available(config.get('strategy'))
+    mcx = config.get('instrument') in POINT_VALUE
+    default_slip = .5 if config.get('instrument') == 'NATURALGAS' or not mcx else 1.0
     return dict(instrument=next(k for k, v in INSTRUMENT_LABELS.items() if v == config['instrument']),
                 strategy=strategy_label(config), period=(date.fromisoformat(config['start']), date.fromisoformat(config['end'])-timedelta(days=1)),
                 capital=int(config['capital']), allocation=f"{config['capital_usage_pct']:g}%",
@@ -287,4 +308,6 @@ def form_values(config, label):
                 exit_label=next(k for k, v in (EXPIRY_EXITS if config['strategy'] in ('expiry_day','expiry_intraday') else EXITS).items() if v == config['exit_mode']),
                 daily_profit_target=float(config.get('daily_profit_target', 0.)),
                 daily_loss_limit=float(config.get('daily_loss_limit', 0.)),
+                slippage=float(config.get('slippage', default_slip)),
+                brokerage=float(config.get('brokerage', 20.)),
                 **{k:v for k,v in config.items() if k.startswith(('expiry_','intraday_'))})

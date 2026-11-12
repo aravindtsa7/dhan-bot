@@ -368,12 +368,31 @@ class LivePaperGapTests(unittest.TestCase):
             'Target / EOD',
             daily_profit_target=18.0,
             daily_loss_limit=10.0,
+            slippage=1.25,
+            brokerage=25.0,
         )
         self.assertEqual(cfg.daily_profit_target, 18.0)
         self.assertEqual(cfg.daily_loss_limit, 10.0)
+        self.assertEqual(cfg.slippage, 1.25)
+        self.assertEqual(cfg.brokerage, 25.0)
         restored = form_values(asdict(cfg), 'Saved Test Strategy')
         self.assertEqual(restored['daily_profit_target'], 18.0)
         self.assertEqual(restored['daily_loss_limit'], 10.0)
+        self.assertEqual(restored['slippage'], 1.25)
+        self.assertEqual(restored['brokerage'], 25.0)
+
+    def test_automatic_totp_token_refresh_helper(self):
+        import os
+        from step6_paper_trader import refresh_access_token
+        env_path = self.root / '.env'
+        env_path.write_text('DHAN_ACCESS_TOKEN=expired_tok\nDHAN_PIN=123456\nDHAN_TOTP_SECRET=JBSWY3DPEHPK3PXP\n', encoding='utf-8')
+        events = []
+        with patch.dict(os.environ, {}, clear=False), patch('step6_paper_trader.new_access_token', return_value='fresh_jwt_token_123') as minted:
+            token = refresh_access_token('110011', current_token='expired_tok', env_file=env_path, emit=events.append)
+        self.assertEqual(token, 'fresh_jwt_token_123')
+        self.assertEqual(minted.call_args.args[:2], ('110011', '123456'))
+        self.assertIn('fresh_jwt_token_123', env_path.read_text(encoding='utf-8'))
+        self.assertTrue(any('refreshed via TOTP' in e for e in events))
 
     def test_dynamic_balance_lot_sizing_and_allocated_capital_daily_limits(self):
         c = config(capital=50000, capital_usage_pct=50, futures_margin_pct=20, sizing_mode='allocation',
